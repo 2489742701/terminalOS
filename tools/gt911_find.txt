@@ -1,0 +1,13 @@
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\4.0inch_ESP32-4848S040\1-Demo\Demo_Arduino\Libraries\Touch_GT911
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\4.0inch_ESP32-4848S040\1-Demo\Demo_Arduino\Libraries\Touch_GT911\Touch_GT911.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\4.0inch_ESP32-4848S040\1-Demo\Demo_Arduino\Libraries\Touch_GT911\Touch_GT911.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\4.0inch_ESP32-4848S040\8-Burn operation\flash_download_tool_3.9.3\dl_temp\_temp_by_dltool\downloadPanel1\LVGL-3.5C-gt911.bin_rep
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.pio\libdeps\esp32s3\TAMC_GT911
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.pio\libdeps\esp32s3\TAMC_GT911\TAMC_GT911.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.pio\libdeps\esp32s3\TAMC_GT911\TAMC_GT911.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.wb_build\esp32s3\libe7a\TAMC_GT911
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.wb_build\esp32s3\libe7a\libTAMC_GT911.a
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.wb_build\esp32s3\libe7a\TAMC_GT911\TAMC_GT911.cpp.d
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.wb_build\esp32s3\libe7a\TAMC_GT911\TAMC_GT911.cpp.o
+C:\Users\longyaosi\.platformio\.cache\tmp\pkg-installing-boo_x9f5\TAMC_GT911.cpp
+C:\Users\longyaosi\.platformio\.cache\tmp\pkg-installing-boo_x9f5\TAMC_GT911.h

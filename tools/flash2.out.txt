@@ -1,0 +1,2 @@
+FLASH_RC=0
+CAP_DONE

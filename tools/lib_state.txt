@@ -1,0 +1,11 @@
+############ .pio/libdeps/esp32s3 (newest first) ############
+09/21/2026 23:04:28  TAMC_GT911
+09/21/2026 23:04:21  Adafruit BusIO
+
+############ all Arduino_GFX copies ############
+12/11/2023 15:52:46  C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\4.0inch_ESP32-4848S040\1-Demo\Demo_Arduino\Libraries\Arduino_GFX-master
+09/22/2026 02:10:27  C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\.wb_build\esp32s3\libb9a\Arduino_GFX-master
+09/22/2026 02:30:16  C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\diag_blink\.pio\build\esp32s3\libb9a\Arduino_GFX-master
+
+############ st7701 init op definitions ############
+FILE: C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\4.0inch_ESP32-4848S040\1-Demo\Demo_Arduino\Libraries\Arduino_GFX-master\src\display\Arduino_ST7701_RGBPanel.h  (06/13/2023 16:03:00)

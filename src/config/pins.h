@@ -42,7 +42,7 @@ constexpr int PIN_TOUCH_RST = -1;
 // 显示参数
 constexpr int SCREEN_WIDTH = 480;
 constexpr int SCREEN_HEIGHT = 480;
-constexpr uint32_t RGB_BUS_SPEED = 16000000;  // 16MHz
+constexpr uint32_t RGB_BUS_SPEED = 10000000;  // 10MHz（降 PCLK 给 PSRAM 留带宽，抗 DMA 饿死花屏）
 
 // ST7701 时序参数
 constexpr int HSYNC_FRONT_PORCH = 10;

@@ -3,15 +3,37 @@
 #include "../hal/touch.h"
 #include "../config/pins.h"
 #include <lvgl.h>
+#include "screensaver.h"
+#include "nav.h"
+#include "welcome.h"
+#include "launcher.h"
+#include "clock.h"
+#include "settings.h"
+#include "wifi_screen.h"
+#include "game_screen.h"
+#include "browser_screen.h"
+#include "draw_screen.h"
+#include "memory_screen.h"
+#include "sysinfo_screen.h"
+#include "weather_screen.h"
 
-// LVGL 显示缓冲（双缓冲，每缓冲 100 行）
+
+// LVGL 显示缓冲（PSRAM 双缓冲）
 static lv_disp_draw_buf_t drawBuf;
 static lv_color_t* dispBuf1 = nullptr;
 static lv_color_t* dispBuf2 = nullptr;
 
-// 极客终端主界面（临时验证用，后续替换为 Launcher 菜单）
-static lv_obj_t* mainLabel;
-static lv_obj_t* touchLabel;
+// 全局屏幕指针（导航）
+lv_obj_t* nav_launcher = nullptr;
+lv_obj_t* nav_clock = nullptr;
+lv_obj_t* nav_settings = nullptr;
+lv_obj_t* nav_wifi = nullptr;
+lv_obj_t* nav_game = nullptr;
+lv_obj_t* nav_browser = nullptr;
+lv_obj_t* nav_draw = nullptr;
+lv_obj_t* nav_memory = nullptr;
+lv_obj_t* nav_sysinfo = nullptr;
+lv_obj_t* nav_weather = nullptr;
 
 void App::dispFlush(lv_disp_drv_t* disp, const lv_area_t* area,
                     lv_color_t* colorP) {
@@ -23,15 +45,27 @@ void App::dispFlush(lv_disp_drv_t* disp, const lv_area_t* area,
 }
 
 void App::touchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
-  int x, y;
-  if (Touch::hasSignal() && Touch::touched(x, y)) {
-    data->state = LV_INDEV_STATE_PR;
-    data->point.x = x;
-    data->point.y = y;
-    // 实时显示触摸坐标（验证用）
-    if (touchLabel) {
-      lv_label_set_text_fmt(touchLabel, "TOUCH  X:%d  Y:%d", x, y);
+  // I2C 轮询 ~10ms 去抖：窗口内直接复用上次结果，避免中断风暴挤占 PSRAM 带宽
+  static uint32_t lastMs = 0;
+  static bool lastDown = false;
+  static int lastX = 0, lastY = 0;
+
+  uint32_t now = millis();
+  if (now - lastMs >= 10) {
+    lastMs = now;
+    int x, y;
+    lastDown = Touch::hasSignal() && Touch::touched(x, y);
+    if (lastDown) {
+      lastX = x;
+      lastY = y;
+      ScreenSaver::notifyActivity();  // 任何触摸按下都重置空闲计时
     }
+  }
+
+  if (lastDown) {
+    data->state = LV_INDEV_STATE_PR;
+    data->point.x = lastX;
+    data->point.y = lastY;
   } else {
     data->state = LV_INDEV_STATE_REL;
   }
@@ -46,9 +80,11 @@ bool App::begin() {
 
   // 3. 初始化 LVGL
   lv_init();
+  Serial.printf("[App] LV_COLOR_DEPTH=%d LV_COLOR_16_SWAP=%d sizeof(lv_color_t)=%d\n", LV_COLOR_DEPTH, LV_COLOR_16_SWAP, (int)sizeof(lv_color_t));
 
-  // 4. 分配显示缓冲（PSRAM）
-  uint32_t bufSize = SCREEN_WIDTH * 100;
+  // 4. 分配显示缓冲（PSRAM 双缓冲，每缓冲 120 行 ≈ 1/4 屏）
+  //    缓冲太小会让 LVGL 拆成大量小批次刷写，加剧 PSRAM 带宽争抢
+  uint32_t bufSize = SCREEN_WIDTH * 120;
   dispBuf1 = (lv_color_t*)heap_caps_malloc(sizeof(lv_color_t) * bufSize,
                                            MALLOC_CAP_SPIRAM);
   dispBuf2 = (lv_color_t*)heap_caps_malloc(sizeof(lv_color_t) * bufSize,
@@ -57,6 +93,8 @@ bool App::begin() {
     Serial.println("[App] LVGL buffer alloc failed");
     return false;
   }
+  Serial.printf("[App] buf pixels=%u bytes=%u ptr=%p\n", (unsigned)bufSize,
+                (unsigned)(sizeof(lv_color_t) * bufSize), dispBuf1);
   lv_disp_draw_buf_init(&drawBuf, dispBuf1, dispBuf2, bufSize);
 
   // 5. 注册 LVGL 显示驱动
@@ -75,31 +113,36 @@ bool App::begin() {
   indevDrv.read_cb = touchRead;
   lv_indev_drv_register(&indevDrv);
 
-  // 7. 构建验证界面（极客风）
-  lv_obj_t* scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0A0A), LV_PART_MAIN);
 
-  // 标题
-  mainLabel = lv_label_create(scr);
-  lv_label_set_text(mainLabel,
-                    "#00FF00 GEEK# #FFFFFF TERMINAL#\n"
-                    "#888888 ESP32-S3 | 480x480 | ST7701#\n\n"
-                    "#00FF00 HARDWARE OK#\n"
-                    "#00FF00 LVGL 8.3 READY#\n\n"
-                    "#FFFF00 TOUCH TO TEST#");
-  lv_label_set_recolor(mainLabel, true);
-  lv_obj_set_style_text_font(mainLabel, &lv_font_montserrat_18, 0);
-  lv_obj_align(mainLabel, LV_ALIGN_TOP_MID, 0, 40);
+  // 7. 构建各屏并接线导航（黑底 + 白色线条图标）
+  nav_clock = ClockScreen_create();
+  nav_settings = SettingsScreen_create();
+  nav_wifi = WifiScreen_create();
+  nav_game = GameScreen_create();
+  nav_browser = BrowserScreen_create();
+  nav_draw = DrawScreen_create();
+  nav_memory = MemoryScreen_create();
+  nav_sysinfo = SysInfoScreen_create();
+  nav_weather = WeatherScreen_create();
+  nav_launcher = LauncherScreen_create();
+  lv_obj_t* welcome = WelcomeScreen_create();
+  lv_scr_load(welcome);
 
-  // 触摸坐标显示
-  touchLabel = lv_label_create(scr);
-  lv_label_set_text(touchLabel, "TOUCH  --");
-  lv_obj_set_style_text_font(touchLabel, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(touchLabel, lv_color_hex(0x00FFFF), 0);
-  lv_obj_align(touchLabel, LV_ALIGN_BOTTOM_MID, 0, -40);
+  // 8. 息屏/锁屏：解锁后回到 launcher（或由 returnScr 回到进入 DIM 时的屏）
+  ScreenSaver::init(nav_launcher);
 
   Serial.println("[App] init ok");
   return true;
 }
 
-void App::loop() { lv_timer_handler(); }
+void App::loop() {
+  lv_timer_handler();
+  ScreenSaver::tick();
+  lv_obj_t* act = lv_scr_act();
+  if (act == nav_clock) ClockScreen_update();
+  if (act == nav_wifi) WifiScreen_tick();
+  if (act == nav_game) GameScreen_tick();
+  if (act == nav_browser) BrowserScreen_tick();
+  if (act == nav_sysinfo) SysInfoScreen_tick();
+  if (act == nav_weather) WeatherScreen_tick();
+}

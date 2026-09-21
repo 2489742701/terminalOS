@@ -1,9 +1,12 @@
 #include "display.h"
 #include "../config/pins.h"
 
+static const uint8_t BL_LEDC_CH = 0;  // 背光 LEDC 通道
+static bool blPwmReady = false;
+
 Arduino_ESP32RGBPanel* Display::bus = nullptr;
 Arduino_ST7701_RGBPanel* Display::panel = nullptr;
-Arduino_GFXClass* Display::gfx = nullptr;
+Arduino_GFX* Display::gfx = nullptr;
 bool Display::initialized = false;
 
 bool Display::begin() {
@@ -26,12 +29,9 @@ bool Display::begin() {
       HSYNC_FRONT_PORCH, HSYNC_PULSE_WIDTH, HSYNC_BACK_PORCH,
       VSYNC_FRONT_PORCH, VSYNC_PULSE_WIDTH, VSYNC_BACK_PORCH);
 
-  gfx = new Arduino_GFXClass(panel, panel, nullptr, nullptr);
+  gfx = panel;
 
-  if (!gfx->begin(RGB_BUS_SPEED)) {
-    Serial.println("[Display] init failed");
-    return false;
-  }
+  gfx->begin(RGB_BUS_SPEED);
 
   setBacklight(true);
   gfx->fillScreen(BLACK);
@@ -40,9 +40,22 @@ bool Display::begin() {
   return true;
 }
 
-Arduino_GFXClass* Display::getGfx() { return gfx; }
+Arduino_GFX* Display::getGfx() { return gfx; }
+
+void Display::initBacklightPWM() {
+  if (blPwmReady) return;
+  ledcSetup(BL_LEDC_CH, 5000, 8);  // 5kHz, 8-bit 分辨率
+  ledcAttachPin(PIN_BL, BL_LEDC_CH);
+  blPwmReady = true;
+}
 
 void Display::setBacklight(bool on) {
-  pinMode(PIN_BL, OUTPUT);
-  digitalWrite(PIN_BL, on ? HIGH : LOW);
+  initBacklightPWM();
+  ledcWrite(BL_LEDC_CH, on ? 255 : 0);
+}
+
+void Display::setBacklightLevel(uint8_t percent) {
+  initBacklightPWM();
+  if (percent > 100) percent = 100;
+  ledcWrite(BL_LEDC_CH, (uint32_t)percent * 255 / 100);
 }

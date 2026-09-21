@@ -1,0 +1,379 @@
+############ DIFF: geek-terminal/ ############
+warning: in the working copy of 'geek-terminal/src/config/lv_conf.h', LF will be replaced by CRLF the next time Git touches it
+diff --git a/geek-terminal/partitions_16MB.csv b/geek-terminal/partitions_16MB.csv
+index 45934b1..277a0cd 100644
+--- a/geek-terminal/partitions_16MB.csv
++++ b/geek-terminal/partitions_16MB.csv
+@@ -1,5 +1,5 @@
+-; ESP32-S3 16MB Flash ?????-; Name,   Type, SubType,  Offset,   Size,    Flags
++# ESP32-S3 16MB Flash partition table
++# Name,   Type, SubType,  Offset,   Size,    Flags
+ nvs,      data, nvs,      0x9000,   0x5000,
+ otadata,  data, ota,      0xe000,   0x2000,
+ app0,     app,  ota_0,    0x10000,  0x6F0000,
+diff --git a/geek-terminal/platformio.ini b/geek-terminal/platformio.ini
+index 6a59e42..e4f7dd2 100644
+--- a/geek-terminal/platformio.ini
++++ b/geek-terminal/platformio.ini
+@@ -1,9 +1,16 @@
+-; PlatformIO ?????? - ESP32-4848S040 ???????????-; ???: ESP32-S3-WROOM-1 (16MB Flash + 8MB Octal PSRAM)
+-;       4.0" 480x480 RGB IPS (ST7701S) + GT911 ???
++; PlatformIO Project Configuration File
++;
++;   Build options: build flags, source filter
++;   Upload options: custom upload port, speed and extra flags
++;   Library options: dependencies, extra library storages
++;   Advanced options: extra scripting
++;
++; Please visit documentation for the other options and examples
++; https://docs.platformio.org/page/projectconf.html
+ 
+ [platformio]
+ default_envs = esp32s3
++build_dir = .wb_build
+ 
+ [env]
+ platform = espressif32@^6.0.0
+@@ -14,32 +21,24 @@ upload_speed = 921600
+ [env:esp32s3]
+ board = esp32-s3-devkitc-1
+ board_build.flash_size = 16MB
++board_build.flash_mode = dio
+ board_build.partitions = partitions_16MB.csv
+-board_build.arduino.memory_type = qspi_opi  ; Flash QSPI + PSRAM Octal
+-
+-; ???
++board_build.arduino.memory_type = qio_opi
+ upload_port = COM7
+ monitor_port = COM7
+ monitor_filters = esp32_exception_decoder, time
+-
+-; ???????????????????????? Libraries ?????-lib_extra_dirs =
+-  ${PROJECTSRC}/../../4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries
+-
+-; ??????
+-build_flags =
+-  -DBOARD_HAS_PSRAM
+-  ; PSRAM 8MB Octal
+-  -DCONFIG_SPIRAM_USE_MALLOC=1
+-  -DCONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=1
+-  ; LVGL ??????
+-  -I ${PROJECTSRC}/config
+-  ; CPU ???
+-  -DF_CPU=240000000L
+-  ; ???
+-  -DCORE_DEBUG_LEVEL=1
+-  ; ??????
+-  -DLV_COLOR_16_SWAP=0
+-
+-lib_deps =
+-  adafruit/Adafruit BusIO@^1.11.0
+\ No newline at end of file
++lib_extra_dirs = 
++	${PROJECT_DIR}/../4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries
++lib_ignore = 
++	Time
++build_flags = 
++	-DBOARD_HAS_PSRAM
++	-DCONFIG_SPIRAM_USE_MALLOC=1
++	-DCONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=1
++	-DF_CPU=240000000L
++	-DCORE_DEBUG_LEVEL=1
++	-DLV_COLOR_16_SWAP=0
++	-D_GNU_SOURCE
++lib_deps = 
++	adafruit/Adafruit BusIO@^1.11.0
++	tamctec/TAMC_GT911@^1.0.2
+diff --git a/geek-terminal/src/app/app.cpp b/geek-terminal/src/app/app.cpp
+index 2e3ca62..9d08409 100644
+--- a/geek-terminal/src/app/app.cpp
++++ b/geek-terminal/src/app/app.cpp
+@@ -3,15 +3,20 @@
+ #include "../hal/touch.h"
+ #include "../config/pins.h"
+ #include <lvgl.h>
++#include "screensaver.h"
++#include "nav.h"
++#include "launcher.h"
++#include "clock.h"
++#include "settings.h"
+ 
+-// LVGL ?????????????????? 100 ???
++// LVGL ???????????RAM ???????????demo ?????
+ static lv_disp_draw_buf_t drawBuf;
+ static lv_color_t* dispBuf1 = nullptr;
+-static lv_color_t* dispBuf2 = nullptr;
+ 
+-// ?????????????????????????????Launcher ?????-static lv_obj_t* mainLabel;
+-static lv_obj_t* touchLabel;
++// ???????????????
++lv_obj_t* nav_launcher = nullptr;
++lv_obj_t* nav_clock = nullptr;
++lv_obj_t* nav_settings = nullptr;
+ 
+ void App::dispFlush(lv_disp_drv_t* disp, const lv_area_t* area,
+                     lv_color_t* colorP) {
+@@ -28,10 +33,7 @@ void App::touchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
+     data->state = LV_INDEV_STATE_PR;
+     data->point.x = x;
+     data->point.y = y;
+-    // ????????????????????-    if (touchLabel) {
+-      lv_label_set_text_fmt(touchLabel, "TOUCH  X:%d  Y:%d", x, y);
+-    }
++    ScreenSaver::notifyActivity();  // ????????????????????   } else {
+     data->state = LV_INDEV_STATE_REL;
+   }
+@@ -46,18 +48,19 @@ bool App::begin() {
+ 
+   // 3. ?????LVGL
+   lv_init();
++  Serial.printf("[App] LV_COLOR_DEPTH=%d LV_COLOR_16_SWAP=%d sizeof(lv_color_t)=%d\n", LV_COLOR_DEPTH, LV_COLOR_16_SWAP, (int)sizeof(lv_color_t));
+ 
+-  // 4. ???????????SRAM??-  uint32_t bufSize = SCREEN_WIDTH * 100;
++  // 4. ??????????????RAM ???????????demo ?????
++  //    PSRAM ???????????RGB DMA ??????
++  uint32_t bufSize = SCREEN_WIDTH * 200;
+   dispBuf1 = (lv_color_t*)heap_caps_malloc(sizeof(lv_color_t) * bufSize,
+-                                           MALLOC_CAP_SPIRAM);
+-  dispBuf2 = (lv_color_t*)heap_caps_malloc(sizeof(lv_color_t) * bufSize,
+-                                           MALLOC_CAP_SPIRAM);
+-  if (!dispBuf1 || !dispBuf2) {
++                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
++  if (!dispBuf1) {
+     Serial.println("[App] LVGL buffer alloc failed");
+     return false;
+   }
+-  lv_disp_draw_buf_init(&drawBuf, dispBuf1, dispBuf2, bufSize);
++  Serial.printf("[App] buf pixels=%u bytes=%u ptr=%p\n", (unsigned)bufSize, (unsigned)(sizeof(lv_color_t)*bufSize), dispBuf1);
++  lv_disp_draw_buf_init(&drawBuf, dispBuf1, NULL, bufSize);
+ 
+   // 5. ??? LVGL ??????
+   static lv_disp_drv_t dispDrv;
+@@ -75,31 +78,21 @@ bool App::begin() {
+   indevDrv.read_cb = touchRead;
+   lv_indev_drv_register(&indevDrv);
+ 
+-  // 7. ?????????????????-  lv_obj_t* scr = lv_scr_act();
+-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A0A0A), LV_PART_MAIN);
++  // 7. ?????????????????? + ???????????+  nav_clock = ClockScreen_create();
++  nav_settings = SettingsScreen_create();
++  nav_launcher = LauncherScreen_create();
++  lv_scr_load(nav_launcher);
+ 
+-  // ???
+-  mainLabel = lv_label_create(scr);
+-  lv_label_set_text(mainLabel,
+-                    "#00FF00 GEEK# #FFFFFF TERMINAL#\n"
+-                    "#888888 ESP32-S3 | 480x480 | ST7701#\n\n"
+-                    "#00FF00 HARDWARE OK#\n"
+-                    "#00FF00 LVGL 8.3 READY#\n\n"
+-                    "#FFFF00 TOUCH TO TEST#");
+-  lv_label_set_recolor(mainLabel, true);
+-  lv_obj_set_style_text_font(mainLabel, &lv_font_montserrat_18, 0);
+-  lv_obj_align(mainLabel, LV_ALIGN_TOP_MID, 0, 40);
+-
+-  // ?????????
+-  touchLabel = lv_label_create(scr);
+-  lv_label_set_text(touchLabel, "TOUCH  --");
+-  lv_obj_set_style_text_font(touchLabel, &lv_font_montserrat_14, 0);
+-  lv_obj_set_style_text_color(touchLabel, lv_color_hex(0x00FFFF), 0);
+-  lv_obj_align(touchLabel, LV_ALIGN_BOTTOM_MID, 0, -40);
++  // 8. ???/???????????? launcher?????returnScr ?????? DIM ??????
++  ScreenSaver::init(nav_launcher);
+ 
+   Serial.println("[App] init ok");
+   return true;
+ }
+ 
+-void App::loop() { lv_timer_handler(); }
+\ No newline at end of file
++void App::loop() {
++  lv_timer_handler();
++  ScreenSaver::tick();  // ????????????????/ OFF ???
++  if (lv_scr_act() == nav_clock) ClockScreen_update();  // ???????????+}
+diff --git a/geek-terminal/src/app/app.h b/geek-terminal/src/app/app.h
+index b521aa9..d59ca21 100644
+--- a/geek-terminal/src/app/app.h
++++ b/geek-terminal/src/app/app.h
+@@ -1,6 +1,8 @@
+ #ifndef APP_APP_H
+ #define APP_APP_H
+ 
++#include <lvgl.h>
++
+ class App {
+  public:
+   // ????????????+???+LVGL+UI??diff --git a/geek-terminal/src/config/lv_conf.h b/geek-terminal/src/config/lv_conf.h
+index 91c24c2..670cd64 100644
+--- a/geek-terminal/src/config/lv_conf.h
++++ b/geek-terminal/src/config/lv_conf.h
+@@ -371,7 +371,7 @@
+ #define LV_FONT_MONTSERRAT_42 0
+ #define LV_FONT_MONTSERRAT_44 0
+ #define LV_FONT_MONTSERRAT_46 0
+-#define LV_FONT_MONTSERRAT_48 0
++#define LV_FONT_MONTSERRAT_48 1
+ 
+ /*Demonstrate special features*/
+ #define LV_FONT_MONTSERRAT_12_SUBPX      0
+diff --git a/geek-terminal/src/hal/display.cpp b/geek-terminal/src/hal/display.cpp
+index f7378ee..e6ab530 100644
+--- a/geek-terminal/src/hal/display.cpp
++++ b/geek-terminal/src/hal/display.cpp
+@@ -1,9 +1,12 @@
+ #include "display.h"
+ #include "../config/pins.h"
+ 
++static const uint8_t BL_LEDC_CH = 0;  // ??? LEDC ???
++static bool blPwmReady = false;
++
+ Arduino_ESP32RGBPanel* Display::bus = nullptr;
+ Arduino_ST7701_RGBPanel* Display::panel = nullptr;
+-Arduino_GFXClass* Display::gfx = nullptr;
++Arduino_GFX* Display::gfx = nullptr;
+ bool Display::initialized = false;
+ 
+ bool Display::begin() {
+@@ -26,12 +29,9 @@ bool Display::begin() {
+       HSYNC_FRONT_PORCH, HSYNC_PULSE_WIDTH, HSYNC_BACK_PORCH,
+       VSYNC_FRONT_PORCH, VSYNC_PULSE_WIDTH, VSYNC_BACK_PORCH);
+ 
+-  gfx = new Arduino_GFXClass(panel, panel, nullptr, nullptr);
++  gfx = panel;
+ 
+-  if (!gfx->begin(RGB_BUS_SPEED)) {
+-    Serial.println("[Display] init failed");
+-    return false;
+-  }
++  gfx->begin(RGB_BUS_SPEED);
+ 
+   setBacklight(true);
+   gfx->fillScreen(BLACK);
+@@ -40,9 +40,22 @@ bool Display::begin() {
+   return true;
+ }
+ 
+-Arduino_GFXClass* Display::getGfx() { return gfx; }
++Arduino_GFX* Display::getGfx() { return gfx; }
++
++void Display::initBacklightPWM() {
++  if (blPwmReady) return;
++  ledcSetup(BL_LEDC_CH, 5000, 8);  // 5kHz, 8-bit ?????+  ledcAttachPin(PIN_BL, BL_LEDC_CH);
++  blPwmReady = true;
++}
+ 
+ void Display::setBacklight(bool on) {
+-  pinMode(PIN_BL, OUTPUT);
+-  digitalWrite(PIN_BL, on ? HIGH : LOW);
++  initBacklightPWM();
++  ledcWrite(BL_LEDC_CH, on ? 255 : 0);
++}
++
++void Display::setBacklightLevel(uint8_t percent) {
++  initBacklightPWM();
++  if (percent > 100) percent = 100;
++  ledcWrite(BL_LEDC_CH, (uint32_t)percent * 255 / 100);
+ }
+\ No newline at end of file
+diff --git a/geek-terminal/src/hal/display.h b/geek-terminal/src/hal/display.h
+index 2cd0858..809b7ae 100644
+--- a/geek-terminal/src/hal/display.h
++++ b/geek-terminal/src/hal/display.h
+@@ -11,15 +11,21 @@ class Display {
+   static bool begin();
+ 
+   // ??? GFX ?????????
+-  static Arduino_GFXClass* getGfx();
++  static Arduino_GFX* getGfx();
+ 
+-  // ???????+  // ??????????? / ?????   static void setBacklight(bool on);
+ 
++  // ????????? 0~100??WM ????????DIM ?????+  static void setBacklightLevel(uint8_t percent);
++
+  private:
++  // ????????PWM??EDC??????
++  static void initBacklightPWM();
++
+   static Arduino_ESP32RGBPanel* bus;
+   static Arduino_ST7701_RGBPanel* panel;
+-  static Arduino_GFXClass* gfx;
++  static Arduino_GFX* gfx;
+   static bool initialized;
+ };
+ 
+diff --git a/geek-terminal/src/main.cpp b/geek-terminal/src/main.cpp
+index 966a4f7..e5377d6 100644
+--- a/geek-terminal/src/main.cpp
++++ b/geek-terminal/src/main.cpp
+@@ -16,4 +16,4 @@ void setup() {
+ void loop() {
+   App::loop();
+   delay(5);
+-}
+\ No newline at end of file
++}
+
+############ DIFF: vendored libs ############
+warning: in the working copy of '4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Lvgl/lv_conf.h', LF will be replaced by CRLF the next time Git touches it
+diff --git a/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD16.cpp b/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD16.cpp
+index df69eb8..2f715e8 100644
+--- a/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD16.cpp
++++ b/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD16.cpp
+@@ -4,6 +4,12 @@
+  */
+ #include "Arduino_ESP32LCD16.h"
+ 
++// ESP-IDF 5.3+ renamed LCD_CAM_LCD_UPDATE_REG -> LCD_CAM_LCD_UPDATE (bit 20 preserved).
++// Shim keeps this file compatible with both old (ESP-IDF <=5.1) and new cores.
++#if !defined(LCD_CAM_LCD_UPDATE_REG) && defined(LCD_CAM_LCD_UPDATE)
++#define LCD_CAM_LCD_UPDATE_REG LCD_CAM_LCD_UPDATE
++#endif
++
+ #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)
+ 
+ #define WAIT_LCD_NOT_BUSY while (LCD_CAM.lcd_user.val & LCD_CAM_LCD_START)
+diff --git a/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD8.cpp b/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD8.cpp
+index 7d4e708..f83f09d 100644
+--- a/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD8.cpp
++++ b/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD8.cpp
+@@ -4,6 +4,12 @@
+  */
+ #include "Arduino_ESP32LCD8.h"
+ 
++// ESP-IDF 5.3+ renamed LCD_CAM_LCD_UPDATE_REG -> LCD_CAM_LCD_UPDATE (bit 20 preserved).
++// Shim keeps this file compatible with both old (ESP-IDF <=5.1) and new cores.
++#if !defined(LCD_CAM_LCD_UPDATE_REG) && defined(LCD_CAM_LCD_UPDATE)
++#define LCD_CAM_LCD_UPDATE_REG LCD_CAM_LCD_UPDATE
++#endif
++
+ #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32S3)
+ 
+ #define WAIT_LCD_NOT_BUSY while (LCD_CAM.lcd_user.val & LCD_CAM_LCD_START)
+diff --git a/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Lvgl/lv_conf.h b/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Lvgl/lv_conf.h
+index 91c24c2..21afd9b 100644
+--- a/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Lvgl/lv_conf.h
++++ b/4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Lvgl/lv_conf.h
+@@ -359,7 +359,7 @@
+ #define LV_FONT_MONTSERRAT_18 1
+ #define LV_FONT_MONTSERRAT_20 1
+ #define LV_FONT_MONTSERRAT_22 0
+-#define LV_FONT_MONTSERRAT_24 0
++#define LV_FONT_MONTSERRAT_24 1
+ #define LV_FONT_MONTSERRAT_26 0
+ #define LV_FONT_MONTSERRAT_28 0
+ #define LV_FONT_MONTSERRAT_30 0
+@@ -371,7 +371,7 @@
+ #define LV_FONT_MONTSERRAT_42 0
+ #define LV_FONT_MONTSERRAT_44 0
+ #define LV_FONT_MONTSERRAT_46 0
+-#define LV_FONT_MONTSERRAT_48 0
++#define LV_FONT_MONTSERRAT_48 1
+ 
+ /*Demonstrate special features*/
+ #define LV_FONT_MONTSERRAT_12_SUBPX      0
+
+############ untracked geek_terminal/ ############
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\geek_terminal\build_opt.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\geek_terminal\geek_terminal.ino
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\geek_terminal\lv_conf.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\geek_terminal\touch.h

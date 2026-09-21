@@ -1,0 +1,6 @@
+﻿framework-arduinoespressif32
+tool-esptoolpy
+tool-scons
+toolchain-riscv32-esp
+toolchain-xtensa-esp32
+toolchain-xtensa-esp32s3

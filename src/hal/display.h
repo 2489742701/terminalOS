@@ -11,15 +11,21 @@ class Display {
   static bool begin();
 
   // 获取 GFX 绘图对象单例
-  static Arduino_GFXClass* getGfx();
+  static Arduino_GFX* getGfx();
 
-  // 开关背光
+  // 开关背光（全亮 / 全灭）
   static void setBacklight(bool on);
 
+  // 设置背光亮度 0~100（PWM 调光，息屏 DIM 态用）
+  static void setBacklightLevel(uint8_t percent);
+
  private:
+  // 初始化背光 PWM（LEDC），幂等
+  static void initBacklightPWM();
+
   static Arduino_ESP32RGBPanel* bus;
   static Arduino_ST7701_RGBPanel* panel;
-  static Arduino_GFXClass* gfx;
+  static Arduino_GFX* gfx;
   static bool initialized;
 };
 

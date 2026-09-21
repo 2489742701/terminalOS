@@ -1,0 +1,152 @@
+############ tools/ (logs, newest first) ############
+09/22/2026 02:44:12  otherai_full_diff.txt  14455b
+09/22/2026 02:43:36  otherai_diff.txt  2153b
+09/22/2026 00:49:42  gt911_find.txt  1570b
+09/22/2026 00:48:30  flash_real.out.txt  1930b
+09/22/2026 00:48:30  cap_real.log  1155b
+09/22/2026 00:47:56  flash_real.ps1  948b
+09/22/2026 00:47:45  build_real.log  2734b
+09/22/2026 00:47:07  restore_check.txt  2174b
+09/22/2026 00:46:12  cap_dio_opi.log  5585b
+09/22/2026 00:45:38  flash_opi_dio.out.txt  1667b
+09/22/2026 00:45:27  flash_opi_dio.ps1  879b
+09/22/2026 00:45:17  state_check.txt  789b
+09/22/2026 00:43:58  build_opi.log  71852b
+09/22/2026 00:42:19  cap_dio.log  30006b
+09/22/2026 00:41:59  flash_dio.log  1667b
+09/22/2026 00:41:45  build_dio.log  71852b
+09/22/2026 00:40:07  cap_factory.log  1439b
+09/22/2026 00:39:48  flash_factory.log  2136b
+09/22/2026 00:38:21  cap_diag_e.log  4208b
+09/22/2026 00:38:02  flash_diag_e.log  1439b
+09/22/2026 00:37:58  erase.log  366b
+09/22/2026 00:36:44  cap_diag40.log  4208b
+09/22/2026 00:36:26  flash_diag40.log  1437b
+09/22/2026 00:35:03  flash_id.log  413b
+09/22/2026 00:34:37  cap_diag.log  4208b
+09/22/2026 00:34:19  flash_diag.log  1437b
+09/22/2026 00:33:57  build_diag.log  4260b
+09/22/2026 00:31:03  cap_nopsram.log  4208b
+09/22/2026 00:30:44  flash_nopsram.log  1634b
+09/22/2026 00:30:24  build_nopsram.log  71852b
+09/22/2026 00:26:18  cap_qspi.log  4208b
+09/22/2026 00:25:54  cap_log.py  692b
+09/22/2026 00:25:23  flash3.log  1667b
+09/22/2026 00:24:58  flash2.log  856b
+09/22/2026 00:24:17  flash_qspi_clean.log  1428b
+09/22/2026 00:23:58  flash_qspi.log  2842b
+09/22/2026 00:23:30  verify_qspi.log  1708b
+09/22/2026 00:23:07  build_qspi.log  73066b
+09/22/2026 00:09:20  cap_sanity.log  2826b
+09/22/2026 00:09:00  flash_sanity.log  1667b
+09/22/2026 00:08:34  build_sanity.log  2241b
+09/21/2026 23:59:26  cap_out.log  2643b
+09/21/2026 23:52:08  pio_esptool.log  1897b
+09/21/2026 23:47:03  pio_flash.log  8060b
+09/21/2026 23:45:42  pio_bu.log  4160b
+09/21/2026 23:32:50  pio_upload.log  7916b
+09/21/2026 23:15:16  pio_run2.log  296937b
+09/21/2026 23:07:44  pio_verbose.log  793876b
+09/21/2026 18:19:41  pio_run_v.log  327332b
+09/21/2026 18:19:26  run_build_v.py  532b
+09/21/2026 18:04:47  run_build.py  670b
+09/21/2026 18:03:58  pkgs_list.txt  134b
+09/21/2026 18:02:03  build_status.txt  137b
+09/21/2026 17:50:51  run_build_err.log  0b
+09/21/2026 17:50:51  run_build_console.log  0b
+09/21/2026 17:46:39  tamc_install3.log  1352b
+09/21/2026 17:46:25  run_libinstall.py  630b
+09/21/2026 17:45:04  tamc_fetch.log  304b
+09/21/2026 17:44:57  fetch_tamc.py  2991b
+09/21/2026 17:40:19  tamc_install.log  2136b
+09/21/2026 17:27:29  pio_run_final.log  19163b
+09/21/2026 17:13:23  framework_seed.log  1031b
+09/21/2026 16:54:40  pio_plat.log  4740b
+09/21/2026 16:45:52  framework_seed.py  4280b
+09/21/2026 16:27:10  framework_dl.log  0b
+09/21/2026 16:27:10  framework_dl.py  1455b
+09/21/2026 16:22:53  pio_run6.log  607b
+09/21/2026 16:17:21  pio_run5.log  525b
+09/21/2026 16:09:50  pio_run4.log  273b
+09/21/2026 15:59:34  pio_run3.log  273b
+09/21/2026 13:33:08  pio_run.log  2433b
+09/21/2026 02:47:53  dl_2017.py  2392b
+09/21/2026 02:47:53  dl_missing.py  2982b
+09/21/2026 02:47:53  list_hosts.py  1096b
+09/21/2026 02:47:53  parse_deps.py  3996b
+09/21/2026 02:40:48  install_2017d.log  4316b
+09/21/2026 02:38:49  install_2017c.log  4274b
+09/21/2026 02:37:43  install_2017b.log  3612b
+09/21/2026 02:35:52  check_deps.py  550b
+09/21/2026 02:35:20  install_2017.log  876b
+09/21/2026 02:30:59  compile11.log  106694b
+09/21/2026 02:22:18  compile10.log  6820b
+09/21/2026 02:08:30  compile8.log  11618b
+09/21/2026 02:02:02  compile7.log  3296b
+09/21/2026 02:01:11  compile6.log  3946b
+09/21/2026 01:59:40  compile5.log  4118b
+09/21/2026 01:58:47  compile4.log  5212b
+09/21/2026 01:57:51  compile3.log  4790b
+09/21/2026 01:56:52  test.cpp  53b
+09/21/2026 01:51:42  compile2.log  4790b
+09/21/2026 01:51:19  compile1.log  982b
+09/21/2026 01:47:20  install6.log  7282b
+09/21/2026 01:42:47  install5.log  4864b
+09/21/2026 01:41:14  install4.log  4076b
+09/21/2026 01:40:24  install3.log  3864b
+09/21/2026 01:39:47  install2.log  3864b
+09/21/2026 01:39:12  install.log  72212b
+09/21/2026 01:15:27  dl_x86_64.log  3794b
+09/21/2026 01:08:37  install7.log  541654b
+09/21/2026 00:53:01  dl3.log  98592b
+09/21/2026 00:37:26  dl2.log  440452b
+09/20/2026 23:48:29  dl.log  6664b
+11/22/2024 09:32:26  arduino-cli.exe  33986048b
+11/22/2024 09:31:32  LICENSE.txt  35149b
+
+############ .wb_build/esp32s3 artifacts ############
+09/22/2026 02:42:04  .sconsign310.dblite  5986163b
+09/22/2026 02:42:04  firmware.bin  696544b
+09/22/2026 02:42:04  firmware.map  11859267b
+09/22/2026 02:42:04  firmware.elf  12469516b
+09/22/2026 02:10:41  libFrameworkArduino.a  4334608b
+09/22/2026 02:10:16  longcmd-f99676fa73b2a24b7a511177ecadc5a6  10111b
+09/22/2026 02:10:15  bootloader.bin  14032b
+09/22/2026 02:10:15  partitions.bin  3072b
+
+############ geek_terminal.ino display config ############
+L7: Arduino_ESP32RGBPanel *bus = new Arduino_ESP32RGBPanel(
+L9:   18 /* DE */, 17 /* VSYNC */, 16 /* HSYNC */, 21 /* PCLK */,
+L15: Arduino_ST7701_RGBPanel *gfx = new Arduino_ST7701_RGBPanel(
+L16:   bus, GFX_NOT_DEFINED /* RST */, 0 /* rotation */,
+L17:   true /*IPS */, 480 /* width */, 480 /* height */,
+L18:   st7701_type1_init_operations, sizeof(st7701_type1_init_operations), true /* BGR */,
+L19:   10 /* hsync_front_porch */, 8 /* hsync_pulse_width */, 50 /* hsync_back_porch */,
+L20:   10 /* vsync_front_porch */, 8 /* vsync_pulse_width */, 20 /* vsync_back_porch */
+L25: static uint32_t screenWidth, screenHeight;
+L26: static lv_disp_draw_buf_t draw_buf;
+L27: static lv_color_t *disp_draw_buf;
+L31: void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
+L54:   lv_obj_set_style_bg_color(scr, lv_color_hex(0x0a0a0a), LV_PART_MAIN);
+L59:   lv_obj_set_style_text_color(title, lv_color_hex(0x00ff88), LV_PART_MAIN);
+L66:   lv_obj_set_style_text_color(sub, lv_color_hex(0x888888), LV_PART_MAIN);
+L73:   lv_obj_set_style_bg_color(card, lv_color_hex(0x1a1a2e), LV_PART_MAIN);
+L74:   lv_obj_set_style_border_color(card, lv_color_hex(0x00ff88), LV_PART_MAIN);
+L75:   lv_obj_set_style_border_width(card, 2, LV_PART_MAIN);
+L92:   lv_obj_set_style_text_color(hint, lv_color_hex(0x444444), LV_PART_MAIN);
+L97:   Serial.begin(115200);
+L102:   gfx->begin(16000000);
+L109:   screenWidth = gfx->width();
+L110:   screenHeight = gfx->height();
+L112:   disp_draw_buf = (lv_color_t *)heap_caps_malloc(
+L113:     sizeof(lv_color_t) * screenWidth * 200, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+L114:   if (!disp_draw_buf) {
+L115:     Serial.println("[FATAL] LVGL buf alloc failed!");
+L119:   lv_disp_draw_buf_init(&draw_buf, disp_draw_buf, NULL, screenWidth * 200);
+L121:   disp_drv.hor_res = screenWidth;
+L122:   disp_drv.ver_res = screenHeight;
+L124:   disp_drv.draw_buf = &draw_buf;
+
+############ geek_terminal/lv_conf.h color settings ############
+L27: #define LV_COLOR_DEPTH 16
+L30: #define LV_COLOR_16_SWAP 0

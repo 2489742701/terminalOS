@@ -1,0 +1,45 @@
+=== git status ===
+ M ../4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD16.cpp
+ M ../4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Arduino_GFX-master/src/databus/Arduino_ESP32LCD8.cpp
+ M ../4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries/Lvgl/lv_conf.h
+ M partitions_16MB.csv
+ M platformio.ini
+ M src/app/app.cpp
+ M src/app/app.h
+ M src/config/lv_conf.h
+ M src/hal/display.cpp
+ M src/hal/display.h
+ M src/main.cpp
+?? ../.workbuddy/
+?? .wb_build/
+?? diag_blink/
+?? geek_terminal/
+?? src/app/clock.cpp
+?? src/app/clock.h
+?? src/app/icons.cpp
+?? src/app/icons.h
+?? src/app/launcher.cpp
+?? src/app/launcher.h
+?? src/app/nav.h
+?? src/app/screensaver.cpp
+?? src/app/screensaver.h
+?? src/app/settings.cpp
+?? src/app/settings.h
+?? tools/
+?? "../\345\217\202\350\200\203\351\241\271\347\233\256/"
+=== git log main.cpp ===
+4be23d6 feat: ??? PlatformIO ?????? (geek-terminal)
+=== files in src/app ===
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\app.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\app.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\clock.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\clock.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\icons.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\icons.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\launcher.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\launcher.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\nav.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\screensaver.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\screensaver.h
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\settings.cpp
+C:\Users\longyaosi\Downloads\C3713 4.0inch_ESP32-4848S040\geek-terminal\src\app\settings.h

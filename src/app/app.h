@@ -1,6 +1,8 @@
 #ifndef APP_APP_H
 #define APP_APP_H
 
+#include <lvgl.h>
+
 class App {
  public:
   // 初始化应用（显示+触摸+LVGL+UI）
