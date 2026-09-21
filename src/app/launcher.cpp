@@ -9,14 +9,57 @@ namespace {
 struct AppEntry {
   Icon icon;
   const char* label;
-  lv_obj_t** target;  // 指向 nav_xxx 全局指针
+  lv_obj_t** target;
 };
+
+struct TileData {
+  lv_obj_t** target;
+  Icon icon;
+  const char* label;
+};
+
+TileData g_tileData[12];
+
+void anim_opa_cb(void* var, int32_t v) {
+  lv_obj_set_style_opa((lv_obj_t*)var, (lv_opa_t)v, 0);
+}
+
+void splashTimer_cb(lv_timer_t* t) {
+  TileData* td = (TileData*)t->user_data;
+  lv_timer_del(t);
+  if (td && td->target && *td->target) {
+    lv_scr_load_anim(*td->target, LV_SCR_LOAD_ANIM_OVER_RIGHT, 300, 0, false);
+    nav_lock_until = lv_tick_get() + 600;
+  }
+}
 
 void tile_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (nav_is_locked()) return;
-  lv_obj_t** pscr = (lv_obj_t**)lv_event_get_user_data(e);
-  if (pscr && *pscr) nav_go_anim(*pscr, LV_SCR_LOAD_ANIM_OVER_RIGHT, 300);
+  TileData* td = (TileData*)lv_event_get_user_data(e);
+  if (!td || !td->target || !*td->target) return;
+
+  lv_obj_t* splash = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(splash, lv_color_black(), 0);
+  lv_obj_set_style_bg_opa(splash, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(splash, 0, 0);
+  lv_obj_set_style_pad_all(splash, 0, 0);
+  lv_obj_clear_flag(splash, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t* bigIcon = icon_create(splash, td->icon, 120);
+  lv_obj_align(bigIcon, LV_ALIGN_CENTER, 0, -30);
+
+  lv_obj_t* lab = lv_label_create(splash);
+  lv_label_set_text(lab, td->label);
+  lv_obj_set_style_text_color(lab, lv_color_hex(0x888888), 0);
+  lv_obj_set_style_text_font(lab, &font_zh_24, 0);
+  lv_obj_align(lab, LV_ALIGN_CENTER, 0, 60);
+
+  lv_scr_load_anim(splash, LV_SCR_LOAD_ANIM_OVER_RIGHT, 200, 0, true);
+  nav_lock_until = lv_tick_get() + 500;
+
+  lv_timer_t* timer = lv_timer_create(splashTimer_cb, 220, td);
+  lv_timer_set_repeat_count(timer, 1);
 }
 
 void addTile(lv_obj_t* scr, const AppEntry& entry, int idx) {
@@ -29,6 +72,10 @@ void addTile(lv_obj_t* scr, const AppEntry& entry, int idx) {
   int x = startX + col * (tileW + gap);
   int y = startY + row * (tileH + gap);
 
+  g_tileData[idx].target = entry.target;
+  g_tileData[idx].icon = entry.icon;
+  g_tileData[idx].label = entry.label;
+
   lv_obj_t* tile = lv_obj_create(scr);
   lv_obj_set_size(tile, tileW, tileH);
   lv_obj_set_pos(tile, x, y);
@@ -39,6 +86,7 @@ void addTile(lv_obj_t* scr, const AppEntry& entry, int idx) {
   lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_style_bg_color(tile, lv_color_hex(0x161616), LV_STATE_PRESSED);
   lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, LV_STATE_PRESSED);
+
   lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
 
   lv_obj_t* ic = icon_create(tile, entry.icon, 52);
@@ -50,8 +98,17 @@ void addTile(lv_obj_t* scr, const AppEntry& entry, int idx) {
   lv_obj_set_style_text_font(lab, &font_zh_16, 0);
   lv_obj_align(lab, LV_ALIGN_BOTTOM_MID, 0, -24);
 
-  // event user_data 存指向 nav_xxx 全局指针的指针，点击时解引用取实时目标屏
-  lv_obj_add_event_cb(tile, tile_event_cb, LV_EVENT_CLICKED, (void*)entry.target);
+  lv_obj_add_event_cb(tile, tile_event_cb, LV_EVENT_CLICKED, (void*)&g_tileData[idx]);
+
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, tile);
+  lv_anim_set_values(&a, 0, 255);
+  lv_anim_set_time(&a, 300);
+  lv_anim_set_delay(&a, idx * 40);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+  lv_anim_set_exec_cb(&a, anim_opa_cb);
+  lv_anim_start(&a);
 }
 
 }  // namespace
@@ -69,16 +126,15 @@ lv_obj_t* LauncherScreen_create() {
   lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 56);
 
-  // v1 应用入口：时钟 + 设置 + WiFi + 游戏 + 浏览器
   AppEntry entries[] = {
-      {Icon::Clock,   "时钟",   &nav_clock},
+      {Icon::Clock,    "时钟",   &nav_clock},
       {Icon::Settings, "设置",   &nav_settings},
-      {Icon::Wifi,    "无线",   &nav_wifi},
-      {Icon::Game,    "游戏",   &nav_game},
-      {Icon::Browser, "浏览器", &nav_browser},
+      {Icon::Wifi,     "无线",   &nav_wifi},
+      {Icon::Game,     "游戏",   &nav_game},
+      {Icon::Browser,  "浏览器", &nav_browser},
       {Icon::Terminal, "画板",   &nav_draw},
-      {Icon::Music,   "记忆",   &nav_memory},
-      {Icon::Power,   "系统",   &nav_sysinfo},
+      {Icon::Music,    "记忆",   &nav_memory},
+      {Icon::Power,    "系统",   &nav_sysinfo},
       {Icon::Weather,  "天气",   &nav_weather},
   };
   for (int i = 0; i < (int)(sizeof(entries) / sizeof(entries[0])); i++) {
