@@ -18,7 +18,7 @@
 
 // ---- 可调参数 ----
 static const unsigned long ACTIVE_TIMEOUT_MS   = 30000;   // 30s 无操作 -> DIM
-static const unsigned long DIM_TIMEOUT_MS      = 180000;  // 3min 在 DIM -> OFF
+static const unsigned long DIM_TIMEOUT_MS      = 10000;   // 10s 在 DIM -> OFF
 static const uint8_t       DIM_BACKLIGHT_PCT   = 15;      // DIM 背光亮度(%)
 
 
@@ -89,7 +89,7 @@ void ScreenSaver::buildDimScreen() {
 
   // 提示文字
   lv_obj_t* hint = lv_label_create(dimScr);
-  lv_label_set_text(hint, "滑动解锁");
+  lv_label_set_text(hint, "滑动解锁  双击关屏");
   lv_obj_set_style_text_color(hint, lv_color_hex(0x555555), 0);
   lv_obj_set_style_text_font(hint, &font_zh_16, 0);
   lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -60);
@@ -103,7 +103,7 @@ void ScreenSaver::gesture_event_cb(lv_event_t* e) {
     pressX = p.x; pressY = p.y; unlocked = false;
 
     unsigned long now = millis();
-    if (now - lastTapMs < 350) {
+    if (now - lastTapMs < 500) {
       enterOff();
       lastTapMs = 0;
     } else {
@@ -151,7 +151,7 @@ void ScreenSaver::sleepNow() {
 }
 
 void ScreenSaver::notifyActivity() {
-  lastActivityMs = millis();
+  if (state == ACTIVE) lastActivityMs = millis();
 }
 
 void ScreenSaver::tick() {
@@ -165,9 +165,7 @@ void ScreenSaver::tick() {
     int x = 0, y = 0;
     if (Touch::touched(x, y)) {
       enterDim(false);
-    } else {
-      esp_sleep_enable_timer_wakeup(200000);
-      esp_light_sleep_start();
+
     }
   }
 }
