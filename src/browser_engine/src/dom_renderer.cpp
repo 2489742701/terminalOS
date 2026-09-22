@@ -478,6 +478,18 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
     }
   }
 
+  /* 过滤空容器：div/container 无文本、无子节点、无显式宽高和背景色 → 跳过。
+     百度首页有大量嵌套空 div 只含 script，渲染出来是一堆空框。 */
+  if ((elem_type == ELEMENT_DIV || elem_type == ELEMENT_CONTAINER) &&
+      !layout_node->text_content &&
+      !layout_node->first_child &&
+      layout_node->box.width == 0 &&
+      layout_node->box.height == 0 &&
+      !layout_node->box.has_explicit_bg_color) {
+    layout_node_destroy(layout_node);
+    return NULL;
+  }
+
   return layout_node;
 }
 

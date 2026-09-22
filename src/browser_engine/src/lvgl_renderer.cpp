@@ -285,7 +285,17 @@ static void *lvgl_renderer_create_container(Renderer *renderer, int x, int y,
                                             int width, int height) {
   lv_obj_t *container = lv_obj_create((lv_obj_t *)renderer->platform_data);
   lv_obj_set_pos(container, x, y);
-  lv_obj_set_size(container, width, height);
+  /* 布局引擎对 auto 尺寸的 div 传 0，用内容自适应避免 0x0 不可见 */
+  if (width > 0) {
+    lv_obj_set_width(container, width);
+  } else {
+    lv_obj_set_width(container, lv_pct(100));
+  }
+  if (height > 0) {
+    lv_obj_set_height(container, height);
+  } else {
+    lv_obj_set_height(container, LV_SIZE_CONTENT);
+  }
   lv_obj_set_scroll_dir(container, LV_DIR_VER);
   return container;
 }
