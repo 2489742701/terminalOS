@@ -21,15 +21,17 @@ bool g_fetching = false;
 uint32_t g_lastFetch = 0;
 
 const char* wmoDesc(int code) {
-  if (code == 0) return "晴";
-  if (code <= 3) return "多云";
-  if (code <= 48) return "雾";
-  if (code <= 57) return "毛毛雨";
-  if (code <= 67) return "雨";
-  if (code <= 77) return "雪";
-  if (code <= 82) return "阵雨";
-  if (code <= 99) return "雷暴";
-  return "未知";
+  return "";
+}
+
+String extractStr(const String& json, const char* key) {
+  String pat = String("\"") + key + "\":\"";
+  int idx = json.indexOf(pat);
+  if (idx < 0) return "";
+  idx += pat.length();
+  int end = json.indexOf('"', idx);
+  if (end < 0) return "";
+  return json.substring(idx, end);
 }
 
 float extractFloat(const String& json, const char* key) {
@@ -66,40 +68,41 @@ void fetchWeather() {
   }
   HTTPClient http;
   http.setTimeout(8000);
-  String url = "http://api.open-meteo.com/v1/forecast?latitude=39.9&longitude=116.4&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&timezone=Asia%2FShanghai";
-  if (!http.begin(url)) {
-    lv_label_set_text(g_statusLab, "请求失败");
-    g_fetching = false;
-    return;
-  }
-  int code = http.GET();
-  if (code != 200) {
-    lv_label_set_text(g_statusLab, "HTTP错误");
+  http.setUserAgent("Mozilla/5.0");
+
+  if (http.begin("http://uapis.cn/api/v1/misc/weather?adcode=110000&extended=true")) {
+    int code = http.GET();
+    if (code == 200) {
+      String body = http.getString();
+      http.end();
+      float temp = extractFloat(body, "temperature");
+      if (temp > -900) {
+        String weather = extractStr(body, "weather");
+        String windDir = extractStr(body, "wind_direction");
+        String windPower = extractStr(body, "wind_power");
+        float humidity = extractFloat(body, "humidity");
+        float feelsLike = extractFloat(body, "feels_like");
+        int aqi = extractInt(body, "aqi");
+        String aqiCat = extractStr(body, "aqi_category");
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.0f°C", temp);
+        lv_label_set_text(g_tempLab, buf);
+        lv_label_set_text(g_descLab, weather.c_str());
+        snprintf(buf, sizeof(buf), "湿度%.0f%% %s%s 体感%.0f°",
+                 humidity, windDir.c_str(), windPower.c_str(), feelsLike);
+        lv_label_set_text(g_detailLab, buf);
+        snprintf(buf, sizeof(buf), "AQI %d %s", aqi, aqiCat.c_str());
+        lv_label_set_text(g_statusLab, buf);
+        g_fetching = false;
+        g_lastFetch = millis();
+        return;
+      }
+    }
     http.end();
-    g_fetching = false;
-    return;
   }
-  String body = http.getString();
-  http.end();
 
-  float temp = extractFloat(body, "temperature_2m");
-  int humidity = extractInt(body, "relative_humidity_2m");
-  int wmo = extractInt(body, "weather_code");
-  float wind = extractFloat(body, "wind_speed_10m");
-
-  if (temp > -100) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1f°C", temp);
-    lv_label_set_text(g_tempLab, buf);
-    lv_label_set_text(g_descLab, wmoDesc(wmo));
-    snprintf(buf, sizeof(buf), "湿度 %d%%  风速 %.1f m/s", humidity, wind);
-    lv_label_set_text(g_detailLab, buf);
-    lv_label_set_text(g_statusLab, "已更新");
-  } else {
-    lv_label_set_text(g_statusLab, "解析失败");
-  }
+  lv_label_set_text(g_statusLab, "天气获取失败");
   g_fetching = false;
-  g_lastFetch = millis();
 }
 
 }  // namespace

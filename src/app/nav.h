@@ -42,11 +42,16 @@ enum SwipeDir : uint8_t {
 };
 
 inline void swipe_detect(lv_event_t* e, SwipeState& st, lv_obj_t* target,
-                         uint8_t dirs = SWIPE_ALL, bool auto_del = false) {
+                         uint8_t dirs = SWIPE_ALL, bool auto_del = false,
+                         uint8_t edgeWidth = 0) {
   lv_event_code_t code = lv_event_get_code(e);
   if (code == LV_EVENT_PRESSED) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
+    if (edgeWidth > 0 && p.x > edgeWidth) {
+      st.triggered = true;
+      return;
+    }
     st.startX = p.x; st.startY = p.y; st.triggered = false;
   } else if (code == LV_EVENT_PRESSING && !st.triggered) {
     lv_point_t p;

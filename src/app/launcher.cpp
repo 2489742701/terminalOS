@@ -28,7 +28,7 @@ void splashTimer_cb(lv_timer_t* t) {
   TileData* td = (TileData*)t->user_data;
   lv_timer_del(t);
   if (td && td->target && *td->target) {
-    lv_scr_load_anim(*td->target, LV_SCR_LOAD_ANIM_OVER_RIGHT, 300, 0, false);
+    lv_scr_load_anim(*td->target, LV_SCR_LOAD_ANIM_OVER_RIGHT, 300, 0, true);
     nav_lock_until = lv_tick_get() + 600;
   }
 }
@@ -55,7 +55,7 @@ void tile_event_cb(lv_event_t* e) {
   lv_obj_set_style_text_font(lab, &font_zh_24, 0);
   lv_obj_align(lab, LV_ALIGN_CENTER, 0, 60);
 
-  lv_scr_load_anim(splash, LV_SCR_LOAD_ANIM_OVER_RIGHT, 200, 0, true);
+  lv_scr_load_anim(splash, LV_SCR_LOAD_ANIM_OVER_RIGHT, 200, 0, false);
   nav_lock_until = lv_tick_get() + 500;
 
   lv_timer_t* timer = lv_timer_create(splashTimer_cb, 220, td);

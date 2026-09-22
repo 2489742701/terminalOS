@@ -12,14 +12,17 @@
 namespace {
 
 constexpr int GRID = 20;
-constexpr int CELL = 14;
+constexpr int CELL = 18;
 constexpr int BOARD = GRID * CELL;
-
-constexpr int DPAD_SIZE = 110;
 
 enum Dir { UP, DOWN, LEFT, RIGHT };
 
 struct Point { int x, y; };
+
+const lv_color_t COLOR_BG   = lv_color_hex(0x080808);
+const lv_color_t COLOR_HEAD = lv_color_white();
+const lv_color_t COLOR_BODY = lv_color_hex(0xAAAAAA);
+const lv_color_t COLOR_FOOD = lv_color_hex(0xFF4444);
 
 Point snake[GRID * GRID];
 int snakeLen;
@@ -34,14 +37,16 @@ bool paused;
 uint32_t lastStepMs;
 
 lv_obj_t* g_canvas = nullptr;
+lv_color_t* g_canvasBuf = nullptr;
 lv_obj_t* g_scoreLab = nullptr;
 lv_obj_t* g_bestLab = nullptr;
 lv_obj_t* g_overLab = nullptr;
-lv_obj_t* g_dpad = nullptr;
 lv_obj_t* g_pauseLab = nullptr;
-bool g_showGuide = true;
+lv_obj_t* g_xLine1 = nullptr;
+lv_obj_t* g_xLine2 = nullptr;
+bool g_showX = false;
 SwipeState g_swipe;
-int g_swipeStartX = 0, g_swipeStartY = 0;
+int g_tapStartX = 0, g_tapStartY = 0;
 
 void placeFood() {
   bool ok = false;
@@ -71,17 +76,20 @@ void resetGame() {
 }
 
 void drawCell(int gx, int gy, lv_color_t color) {
-  lv_canvas_set_px_color(g_canvas, gx * CELL + 1, gy * CELL + 1, color);
-  for (int dy = 0; dy < CELL - 2; dy++) {
-    for (int dx = 0; dx < CELL - 2; dx++) {
-      lv_canvas_set_px_color(g_canvas, gx * CELL + 1 + dx, gy * CELL + 1 + dy, color);
+  if (!g_canvas) return;
+  int sx = gx * CELL + 1;
+  int sy = gy * CELL + 1;
+  int w = CELL - 2;
+  for (int dy = 0; dy < w; dy++) {
+    for (int dx = 0; dx < w; dx++) {
+      lv_canvas_set_px_color(g_canvas, sx + dx, sy + dy, color);
     }
   }
 }
 
-void render() {
+void renderFull() {
   if (!g_canvas) return;
-  lv_canvas_fill_bg(g_canvas, lv_color_hex(0x080808), LV_OPA_COVER);
+  lv_canvas_fill_bg(g_canvas, COLOR_BG, LV_OPA_COVER);
   for (int i = 0; i <= GRID; i++) {
     lv_draw_line_dsc_t ld;
     lv_draw_line_dsc_init(&ld);
@@ -92,9 +100,20 @@ void render() {
     lv_canvas_draw_line(g_canvas, h, 2, &ld);
     lv_canvas_draw_line(g_canvas, v, 2, &ld);
   }
-  drawCell(food.x, food.y, lv_color_hex(0xFF4444));
+  drawCell(food.x, food.y, COLOR_FOOD);
   for (int i = 0; i < snakeLen; i++) {
-    drawCell(snake[i].x, snake[i].y, i == 0 ? lv_color_white() : lv_color_hex(0xAAAAAA));
+    drawCell(snake[i].x, snake[i].y, i == 0 ? COLOR_HEAD : COLOR_BODY);
+  }
+}
+
+void renderStep(Point oldHead, Point oldTail, bool ateFood) {
+  if (!g_canvas) return;
+  drawCell(oldHead.x, oldHead.y, COLOR_BODY);
+  drawCell(snake[0].x, snake[0].y, COLOR_HEAD);
+  if (!ateFood) {
+    drawCell(oldTail.x, oldTail.y, COLOR_BG);
+  } else {
+    drawCell(food.x, food.y, COLOR_FOOD);
   }
 }
 
@@ -138,12 +157,16 @@ void step() {
       return;
     }
   }
+  Point oldHead = snake[0];
+  Point oldTail = snake[snakeLen - 1];
+  bool ate = (head.x == food.x && head.y == food.y);
+
   for (int i = snakeLen - 1; i > 0; i--) snake[i] = snake[i - 1];
   snake[0] = head;
-  if (head.x == food.x && head.y == food.y) {
+  if (ate) {
     score++;
     snakeLen++;
-    snake[snakeLen - 1] = snake[snakeLen - 2];
+    snake[snakeLen - 1] = oldTail;
     placeFood();
     if (g_scoreLab) {
       char buf[16];
@@ -151,7 +174,7 @@ void step() {
       lv_label_set_text(g_scoreLab, buf);
     }
   }
-  render();
+  renderStep(oldHead, oldTail, ate);
 }
 
 void back_event_cb(lv_event_t* e) {
@@ -164,7 +187,7 @@ void restart_cb(lv_event_t* e) {
   if (g_overLab) lv_label_set_text(g_overLab, "");
   if (g_scoreLab) lv_label_set_text(g_scoreLab, "分数 0");
   if (g_pauseLab) lv_label_set_text(g_pauseLab, "暂停");
-  render();
+  renderFull();
 }
 
 void pause_cb(lv_event_t* e) {
@@ -187,41 +210,11 @@ void setDir(Dir d) {
   if (nextDir == RIGHT && dir == LEFT) nextDir = dir;
 }
 
-void dpad_draw() {
-  if (!g_dpad) return;
-  lv_canvas_fill_bg(g_dpad, lv_color_hex(0x1a1a1a), LV_OPA_COVER);
-  if (g_showGuide) {
-    lv_draw_line_dsc_t ld;
-    lv_draw_line_dsc_init(&ld);
-    ld.color = lv_color_hex(0x666666);
-    ld.width = 1;
-    lv_point_t d1[2] = {{0, 0}, {DPAD_SIZE, DPAD_SIZE}};
-    lv_point_t d2[2] = {{DPAD_SIZE, 0}, {0, DPAD_SIZE}};
-    lv_canvas_draw_line(g_dpad, d1, 2, &ld);
-    lv_canvas_draw_line(g_dpad, d2, 2, &ld);
-  }
-}
-
-void dpad_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (gameOver || paused) return;
-  lv_point_t p;
-  lv_indev_get_point(lv_indev_get_act(), &p);
-  int cx = lv_obj_get_x(g_dpad) + DPAD_SIZE / 2;
-  int cy = lv_obj_get_y(g_dpad) + DPAD_SIZE / 2;
-  int dx = p.x - cx, dy = p.y - cy;
-  if (abs(dx) < 5 && abs(dy) < 5) return;
-  if (abs(dx) > abs(dy)) {
-    setDir(dx > 0 ? RIGHT : LEFT);
-  } else {
-    setDir(dy > 0 ? DOWN : UP);
-  }
-}
-
 void help_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  g_showGuide = !g_showGuide;
-  dpad_draw();
+  g_showX = !g_showX;
+  if (g_xLine1) lv_obj_set_style_opa(g_xLine1, g_showX ? LV_OPA_50 : LV_OPA_TRANSP, 0);
+  if (g_xLine2) lv_obj_set_style_opa(g_xLine2, g_showX ? LV_OPA_50 : LV_OPA_TRANSP, 0);
 }
 
 void swipe_cb(lv_event_t* e) {
@@ -229,20 +222,25 @@ void swipe_cb(lv_event_t* e) {
   if (code == LV_EVENT_PRESSED) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
-    g_swipeStartX = p.x; g_swipeStartY = p.y;
+    g_tapStartX = p.x; g_tapStartY = p.y;
   } else if (code == LV_EVENT_RELEASED) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
-    int dx = p.x - g_swipeStartX, dy = p.y - g_swipeStartY;
-    if (abs(dx) < 20 && abs(dy) < 20) return;
-    if (gameOver || paused) {
-      nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
+    int dx = p.x - g_tapStartX, dy = p.y - g_tapStartY;
+    if (abs(dx) < 20 && abs(dy) < 20) {
+      if (gameOver || paused) return;
+      int cx = 240, cy = 240;
+      int tdx = p.x - cx, tdy = p.y - cy;
+      if (abs(tdx) < 10 && abs(tdy) < 10) return;
+      if (abs(tdx) > abs(tdy)) {
+        setDir(tdx > 0 ? RIGHT : LEFT);
+      } else {
+        setDir(tdy > 0 ? DOWN : UP);
+      }
       return;
     }
-    if (abs(dx) > abs(dy)) {
-      setDir(dx > 0 ? RIGHT : LEFT);
-    } else {
-      setDir(dy > 0 ? DOWN : UP);
+    if (g_tapStartX < 40) {
+      nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
     }
   }
 }
@@ -291,10 +289,13 @@ lv_obj_t* GameScreen_create() {
 
   g_canvas = lv_canvas_create(scr);
   void* buf = heap_caps_malloc(BOARD * BOARD * 2, MALLOC_CAP_SPIRAM);
+  g_canvasBuf = (lv_color_t*)buf;
   if (buf) {
     lv_canvas_set_buffer(g_canvas, buf, BOARD, BOARD, LV_IMG_CF_TRUE_COLOR);
-    lv_canvas_fill_bg(g_canvas, lv_color_hex(0x080808), LV_OPA_COVER);
+    lv_canvas_fill_bg(g_canvas, COLOR_BG, LV_OPA_COVER);
   }
+  lv_obj_clear_flag(g_canvas, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_clear_flag(g_canvas, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_align(g_canvas, LV_ALIGN_TOP_MID, 0, 55);
 
   g_overLab = lv_label_create(scr);
@@ -302,37 +303,25 @@ lv_obj_t* GameScreen_create() {
   lv_obj_set_style_text_color(g_overLab, lv_color_hex(0xFF4444), 0);
   lv_obj_set_style_text_font(g_overLab, &font_zh_24, 0);
   lv_obj_set_style_text_align(g_overLab, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_align(g_overLab, LV_ALIGN_TOP_MID, 0, 170);
+  lv_obj_align(g_overLab, LV_ALIGN_TOP_MID, 0, 200);
 
-  g_dpad = lv_canvas_create(scr);
-  void* dpadBuf = heap_caps_malloc(DPAD_SIZE * DPAD_SIZE * 2, MALLOC_CAP_SPIRAM);
-  if (dpadBuf) {
-    lv_canvas_set_buffer(g_dpad, dpadBuf, DPAD_SIZE, DPAD_SIZE, LV_IMG_CF_TRUE_COLOR);
-    dpad_draw();
-  }
-  lv_obj_set_pos(g_dpad, 50, 345);
-  lv_obj_add_flag(g_dpad, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(g_dpad, dpad_cb, LV_EVENT_CLICKED, NULL);
+  static lv_point_t x1Pts[2] = {{0, 0}, {480, 480}};
+  g_xLine1 = lv_line_create(scr);
+  lv_line_set_points(g_xLine1, x1Pts, 2);
+  lv_obj_set_style_line_color(g_xLine1, lv_color_hex(0x444444), 0);
+  lv_obj_set_style_line_width(g_xLine1, 1, 0);
+  lv_obj_set_style_opa(g_xLine1, LV_OPA_TRANSP, 0);
 
-  lv_obj_t* helpBtn = lv_btn_create(scr);
-  lv_obj_set_size(helpBtn, 36, 36);
-  lv_obj_set_pos(helpBtn, 175, 382);
-  lv_obj_set_style_bg_opa(helpBtn, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_bg_opa(helpBtn, LV_OPA_COVER, LV_STATE_PRESSED);
-  lv_obj_set_style_bg_color(helpBtn, lv_color_hex(0x161616), LV_STATE_PRESSED);
-  lv_obj_set_style_border_color(helpBtn, lv_color_white(), 0);
-  lv_obj_set_style_border_width(helpBtn, 1, 0);
-  lv_obj_set_style_radius(helpBtn, 18, 0);
-  lv_obj_add_event_cb(helpBtn, help_cb, LV_EVENT_CLICKED, NULL);
-  lv_obj_t* helpLab = lv_label_create(helpBtn);
-  lv_label_set_text(helpLab, "?");
-  lv_obj_set_style_text_color(helpLab, lv_color_white(), 0);
-  lv_obj_set_style_text_font(helpLab, &lv_font_montserrat_16, 0);
-  lv_obj_center(helpLab);
+  static lv_point_t x2Pts[2] = {{480, 0}, {0, 480}};
+  g_xLine2 = lv_line_create(scr);
+  lv_line_set_points(g_xLine2, x2Pts, 2);
+  lv_obj_set_style_line_color(g_xLine2, lv_color_hex(0x444444), 0);
+  lv_obj_set_style_line_width(g_xLine2, 1, 0);
+  lv_obj_set_style_opa(g_xLine2, LV_OPA_TRANSP, 0);
 
   auto mkBtn = [&](const char* txt, lv_event_cb_t cb, int x, int y) {
     lv_obj_t* b = lv_btn_create(scr);
-    lv_obj_set_size(b, 80, 34);
+    lv_obj_set_size(b, 70, 32);
     lv_obj_set_pos(b, x, y);
     lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, 0);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_STATE_PRESSED);
@@ -341,6 +330,7 @@ lv_obj_t* GameScreen_create() {
     lv_obj_set_style_border_width(b, 1, 0);
     lv_obj_set_style_radius(b, 8, 0);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text(l, txt);
     lv_obj_set_style_text_color(l, lv_color_white(), 0);
@@ -348,17 +338,34 @@ lv_obj_t* GameScreen_create() {
     lv_obj_center(l);
     return l;
   };
-  mkBtn("重置", restart_cb, 275, 350);
-  g_pauseLab = mkBtn("暂停", pause_cb, 275, 394);
+  mkBtn("重置", restart_cb, 100, 438);
+  g_pauseLab = mkBtn("暂停", pause_cb, 310, 438);
+
+  lv_obj_t* helpBtn = lv_btn_create(scr);
+  lv_obj_set_size(helpBtn, 36, 36);
+  lv_obj_align(helpBtn, LV_ALIGN_BOTTOM_MID, 0, -8);
+  lv_obj_set_style_bg_opa(helpBtn, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_bg_opa(helpBtn, LV_OPA_COVER, LV_STATE_PRESSED);
+  lv_obj_set_style_bg_color(helpBtn, lv_color_hex(0x161616), LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(helpBtn, lv_color_white(), 0);
+  lv_obj_set_style_border_width(helpBtn, 1, 0);
+  lv_obj_set_style_radius(helpBtn, 18, 0);
+  lv_obj_add_event_cb(helpBtn, help_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_flag(helpBtn, LV_OBJ_FLAG_EVENT_BUBBLE);
+  lv_obj_t* helpLab = lv_label_create(helpBtn);
+  lv_label_set_text(helpLab, "?");
+  lv_obj_set_style_text_color(helpLab, lv_color_white(), 0);
+  lv_obj_set_style_text_font(helpLab, &lv_font_montserrat_16, 0);
+  lv_obj_center(helpLab);
 
   resetGame();
-  render();
+  renderFull();
   return scr;
 }
 
 void GameScreen_tick() {
   if (gameOver || paused || !g_canvas) return;
-  if (millis() - lastStepMs >= 150) {
+  if (millis() - lastStepMs >= 120) {
     lastStepMs = millis();
     step();
   }

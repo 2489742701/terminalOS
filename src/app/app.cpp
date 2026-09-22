@@ -1,6 +1,7 @@
 #include "app.h"
 #include "../hal/display.h"
 #include "../hal/touch.h"
+#include "../hal/serial_console.h"
 #include "../config/pins.h"
 #include <lvgl.h>
 #include "screensaver.h"
@@ -16,6 +17,7 @@
 #include "memory_screen.h"
 #include "sysinfo_screen.h"
 #include "weather_screen.h"
+#include <WiFi.h>
 
 
 // LVGL 显示缓冲（PSRAM 双缓冲）
@@ -51,7 +53,7 @@ void App::touchRead(lv_indev_drv_t* indev, lv_indev_data_t* data) {
   static int lastX = 0, lastY = 0;
 
   uint32_t now = millis();
-  if (now - lastMs >= 10) {
+  if (now - lastMs >= 8) {
     lastMs = now;
     int x, y;
     lastDown = Touch::hasSignal() && Touch::touched(x, y);
@@ -118,6 +120,7 @@ bool App::begin() {
   nav_clock = ClockScreen_create();
   nav_settings = SettingsScreen_create();
   nav_wifi = WifiScreen_create();
+  WiFi.begin("NETGEAR", "13357728293");
   nav_game = GameScreen_create();
   nav_browser = BrowserScreen_create();
   nav_draw = DrawScreen_create();
@@ -132,15 +135,20 @@ bool App::begin() {
   ScreenSaver::init(nav_launcher);
 
   Serial.println("[App] init ok");
+
+  // 9. 串口命令监听（调试用，发行版把 SERIAL_CONSOLE_ENABLED 置 0）
+  SerialConsole::begin();
+
   return true;
 }
 
 void App::loop() {
+  SerialConsole::tick();
   lv_timer_handler();
   ScreenSaver::tick();
   lv_obj_t* act = lv_scr_act();
   if (act == nav_clock) ClockScreen_update();
-  if (act == nav_wifi) WifiScreen_tick();
+  if (act == nav_wifi || WifiScreen_isConnecting()) WifiScreen_tick();
   if (act == nav_game) GameScreen_tick();
   if (act == nav_browser) BrowserScreen_tick();
   if (act == nav_sysinfo) SysInfoScreen_tick();

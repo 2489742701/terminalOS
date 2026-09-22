@@ -34,7 +34,9 @@ void draw_cb(lv_event_t* e) {
   if (code == LV_EVENT_PRESSED) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
-    g_lastX = p.x; g_lastY = p.y; g_drawing = true;
+    int cxOff = lv_obj_get_x(g_canvas);
+    int cyOff = lv_obj_get_y(g_canvas);
+    g_lastX = p.x - cxOff; g_lastY = p.y - cyOff; g_drawing = true;
   } else if (code == LV_EVENT_PRESSING && g_drawing) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
@@ -42,7 +44,7 @@ void draw_cb(lv_event_t* e) {
     int cxOff = lv_obj_get_x(g_canvas);
     int cyOff = lv_obj_get_y(g_canvas);
     int x2 = p.x - cxOff, y2 = p.y - cyOff;
-    int x1 = g_lastX - cxOff, y1 = g_lastY - cyOff;
+    int x1 = g_lastX, y1 = g_lastY;
 
     lv_draw_line_dsc_t ld;
     lv_draw_line_dsc_init(&ld);

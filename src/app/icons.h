@@ -14,6 +14,7 @@ enum class Icon {
   Power,
   Game,
   Browser,
+  Lock,
 };
 
 // 在 parent 内创建一个 size×size 的白色线条图标，返回 canvas 对象。

@@ -67,8 +67,8 @@ lv_obj_t* SettingsScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
-  lv_obj_t* back = icon_create(scr, Icon::Back, 40);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 18, 18);
+  lv_obj_t* back = icon_create(scr, Icon::Back, 36);
+  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
   lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_flag(back, LV_OBJ_FLAG_EVENT_BUBBLE);
   lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
@@ -77,15 +77,15 @@ lv_obj_t* SettingsScreen_create() {
   lv_label_set_text(title, "设置");
   lv_obj_set_style_text_color(title, lv_color_white(), 0);
   lv_obj_set_style_text_font(title, &font_zh_24, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
 
-  makeRow(scr, "时间源", "编译时软时钟", 100);
-  makeRow(scr, "固件", "GEEK TERMINAL v0.1", 140);
+  makeRow(scr, "时间源", "编译时软时钟", 90);
+  makeRow(scr, "固件", "GEEK TERMINAL v0.1", 124);
 
   // 校准时间按钮
   lv_obj_t* btn = lv_btn_create(scr);
-  lv_obj_set_size(btn, 200, 44);
-  lv_obj_align(btn, LV_ALIGN_TOP_MID, -110, 185);
+  lv_obj_set_size(btn, 180, 40);
+  lv_obj_align(btn, LV_ALIGN_TOP_MID, -100, 165);
   lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
   lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_PRESSED);
   lv_obj_set_style_bg_color(btn, lv_color_hex(0x161616), LV_STATE_PRESSED);
@@ -103,8 +103,8 @@ lv_obj_t* SettingsScreen_create() {
 
   // 息屏按钮
   lv_obj_t* sbtn = lv_btn_create(scr);
-  lv_obj_set_size(sbtn, 200, 44);
-  lv_obj_align(sbtn, LV_ALIGN_TOP_MID, 110, 185);
+  lv_obj_set_size(sbtn, 180, 40);
+  lv_obj_align(sbtn, LV_ALIGN_TOP_MID, 100, 165);
   lv_obj_set_style_bg_opa(sbtn, LV_OPA_TRANSP, 0);
   lv_obj_set_style_bg_opa(sbtn, LV_OPA_COVER, LV_STATE_PRESSED);
   lv_obj_set_style_bg_color(sbtn, lv_color_hex(0x161616), LV_STATE_PRESSED);
@@ -125,11 +125,11 @@ lv_obj_t* SettingsScreen_create() {
   lv_label_set_text(brLab, "亮度");
   lv_obj_set_style_text_color(brLab, lv_color_hex(0x888888), 0);
   lv_obj_set_style_text_font(brLab, &font_zh_16, 0);
-  lv_obj_align(brLab, LV_ALIGN_TOP_LEFT, 40, 250);
+  lv_obj_align(brLab, LV_ALIGN_TOP_LEFT, 40, 225);
 
   lv_obj_t* slider = lv_slider_create(scr);
-  lv_obj_set_width(slider, 300);
-  lv_obj_align(slider, LV_ALIGN_TOP_MID, 30, 252);
+  lv_obj_set_width(slider, 280);
+  lv_obj_align(slider, LV_ALIGN_TOP_MID, 30, 227);
   lv_slider_set_range(slider, 5, 100);
   lv_slider_set_value(slider, 100, LV_ANIM_OFF);
   lv_obj_set_style_bg_color(slider, lv_color_hex(0x333333), 0);
@@ -142,7 +142,7 @@ lv_obj_t* SettingsScreen_create() {
   lv_label_set_text(g_statusLab, "双击主屏时间可校准（待接入 WiFi）");
   lv_obj_set_style_text_color(g_statusLab, lv_color_hex(0x666666), 0);
   lv_obj_set_style_text_font(g_statusLab, &font_zh_16, 0);
-  lv_obj_align(g_statusLab, LV_ALIGN_TOP_MID, 0, 300);
+  lv_obj_align(g_statusLab, LV_ALIGN_TOP_MID, 0, 275);
 
   return scr;
 }
