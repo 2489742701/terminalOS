@@ -218,21 +218,38 @@ static void lvgl_renderer_cleanup(Renderer *renderer) {
 }
 
 static void *lvgl_renderer_create_label(Renderer *renderer, const char *text,
-                                        int x, int y) {
-  lv_obj_t *label = lv_label_create((lv_obj_t *)renderer->platform_data);
+                                         int x, int y) {
+  lv_obj_t *parent = (lv_obj_t *)renderer->platform_data;
+  lv_obj_t *label = lv_label_create(parent);
   lv_label_set_text(label, text);
-  /* 不设 pos，让 flex column 布局自动垂直排列 */
+  /* 不设 pos，让 flex 布局自动排列 */
   (void)x; (void)y;
-  lv_obj_set_width(label, lv_pct(100));
+  /* 行布局中 label 不占满宽度，让多个 label 水平排列；
+     列布局中 label 占满宽度，文本自动换行 */
+  lv_flex_flow_t parent_flow = lv_obj_get_style_flex_flow(parent, 0);
+  if (parent_flow == LV_FLEX_FLOW_ROW || parent_flow == LV_FLEX_FLOW_ROW_WRAP ||
+      parent_flow == LV_FLEX_FLOW_ROW_REVERSE) {
+    lv_obj_set_width(label, LV_SIZE_CONTENT);
+  } else {
+    lv_obj_set_width(label, lv_pct(100));
+  }
   lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
   return label;
 }
 
 static void *lvgl_renderer_create_button(Renderer *renderer, const char *text,
-                                         int x, int y) {
-  lv_obj_t *btn = lv_btn_create((lv_obj_t *)renderer->platform_data);
+                                          int x, int y) {
+  lv_obj_t *parent = (lv_obj_t *)renderer->platform_data;
+  lv_obj_t *btn = lv_btn_create(parent);
   (void)x; (void)y;
-  lv_obj_set_size(btn, 70, 35);
+  /* 行布局中按钮用内容自适应宽度 */
+  lv_flex_flow_t parent_flow = lv_obj_get_style_flex_flow(parent, 0);
+  if (parent_flow == LV_FLEX_FLOW_ROW || parent_flow == LV_FLEX_FLOW_ROW_WRAP ||
+      parent_flow == LV_FLEX_FLOW_ROW_REVERSE) {
+    lv_obj_set_size(btn, LV_SIZE_CONTENT, 35);
+  } else {
+    lv_obj_set_size(btn, 70, 35);
+  }
 
   lv_obj_t *btn_label = lv_label_create(btn);
   lv_label_set_text(btn_label, text);
@@ -303,6 +320,9 @@ static void *lvgl_renderer_create_container(Renderer *renderer, int x, int y,
   lv_obj_set_style_radius(container, 0, 0);
   lv_obj_set_style_pad_all(container, 0, 0);
   lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
+  /* 默认 flex column 布局：子节点垂直排列 */
+  lv_obj_set_flex_flow(container, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_gap(container, 2, 0);
   return container;
 }
 
@@ -362,6 +382,23 @@ static void lvgl_renderer_set_text_align(Renderer *renderer, void *widget,
   lv_obj_set_style_text_align((lv_obj_t *)widget, lv_align, 0);
 }
 
+static void lvgl_renderer_set_flex_direction(Renderer *renderer, void *widget,
+                                             int direction) {
+  (void)renderer;
+  if (!widget)
+    return;
+  lv_obj_t *obj = (lv_obj_t *)widget;
+  if (direction == 2) {
+    /* row：子节点水平排列 */
+    lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_gap(obj, 4, 0);
+  } else if (direction == 1) {
+    /* column：子节点垂直排列 */
+    lv_obj_set_flex_flow(obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_gap(obj, 2, 0);
+  }
+}
+
 static void lvgl_renderer_clear_container(Renderer *renderer, void *container) {
   (void)renderer;
   lv_obj_clean((lv_obj_t *)container);
@@ -389,6 +426,7 @@ LvglRenderer *lvgl_renderer_create(void) {
   renderer->base.set_bg_color = lvgl_renderer_set_bg_color;
   renderer->base.set_bg_gradient = lvgl_renderer_set_bg_gradient;
   renderer->base.set_text_align = lvgl_renderer_set_text_align;
+  renderer->base.set_flex_direction = lvgl_renderer_set_flex_direction;
   renderer->base.clear_container = lvgl_renderer_clear_container;
   renderer->base.get_height = lvgl_renderer_get_height;
   renderer->base.platform_data = NULL;

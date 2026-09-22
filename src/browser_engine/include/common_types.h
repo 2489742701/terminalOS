@@ -86,6 +86,8 @@ typedef struct {
                           const LinearGradientFill *gradient);
   // Set text alignment
   void (*set_text_align)(Renderer *renderer, void *widget, int align);
+  // Set flex direction (0=none, 1=column, 2=row)
+  void (*set_flex_direction)(Renderer *renderer, void *widget, int direction);
   // Clear container
   void (*clear_container)(Renderer *renderer, void *container);
   // Get widget height

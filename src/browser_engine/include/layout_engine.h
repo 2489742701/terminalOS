@@ -45,6 +45,9 @@ typedef struct {
   int line_height;
   int text_align; // 0=left, 1=center, 2=right
 
+  /* 布局意图：flex 方向（0=none/继承父容器, 1=column垂直, 2=row水平） */
+  int flex_direction;
+
   // Overflow handling
   bool scroll_y;
   bool scroll_x;

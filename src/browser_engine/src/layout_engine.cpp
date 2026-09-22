@@ -30,6 +30,7 @@ static const LayoutBox DEFAULT_BOX = {
     .font_size = 14,
     .line_height = 20,
     .text_align = 0,
+    .flex_direction = 0,
     .scroll_y = false,
     .scroll_x = false};
 
@@ -751,6 +752,78 @@ void layout_position_node(LayoutNode *node, int parent_x, int parent_y) {
 /* 诊断：widget 创建计数器（文件作用域，layout_render_tree 中打印总数） */
 static int g_widgetCount = 0;
 
+/* 布局意图：判断 div 是否应为行容器（flex row）。
+   规则：div 有 ≥2 个"简单"子节点（link/span/只含文本的div）且无块级子节点（p/h1-h6/ul/ol）→ row。
+   典型场景：导航栏 <div><div>Logo</div><div>Menu</div></div>、底部链接 <div><a>L1</a><a>L2</a></div>。
+   非行场景：新闻列表 <div><div><p>News1</p></div><div><p>News2</p></div></div> → column。 */
+static bool layout_should_be_row(LayoutNode *node) {
+  if (!node || (node->type != ELEMENT_DIV && node->type != ELEMENT_CONTAINER))
+    return false;
+
+  int row_candidate_count = 0;
+  int block_child_count = 0;
+  LayoutNode *child = node->first_child;
+  while (child) {
+    /* 块级元素 → column */
+    if (child->type == ELEMENT_PARAGRAPH ||
+        (child->type >= ELEMENT_HEADING1 && child->type <= ELEMENT_HEADING6) ||
+        child->type == ELEMENT_UNORDERED_LIST ||
+        child->type == ELEMENT_ORDERED_LIST) {
+      block_child_count++;
+    }
+
+    /* 行候选：inline 元素 */
+    if (child->type == ELEMENT_LINK || child->type == ELEMENT_SPAN ||
+        child->type == ELEMENT_STRONG || child->type == ELEMENT_EM ||
+        child->type == ELEMENT_BOLD || child->type == ELEMENT_BUTTON) {
+      row_candidate_count++;
+    } else if (child->type == ELEMENT_DIV || child->type == ELEMENT_CONTAINER) {
+      /* div 若只含文本/链接（无 p/h1-h6 子节点）→ 行候选；否则 → block */
+      bool has_block_descendant = false;
+      LayoutNode *gc = child->first_child;
+      while (gc) {
+        if (gc->type == ELEMENT_PARAGRAPH ||
+            (gc->type >= ELEMENT_HEADING1 && gc->type <= ELEMENT_HEADING6)) {
+          has_block_descendant = true;
+          break;
+        }
+        gc = gc->next_sibling;
+      }
+      if (has_block_descendant)
+        block_child_count++;
+      else
+        row_candidate_count++;
+    }
+
+    child = child->next_sibling;
+  }
+
+  /* ≥2 个行候选且无块级子节点 → row */
+  return row_candidate_count >= 2 && block_child_count == 0;
+}
+
+/* 布局意图：trim 文本前导空格（dom_renderer 已 trim，但 Lexbor 有时会残留 \n + 空格） */
+static char *layout_trim_text(const char *text) {
+  if (!text)
+    return NULL;
+  const char *start = text;
+  while (*start && isspace((unsigned char)*start))
+    start++;
+  if (*start == '\0')
+    return NULL;
+  size_t len = strlen(start);
+  while (len > 0 && isspace((unsigned char)start[len - 1]))
+    len--;
+  if (len == 0)
+    return NULL;
+  char *result = (char *)malloc(len + 1);
+  if (!result)
+    return NULL;
+  memcpy(result, start, len);
+  result[len] = '\0';
+  return result;
+}
+
 static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
                                void *parent_widget) {
   if (!node || !render_ctx || !render_ctx->renderer)
@@ -786,13 +859,18 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
        后续可用 label 或自定义容器替代。仍递归渲染子节点（textarea 内文本）。 */
     if (g_widgetCount < 5) Serial.printf("[Diag] textarea skipped\n");
   } else if (node->text_content && strlen(node->text_content) > 0) {
-    if (g_widgetCount < 5) Serial.printf("[Diag] creating label/button, type=%d text='%.20s'\n", (int)node->type, node->text_content);
-    if (node->type == ELEMENT_BUTTON && iface->create_button) {
-      node->widget = iface->create_button(
-          render_ctx->renderer, node->text_content, node->box.x, node->box.y);
-    } else if (iface->create_label) {
-      node->widget = iface->create_label(
-          render_ctx->renderer, node->text_content, node->box.x, node->box.y);
+    /* 布局意图：trim 前导/尾部空格，避免开头空格太多 */
+    char *trimmed_text = layout_trim_text(node->text_content);
+    if (trimmed_text) {
+      if (g_widgetCount < 5) Serial.printf("[Diag] creating label/button, type=%d text='%.20s'\n", (int)node->type, trimmed_text);
+      if (node->type == ELEMENT_BUTTON && iface->create_button) {
+        node->widget = iface->create_button(
+            render_ctx->renderer, trimmed_text, node->box.x, node->box.y);
+      } else if (iface->create_label) {
+        node->widget = iface->create_label(
+            render_ctx->renderer, trimmed_text, node->box.x, node->box.y);
+      }
+      free(trimmed_text);
     }
 
     widget = node->widget;
@@ -821,13 +899,19 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     bool reuse_parent =
         (node->parent == NULL && parent == render_ctx->root_container);
     /* 布局意图：有 bg_color 或 text_align 或显式宽高 → 创建容器；
+       行布局（多个子 div/link）→ 创建容器；
        无样式 div → 透明传递，子节点直接平铺到 parent */
     bool has_layout_intent = node->box.has_explicit_bg_color ||
                              node->box.text_align != 0 ||
                              (node->box.width > 0 && !node->box.width_auto);
+    bool should_be_row = layout_should_be_row(node);
     if (reuse_parent) {
       node->widget = parent;
-    } else if (has_layout_intent && iface->create_container) {
+      /* 根容器若是行布局，切换 flex 方向 */
+      if (should_be_row && iface->set_flex_direction) {
+        iface->set_flex_direction(render_ctx->renderer, parent, 2);
+      }
+    } else if ((has_layout_intent || should_be_row) && iface->create_container) {
       node->widget = iface->create_container(render_ctx->renderer, node->box.x,
                                              node->box.y, node->box.width,
                                              node->box.height);
@@ -840,6 +924,10 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
       /* 容器也应用 text_align */
       if (iface->set_text_align && node->box.text_align != 0) {
         iface->set_text_align(render_ctx->renderer, widget, node->box.text_align);
+      }
+      /* 行布局：切换为 flex row */
+      if (should_be_row && iface->set_flex_direction) {
+        iface->set_flex_direction(render_ctx->renderer, widget, 2);
       }
     }
   }
