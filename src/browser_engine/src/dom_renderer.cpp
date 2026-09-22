@@ -13,6 +13,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+/* 协作式停止标志：DOM 遍历时定期检查，true 则中止构建 */
+static volatile bool *g_stopFlag = nullptr;
+void dom_renderer_set_stop_flag(volatile bool *flag) { g_stopFlag = flag; }
+
 // Helper: Copy node text
 static char *copy_node_text(lxb_dom_node_t *node, size_t *length) {
   if (!node) {
@@ -468,6 +472,11 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
     lxb_dom_node_t *child = html_parser.get_first_child(dom_node);
     static int s_nodeCount = 0;  /* DOM 遍历节点计数器，定期让 CPU 喘气 */
     while (child) {
+      /* 协作式停止检查 */
+      if (g_stopFlag && *g_stopFlag) {
+        layout_node_destroy(layout_node);
+        return NULL;
+      }
       LayoutNode *child_layout = build_layout_tree_from_dom(child, context);
       if (child_layout) {
         layout_node_add_child(layout_node, child_layout);
@@ -661,6 +670,76 @@ DomRendererInterface dom_renderer = {
 
 // Initialize DOM renderer
 bool dom_renderer_init(void) { return layout_engine_init(); }
+
+/* ── 两阶段拆分：build（无 LVGL）+ render（LVGL）── */
+
+/* Phase 1: 收集 CSS + 获取 body + 构建布局树 + 计算尺寸 + 定位。
+   不触碰任何 LVGL 控件，可在后台任务中安全运行。 */
+RenderResult dom_renderer_build_layout_only(lxb_html_document_t *document,
+                                            RenderContext *context,
+                                            LayoutNode **out_root) {
+  if (!document || !context || !out_root)
+    return RENDER_ERROR_UNKNOWN;
+  *out_root = nullptr;
+
+  /* 收集样式表（会下载外部 CSS，有 stop_flag 检查） */
+  css_parser_cleanup();
+  css_parser_init();
+  lxb_dom_element_t *root_el =
+      lxb_dom_document_element(lxb_dom_interface_document(document));
+  if (root_el) {
+    collect_stylesheets(lxb_dom_interface_node(root_el), context->document_url);
+  }
+
+  /* 协作式停止检查 */
+  if (g_stopFlag && *g_stopFlag) return RENDER_ERROR_UNKNOWN;
+
+  lxb_dom_element_t *body = html_parser.find_body_element(document);
+  if (!body) return RENDER_ERROR_PARSE;
+
+  g_layoutNodeCount = 0;
+  LayoutNode *layout_root =
+      build_layout_tree_from_dom(lxb_dom_interface_node(body), context);
+
+  if (g_stopFlag && *g_stopFlag) {
+    if (layout_root) layout_node_destroy(layout_root);
+    return RENDER_ERROR_UNKNOWN;
+  }
+
+  if (!layout_root) return RENDER_ERROR_PARSE;
+
+  layout_calculate_dimensions(layout_root, context->max_width);
+  layout_position_node(layout_root, 0, 10);
+
+  *out_root = layout_root;
+  return RENDER_SUCCESS;
+}
+
+/* Phase 2: 清空容器 + 渲染布局树到 LVGL 控件。
+   快速，在 UI 任务中调用。 */
+RenderResult dom_renderer_render_layout_only(LayoutNode *layout_root,
+                                             RenderContext *context) {
+  if (!layout_root || !context || !context->renderer)
+    return RENDER_ERROR_UNKNOWN;
+
+  /* 清空旧内容 */
+  if (context->renderer->interface->clear_container) {
+    context->renderer->interface->clear_container(context->renderer,
+                                                  context->root_container);
+  }
+
+  layout_render_tree(layout_root, context);
+
+  context->current_y =
+      layout_root->box.y + layout_get_total_height(&layout_root->box);
+
+  return RENDER_SUCCESS;
+}
+
+/* Phase 3: 释放布局树 */
+void dom_renderer_free_layout(LayoutNode *root) {
+  if (root) layout_node_destroy(root);
+}
 
 // Cleanup DOM renderer
 void dom_renderer_cleanup(void) { layout_engine_cleanup(); }

@@ -23,6 +23,10 @@ static bool s_html_truncated = false;
 static HtmlProgressCallback s_progressCb = nullptr;
 void arduino_set_progress_callback(HtmlProgressCallback cb) { s_progressCb = cb; }
 
+/* 协作式停止标志：外部设置为 true 后，下载函数尽快退出 */
+static volatile bool *s_stopFlag = nullptr;
+void arduino_set_stop_flag(volatile bool *flag) { s_stopFlag = flag; }
+
 bool arduino_html_was_truncated() { return s_html_truncated; }
 static void *tls_psram_calloc(size_t n, size_t size) {
     void *p = heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -150,6 +154,14 @@ RenderResult arduino_download_html(const char *url, MemoryBuffer *buffer) {
   if (chunked) {
     /* chunked 传输：每块前一行十六进制长度，空行结束 */
     while (client->connected() || client->available()) {
+      /* 协作式停止检查 */
+      if (s_stopFlag && *s_stopFlag) {
+        client->stop();
+        heap_caps_free(buffer->data);
+        buffer->data = NULL;
+        Serial.println("[Browser] download stopped by user");
+        return RENDER_ERROR_UNKNOWN;
+      }
       String sizeLine = client->readStringUntil('\n');
       sizeLine.trim();
       int chunkSize = strtol(sizeLine.c_str(), NULL, 16);
@@ -171,6 +183,14 @@ RenderResult arduino_download_html(const char *url, MemoryBuffer *buffer) {
   } else {
     /* 普通传输：按 Content-Length 读取 */
     while (total < contentLen && (client->connected() || client->available())) {
+      /* 协作式停止检查 */
+      if (s_stopFlag && *s_stopFlag) {
+        client->stop();
+        heap_caps_free(buffer->data);
+        buffer->data = NULL;
+        Serial.println("[Browser] download stopped by user");
+        return RENDER_ERROR_UNKNOWN;
+      }
       int r = client->read((uint8_t*)(buffer->data + total), contentLen - total);
       if (r > 0) total += r;
       else delay(1);

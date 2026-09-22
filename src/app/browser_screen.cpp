@@ -7,34 +7,34 @@
 #include <WiFiClient.h>
 #include <esp_heap_caps.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "lvgl_renderer.h"
 #include "tactilebrowser_core.h"
 
-
 /* ═══════════════════════════════════════════════════════════════════════════
- * 浏览器屏幕布局（480×480）
+ * 异步浏览器架构
  *
- *   ┌──┬────────────────────────────┬──┬──────┐
- *   │退│ URL 输入框                 │加│ 状态  │  0-40  顶栏
- *   ├──┴────────────────────────────┴──┴──────┤
- *   │                                        │
- *   │           网页内容区（可滚动）           │  40-410 内容
- *   │                                        │
- *   ├────────────────────────────────────────┤
- *   │  ████████░░░░░░  下载中 45%            │  410-435 进度条
- *   ├──┬──────┬──────┬──────┬──────┬──────┤
- *   │  │ 后退 │ 前进 │ 首页 │ 退出 │      │  435-480 底栏
- *   └──┴──────┴──────┴──────┴──────┴──────┘
+ * 状态机：IDLE → LOADING → LOADED / STOPPED / ERROR
  *
- * 设计要点：
- *   - 去掉"浏览器"标题，把空间让给 URL 和内容
- *   - 状态栏（就绪/加载中/已加载）放顶栏右侧
- *   - 底部 4 按钮：后退/前进/首页/退出
- *   - URL 框可重复点击弹出键盘输入
- *   - 默认 URL = https://www.baidu.com，进入浏览器自动加载
+ * Phase 1（后台任务 Core 0）：下载 HTML + 解析 DOM + 构建布局树（不触碰 LVGL）
+ *   - 协作式停止：g_stopRequested = true → 任务尽快退出
+ *   - 进度通过全局变量传递，tick 读取更新 UI
+ * Phase 2（UI 任务 Core 1）：渲染布局树到 LVGL 控件（快速）
+ *
+ * 加载时 UI：半透明遮罩 + "加载中，请稍等..." + 大停止按钮 + 进度条
+ * 加载后 UI：网页内容，支持上下滚动、链接点击
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 namespace {
+
+/* ── 浏览器状态机 ── */
+enum BrowserState {
+  BROWSER_IDLE,     /* 未加载 */
+  BROWSER_LOADING,  /* 后台任务运行中 */
+  BROWSER_LOADED,   /* 已加载，可交互 */
+  BROWSER_STOPPED,  /* 加载被用户取消 */
+  BROWSER_ERROR     /* 加载失败 */
+};
 
 /* ── UI 控件 ── */
 SwipeState g_swipe;
@@ -42,38 +42,49 @@ lv_obj_t* g_urlArea = nullptr;
 lv_obj_t* g_content = nullptr;
 lv_obj_t* g_status = nullptr;
 lv_obj_t* g_goBtn = nullptr;
-lv_obj_t* g_kb = nullptr;
 lv_obj_t* g_progressBar = nullptr;
 lv_obj_t* g_progressLabel = nullptr;
-lv_obj_t* g_backBtn = nullptr;    /* 底部后退 */
-lv_obj_t* g_fwdBtn = nullptr;     /* 底部前进 */
-lv_obj_t* g_homeBtn = nullptr;    /* 底部首页 */
-lv_obj_t* g_exitBtn = nullptr;    /* 底部退出 */
+lv_obj_t* g_backBtn = nullptr;
+lv_obj_t* g_fwdBtn = nullptr;
+lv_obj_t* g_homeBtn = nullptr;
+lv_obj_t* g_exitBtn = nullptr;
 
-/* ── 加载状态 ── */
+/* ── 加载遮罩 UI（覆盖在内容区上） ── */
+lv_obj_t* g_loadingOverlay = nullptr;   /* 半透明遮罩 */
+lv_obj_t* g_loadingLabel = nullptr;     /* "加载中，请稍等..." */
+lv_obj_t* g_stopBtn = nullptr;          /* 大停止按钮 */
+lv_obj_t* g_loadProgressBar = nullptr;  /* 遮罩上的进度条 */
+lv_obj_t* g_loadProgressText = nullptr; /* "下载中 45%" */
+
+/* ── 异步状态（后台任务和 UI 任务共享，用 volatile 保护） ── */
+volatile BrowserState g_state = BROWSER_IDLE;
+volatile bool g_stopRequested = false;
+volatile bool g_taskDone = false;
+volatile int g_progressPct = 0;
+volatile char g_progressStage[32] = {0};
+volatile RenderResult g_taskResult = RENDER_SUCCESS;
+LayoutNode* g_layoutRoot = nullptr;     /* Phase 1 产出的布局树 */
+TaskHandle_t g_fetchTask = nullptr;     /* 后台任务句柄 */
 String g_fetchUrl;
-bool g_fetching = false;
-bool g_firstLoad = true;          /* 首次进入自动加载百度 */
+bool g_firstLoad = true;
 
 /* ── 引擎 ── */
 LvglRenderer* g_renderer = nullptr;
 bool g_engineInited = false;
 
-/* ── 导航历史栈（最多 20 条） ── */
+/* ── 导航历史栈 ── */
 #define MAX_HISTORY 20
 String g_history[MAX_HISTORY];
 int g_historySize = 0;
 int g_historyIdx = -1;
 
 void historyPush(const String& url) {
-  /* 在历史中间打开新 URL 时，截断后面的记录 */
   if (g_historyIdx < g_historySize - 1)
     g_historySize = g_historyIdx + 1;
   if (g_historySize < MAX_HISTORY) {
     g_history[g_historySize] = url;
     g_historySize++;
   } else {
-    /* 满了左移 */
     for (int i = 1; i < MAX_HISTORY; i++)
       g_history[i-1] = g_history[i];
     g_history[MAX_HISTORY-1] = url;
@@ -91,22 +102,13 @@ void updateNavButtons() {
     g_historySize > 0 ? LV_OPA_COVER : LV_OPA_50, 0);
 }
 
-/* ── 进度回调（下载过程中定期调用） ──
- * 注意：此处不能调 lv_timer_handler()！
- *   fetchPage() 在 BrowserScreen_tick() → App::loop() 中阻塞式执行，
- *   下载过程中 LVGL 显示状态可能不完整（内容区刚被 lv_obj_clean 清空），
- *   此时调 lv_timer_handler() 会触发渲染管线处理半成品状态导致崩溃。
- *   进度条更新会在下一个 loop() 周期的 lv_timer_handler() 中自然刷新。 */
+/* ── 进度回调（在后台任务中调用，不能触碰 LVGL） ──
+ * 只把进度存到全局变量，tick 中读取并更新 UI。 */
 void progressCb(int downloaded, int total, const char* stage) {
-  if (g_progressBar) {
-    int pct = total > 0 ? downloaded * 100 / total : 0;
-    lv_bar_set_value(g_progressBar, pct, LV_ANIM_OFF);
-  }
-  if (g_progressLabel) {
-    int pct = total > 0 ? downloaded * 100 / total : 0;
-    char buf[48];
-    snprintf(buf, sizeof(buf), "%s %d%%", stage, pct);
-    lv_label_set_text(g_progressLabel, buf);
+  g_progressPct = total > 0 ? downloaded * 100 / total : 0;
+  if (stage) {
+    strncpy((char*)g_progressStage, stage, sizeof(g_progressStage) - 1);
+    g_progressStage[sizeof(g_progressStage) - 1] = '\0';
   }
 }
 
@@ -120,62 +122,16 @@ void swipe_cb(lv_event_t* e) {
   swipe_detect(e, g_swipe, nav_launcher, SWIPE_H, false, 40);
 }
 
-/* URL 框被点击 → 弹出键盘 */
 void url_focus_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED && g_kb) {
-    lv_obj_clear_flag(g_kb, LV_OBJ_FLAG_HIDDEN);
-    lv_keyboard_set_textarea(g_kb, g_urlArea);
-  }
+  /* URL 框点击暂时不弹键盘（DRAM 不足），通过串口输入 */
+  (void)e;
 }
 
-void go_cb(lv_event_t* e) {
+/* 停止按钮回调：设置停止标志，后台任务会尽快退出 */
+void stop_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  const char* url = lv_textarea_get_text(g_urlArea);
-  if (!url || strlen(url) == 0) return;
-  g_fetchUrl = String(url);
-  historyPush(g_fetchUrl);
-  g_fetching = true;
-  g_firstLoad = false;
-  if (g_kb) lv_obj_add_flag(g_kb, LV_OBJ_FLAG_HIDDEN);
-  lv_label_set_text(g_status, "加载中");
-  lv_obj_clean(g_content);
-  updateNavButtons();
-}
-
-void back_nav_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (g_historyIdx <= 0) return;
-  g_historyIdx--;
-  g_fetchUrl = g_history[g_historyIdx];
-  g_fetching = true;
-  lv_textarea_set_text(g_urlArea, g_fetchUrl.c_str());
-  lv_label_set_text(g_status, "加载中");
-  lv_obj_clean(g_content);
-  updateNavButtons();
-}
-
-void fwd_nav_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (g_historyIdx >= g_historySize - 1) return;
-  g_historyIdx++;
-  g_fetchUrl = g_history[g_historyIdx];
-  g_fetching = true;
-  lv_textarea_set_text(g_urlArea, g_fetchUrl.c_str());
-  lv_label_set_text(g_status, "加载中");
-  lv_obj_clean(g_content);
-  updateNavButtons();
-}
-
-void home_nav_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (g_historySize == 0) return;
-  g_historyIdx = 0;
-  g_fetchUrl = g_history[0];
-  g_fetching = true;
-  lv_textarea_set_text(g_urlArea, g_fetchUrl.c_str());
-  lv_label_set_text(g_status, "加载中");
-  lv_obj_clean(g_content);
-  updateNavButtons();
+  g_stopRequested = true;
+  if (g_loadingLabel) lv_label_set_text(g_loadingLabel, "正在停止...");
 }
 
 /* ── 引擎管理 ── */
@@ -189,104 +145,112 @@ void ensureEngineInit() {
   g_engineInited = true;
 }
 
-/* 每次加载前完整重建引擎，清除 Lexbor 内部脏状态 */
-void resetEngine() {
-  if (!g_engineInited) return;
+/* ── 后台下载解析任务（Phase 1，不触碰 LVGL） ── */
+void fetch_task(void *param) {
+  String url = g_fetchUrl;
+  if (!url.startsWith("http://") && !url.startsWith("https://"))
+    url = "http://" + url;
+
+  Serial.printf("[Browser] fetch_task start: %s\n", url.c_str());
+
+  /* 每次加载前完整重建引擎 */
   tactilebrowser_core_cleanup();
   tactilebrowser_core_init();
   tactilebrowser_set_renderer(&g_renderer->base);
   tactilebrowser_set_html_downloader(arduino_download_html);
   arduino_set_progress_callback(progressCb);
+
+  g_taskResult = tactilebrowser_download_and_parse(
+      url.c_str(), 460, 360, &g_stopRequested, &g_layoutRoot);
+
+  Serial.printf("[Browser] fetch_task done: result=%d layout=%p\n",
+    (int)g_taskResult, g_layoutRoot);
+
+  g_taskDone = true;
+  vTaskDelete(NULL);
 }
 
-/* ── 加载网页（在 tick 中调用，阻塞式） ── */
-void fetchPage() {
+/* ── 显示/隐藏加载遮罩 ── */
+void showLoadingOverlay() {
+  if (g_loadingOverlay) lv_obj_clear_flag(g_loadingOverlay, LV_OBJ_FLAG_HIDDEN);
+  if (g_loadingLabel) lv_label_set_text(g_loadingLabel, "加载中，请稍等...");
+  if (g_loadProgressText) lv_label_set_text(g_loadProgressText, "");
+  if (g_loadProgressBar) lv_bar_set_value(g_loadProgressBar, 0, LV_ANIM_OFF);
+  g_progressPct = 0;
+  g_progressStage[0] = '\0';
+}
+
+void hideLoadingOverlay() {
+  if (g_loadingOverlay) lv_obj_add_flag(g_loadingOverlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+/* ── 启动加载（创建后台任务） ── */
+void startFetch(const String& url) {
+  /* 如果有任务在跑，先停止它 */
+  if (g_fetchTask != nullptr) {
+    g_stopRequested = true;
+    /* 等待旧任务退出（最多 2 秒） */
+    for (int i = 0; i < 200 && g_fetchTask != nullptr; i++) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+  }
+
   ensureEngineInit();
 
-  if (WiFi.status() != WL_CONNECTED) {
-    lv_label_set_text(g_status, "等WiFi");
-    for (int i = 0; i < 50 && WiFi.status() != WL_CONNECTED; i++)
-      delay(100);
+  g_fetchUrl = url;
+  g_stopRequested = false;
+  g_taskDone = false;
+  g_layoutRoot = nullptr;
+  g_state = BROWSER_LOADING;
+
+  /* 显示加载 UI */
+  if (g_status) lv_label_set_text(g_status, "加载中");
+  showLoadingOverlay();
+  if (g_content) lv_obj_clean(g_content);
+  updateNavButtons();
+
+  /* 创建后台任务：64KB 栈（HTTPS + HTML 解析需要大栈），Core 0（和 WiFi 同核） */
+  BaseType_t ret = xTaskCreatePinnedToCore(
+      fetch_task, "browser_fetch", 65536, NULL, 5, &g_fetchTask, 0);
+  if (ret != pdPASS) {
+    Serial.println("[Browser] Failed to create fetch task!");
+    g_state = BROWSER_ERROR;
+    if (g_status) lv_label_set_text(g_status, "任务创建失败");
+    hideLoadingOverlay();
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    lv_label_set_text(g_status, "无WiFi");
-    g_fetching = false;
-    return;
-  }
+}
 
-  String url = g_fetchUrl;
-  if (!url.startsWith("http://") && !url.startsWith("https://"))
-    url = "http://" + url;
+/* ── 导航回调 ── */
+void go_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  const char* url = lv_textarea_get_text(g_urlArea);
+  if (!url || strlen(url) == 0) return;
+  historyPush(String(url));
+  startFetch(String(url));
+}
 
-  Serial.printf("[Browser] fetching: %s\n", url.c_str());
-  lv_label_set_text(g_status, "下载中");
+void back_nav_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (g_historyIdx <= 0) return;
+  g_historyIdx--;
+  lv_textarea_set_text(g_urlArea, g_history[g_historyIdx].c_str());
+  startFetch(g_history[g_historyIdx]);
+}
 
-  resetEngine();
-  lv_obj_clean(g_content);
+void fwd_nav_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (g_historyIdx >= g_historySize - 1) return;
+  g_historyIdx++;
+  lv_textarea_set_text(g_urlArea, g_history[g_historyIdx].c_str());
+  startFetch(g_history[g_historyIdx]);
+}
 
-  /* 诊断：渲染前打印内存情况 */
-  Serial.printf("[Diag] before render: DRAM free=%u, PSRAM free=%u\n",
-    (unsigned)xPortGetFreeHeapSize(),
-    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
-  /* 诊断：渲染前打印 g_content 信息 */
-  if (g_content) {
-    int cc = 0;
-    lv_obj_t* ch = lv_obj_get_child(g_content, 0);
-    while (ch) { cc++; ch = lv_obj_get_child(g_content, cc); }
-    Serial.printf("[Diag] BEFORE render: g_content w=%d h=%d x=%d y=%d children=%d\n",
-      lv_obj_get_width(g_content), lv_obj_get_height(g_content),
-      lv_obj_get_x(g_content), lv_obj_get_y(g_content), cc);
-  } else {
-    Serial.println("[Diag] BEFORE render: g_content is NULL!");
-  }
-
-  /* 内容区高度 = 410-40 = 370，宽度 = 480 */
-  RenderResult result = tactilebrowser_render_url(url.c_str(), g_content, 460, 360);
-
-  Serial.printf("[Browser] render result: %d\n", (int)result);
-
-  /* 诊断：渲染后打印 g_content 信息 */
-  if (g_content) {
-    int cc = 0;
-    lv_obj_t* ch = lv_obj_get_child(g_content, 0);
-    while (ch) { cc++; ch = lv_obj_get_child(g_content, cc); }
-    Serial.printf("[Diag] AFTER render: g_content w=%d h=%d x=%d y=%d children=%d\n",
-      lv_obj_get_width(g_content), lv_obj_get_height(g_content),
-      lv_obj_get_x(g_content), lv_obj_get_y(g_content), cc);
-  } else {
-    Serial.println("[Diag] AFTER render: g_content is NULL!");
-  }
-
-  /* 诊断：打印 g_content 的子对象信息 */
-  if (g_content) {
-    int childCount = 0;
-    lv_obj_t* child = lv_obj_get_child(g_content, 0);
-    while (child) {
-      childCount++;
-      child = lv_obj_get_child(g_content, childCount);
-    }
-    Serial.printf("[Browser] g_content children=%d w=%d h=%d x=%d y=%d\n",
-      childCount, lv_obj_get_width(g_content), lv_obj_get_height(g_content),
-      lv_obj_get_x(g_content), lv_obj_get_y(g_content));
-    /* 打印前 3 个子对象的信息 */
-    for (int i = 0; i < 3 && i < childCount; i++) {
-      lv_obj_t* c = lv_obj_get_child(g_content, i);
-      Serial.printf("[Browser] child[%d]: x=%d y=%d w=%d h=%d\n",
-        i, lv_obj_get_x(c), lv_obj_get_y(c),
-        lv_obj_get_width(c), lv_obj_get_height(c));
-    }
-  }
-
-  if (result == RENDER_SUCCESS)         lv_label_set_text(g_status, "已加载");
-  else if (result == RENDER_ERROR_NETWORK) lv_label_set_text(g_status, "网络错误");
-  else if (result == RENDER_ERROR_PARSE)   lv_label_set_text(g_status, "解析失败");
-  else if (result == RENDER_ERROR_MEMORY)  lv_label_set_text(g_status, "内存不足");
-  else                                     lv_label_set_text(g_status, "未知错误");
-
-  lv_bar_set_value(g_progressBar, 0, LV_ANIM_OFF);
-  lv_label_set_text(g_progressLabel, "");
-  g_fetching = false;
+void home_nav_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (g_historySize == 0) return;
+  g_historyIdx = 0;
+  lv_textarea_set_text(g_urlArea, g_history[0].c_str());
+  startFetch(g_history[0]);
 }
 
 }  // namespace
@@ -307,7 +271,6 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
   /* ── 顶栏 (0-40) ── */
-  /* 退出按钮（左上角，替代原来的返回箭头） */
   lv_obj_t* exitTop = lv_btn_create(scr);
   lv_obj_set_size(exitTop, 40, 36);
   lv_obj_align(exitTop, LV_ALIGN_TOP_LEFT, 2, 2);
@@ -323,24 +286,20 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_set_style_text_font(exitLbl, &font_zh_16, 0);
   lv_obj_center(exitLbl);
 
-  /* URL 输入框 */
   g_urlArea = lv_textarea_create(scr);
   lv_obj_set_size(g_urlArea, 300, 36);
   lv_obj_align(g_urlArea, LV_ALIGN_TOP_LEFT, 46, 2);
   lv_textarea_set_placeholder_text(g_urlArea, "输入网址");
   lv_textarea_set_text(g_urlArea, "https://www.baidu.com");
   lv_textarea_set_one_line(g_urlArea, true);
-  lv_textarea_set_cursor_click_pos(g_urlArea, true);
   lv_obj_set_style_text_font(g_urlArea, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(g_urlArea, lv_color_white(), 0);
   lv_obj_set_style_border_color(g_urlArea, lv_color_hex(0x444444), 0);
   lv_obj_set_style_border_width(g_urlArea, 1, 0);
   lv_obj_set_style_radius(g_urlArea, 6, 0);
   lv_obj_set_style_bg_color(g_urlArea, lv_color_hex(0x111111), 0);
-  /* 点击 URL 框弹出键盘 */
   lv_obj_add_event_cb(g_urlArea, url_focus_cb, LV_EVENT_CLICKED, NULL);
 
-  /* 加载按钮 */
   g_goBtn = lv_btn_create(scr);
   lv_obj_set_size(g_goBtn, 50, 36);
   lv_obj_align(g_goBtn, LV_ALIGN_TOP_LEFT, 350, 2);
@@ -356,7 +315,6 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_set_style_text_font(goLbl, &font_zh_16, 0);
   lv_obj_center(goLbl);
 
-  /* 状态标签（顶栏右侧） */
   g_status = lv_label_create(scr);
   lv_label_set_text(g_status, WiFi.status() == WL_CONNECTED ? "就绪" : "无WiFi");
   lv_obj_set_style_text_color(g_status, lv_color_hex(0x888888), 0);
@@ -374,9 +332,59 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_set_scroll_dir(g_content, LV_DIR_VER);
   lv_obj_set_style_text_color(g_content, lv_color_hex(0xCCCCCC), 0);
   lv_obj_set_style_text_font(g_content, &font_zh_16, 0);
-  /* flex column 布局：div 不创建容器时子节点直接平铺，垂直排列 */
   lv_obj_set_flex_flow(g_content, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_gap(g_content, 2, 0);
+
+  /* ── 加载遮罩（覆盖在内容区上，默认隐藏） ── */
+  g_loadingOverlay = lv_obj_create(scr);
+  lv_obj_set_size(g_loadingOverlay, 476, 366);
+  lv_obj_align(g_loadingOverlay, LV_ALIGN_TOP_LEFT, 2, 42);
+  lv_obj_set_style_bg_color(g_loadingOverlay, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(g_loadingOverlay, LV_OPA_80, 0);
+  lv_obj_set_style_border_width(g_loadingOverlay, 0, 0);
+  lv_obj_set_style_radius(g_loadingOverlay, 0, 0);
+  lv_obj_set_style_pad_all(g_loadingOverlay, 0, 0);
+  lv_obj_clear_flag(g_loadingOverlay, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(g_loadingOverlay, LV_OBJ_FLAG_HIDDEN);
+
+  /* "加载中，请稍等..." 文字 */
+  g_loadingLabel = lv_label_create(g_loadingOverlay);
+  lv_label_set_text(g_loadingLabel, "加载中，请稍等...");
+  lv_obj_set_style_text_color(g_loadingLabel, lv_color_white(), 0);
+  lv_obj_set_style_text_font(g_loadingLabel, &font_zh_16, 0);
+  lv_obj_align(g_loadingLabel, LV_ALIGN_TOP_MID, 0, 80);
+
+  /* 进度条 */
+  g_loadProgressBar = lv_bar_create(g_loadingOverlay);
+  lv_obj_set_size(g_loadProgressBar, 300, 12);
+  lv_obj_align(g_loadProgressBar, LV_ALIGN_TOP_MID, 0, 120);
+  lv_bar_set_range(g_loadProgressBar, 0, 100);
+  lv_bar_set_value(g_loadProgressBar, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(g_loadProgressBar, lv_color_hex(0x222222), 0);
+  lv_obj_set_style_bg_color(g_loadProgressBar, lv_color_hex(0x4488ff), LV_PART_INDICATOR);
+
+  /* 进度文字 */
+  g_loadProgressText = lv_label_create(g_loadingOverlay);
+  lv_label_set_text(g_loadProgressText, "");
+  lv_obj_set_style_text_color(g_loadProgressText, lv_color_hex(0x888888), 0);
+  lv_obj_set_style_text_font(g_loadProgressText, &lv_font_montserrat_14, 0);
+  lv_obj_align(g_loadProgressText, LV_ALIGN_TOP_MID, 0, 140);
+
+  /* 大停止按钮 */
+  g_stopBtn = lv_btn_create(g_loadingOverlay);
+  lv_obj_set_size(g_stopBtn, 120, 50);
+  lv_obj_align(g_stopBtn, LV_ALIGN_TOP_MID, 0, 180);
+  lv_obj_set_style_bg_color(g_stopBtn, lv_color_hex(0x8B0000), 0);
+  lv_obj_set_style_bg_color(g_stopBtn, lv_color_hex(0xFF0000), LV_STATE_PRESSED);
+  lv_obj_set_style_radius(g_stopBtn, 8, 0);
+  lv_obj_set_style_border_width(g_stopBtn, 2, 0);
+  lv_obj_set_style_border_color(g_stopBtn, lv_color_hex(0xFF6666), 0);
+  lv_obj_add_event_cb(g_stopBtn, stop_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t* stopLbl = lv_label_create(g_stopBtn);
+  lv_label_set_text(stopLbl, "停止");
+  lv_obj_set_style_text_color(stopLbl, lv_color_white(), 0);
+  lv_obj_set_style_text_font(stopLbl, &font_zh_16, 0);
+  lv_obj_center(stopLbl);
 
   /* ── 进度条 + 进度文字 (410-435) ── */
   g_progressBar = lv_bar_create(scr);
@@ -394,7 +402,6 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_align(g_progressLabel, LV_ALIGN_TOP_LEFT, 360, 412);
 
   /* ── 底栏四按钮 (435-480) ── */
-  /* 每个按钮 110×40，间距 8，起始 x=10 */
   #define BTN_W 110
   #define BTN_H 40
   #define BTN_GAP 8
@@ -425,58 +432,97 @@ lv_obj_t* BrowserScreen_create() {
 
   updateNavButtons();
 
-  /* ── 键盘（弹出式，覆盖底部） ──
-   * 暂时禁用键盘：lv_keyboard_create 会创建约 100 个 LVGL 对象，
-   * 占用大量 DRAM 导致浏览器渲染时内存不足崩溃。
-   * URL 输入暂时通过串口命令 browser <url> 实现。 */
-  /* lv_obj_t* kb = lv_keyboard_create(scr); */
-  /* lv_obj_set_size(kb, 480, 200); */
-  /* lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0); */
-  /* lv_keyboard_set_textarea(kb, g_urlArea); */
-  /* lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN); */
-  /* g_kb = kb; */
-
-  /* 诊断：确认 g_content 创建后的尺寸 */
-  Serial.printf("[Diag] BrowserScreen_create: g_content=%p w=%d h=%d x=%d y=%d\n",
-    g_content, g_content ? lv_obj_get_width(g_content) : -1,
-    g_content ? lv_obj_get_height(g_content) : -1,
-    g_content ? lv_obj_get_x(g_content) : -1,
-    g_content ? lv_obj_get_y(g_content) : -1);
-
   return scr;
 }
 
-/* ── tick：首次自动加载百度 + 处理加载请求 ── */
+/* ── tick：状态机驱动 ── */
 void BrowserScreen_tick() {
-  /* 诊断：tick 开头打印 g_content 尺寸 */
-  if (g_firstLoad || g_fetching) {
-    Serial.printf("[Diag] tick: g_content=%p w=%d h=%d\n",
-      g_content, g_content ? lv_obj_get_width(g_content) : -1,
-      g_content ? lv_obj_get_height(g_content) : -1);
-  }
-  /* 首次进入浏览器自动加载百度 */
-  if (g_firstLoad && !g_fetching) {
-    g_fetchUrl = "https://www.baidu.com";
-    historyPush(g_fetchUrl);
-    g_fetching = true;
+  /* 首次进入自动加载百度 */
+  if (g_firstLoad && g_state == BROWSER_IDLE) {
     g_firstLoad = false;
-    lv_label_set_text(g_status, "加载中");
-    updateNavButtons();
+    historyPush("https://www.baidu.com");
+    startFetch("https://www.baidu.com");
   }
-  if (g_fetching) fetchPage();
+
+  if (g_state == BROWSER_LOADING) {
+    /* 更新进度 UI（读取后台任务写入的全局变量） */
+    int pct = g_progressPct;
+    if (g_loadProgressBar && pct > 0)
+      lv_bar_set_value(g_loadProgressBar, pct, LV_ANIM_OFF);
+    if (g_loadProgressText && g_progressStage[0] != '\0') {
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%s %d%%", (const char*)g_progressStage, pct);
+      lv_label_set_text(g_loadProgressText, buf);
+    }
+    if (g_progressBar && pct > 0)
+      lv_bar_set_value(g_progressBar, pct, LV_ANIM_OFF);
+    if (g_progressLabel && g_progressStage[0] != '\0') {
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%s %d%%", (const char*)g_progressStage, pct);
+      lv_label_set_text(g_progressLabel, buf);
+    }
+
+    /* 检查后台任务是否完成 */
+    if (g_taskDone) {
+      g_taskDone = false;
+      g_fetchTask = nullptr;
+
+      if (g_taskResult == RENDER_SUCCESS && g_layoutRoot) {
+        /* Phase 2: 渲染布局树到 LVGL 控件（快速，在 UI 任务中） */
+        hideLoadingOverlay();
+        RenderResult r = tactilebrowser_render_layout(g_layoutRoot, g_content, 460, 360);
+        tactilebrowser_free_layout(g_layoutRoot);
+        g_layoutRoot = nullptr;
+
+        if (r == RENDER_SUCCESS) {
+          g_state = BROWSER_LOADED;
+          if (g_status) lv_label_set_text(g_status, "已加载");
+        } else {
+          g_state = BROWSER_ERROR;
+          if (g_status) lv_label_set_text(g_status, "渲染失败");
+        }
+      } else if (g_stopRequested) {
+        /* 用户点了停止 */
+        g_state = BROWSER_STOPPED;
+        hideLoadingOverlay();
+        if (g_status) lv_label_set_text(g_status, "已停止");
+        if (g_content) {
+          lv_obj_clean(g_content);
+          lv_obj_t* msg = lv_label_create(g_content);
+          lv_label_set_text(msg, "加载已停止");
+          lv_obj_set_style_text_color(msg, lv_color_hex(0x888888), 0);
+          lv_obj_set_style_text_font(msg, &font_zh_16, 0);
+        }
+      } else {
+        /* 加载失败 */
+        g_state = BROWSER_ERROR;
+        hideLoadingOverlay();
+        const char* errMsg = "未知错误";
+        if (g_taskResult == RENDER_ERROR_NETWORK) errMsg = "网络错误";
+        else if (g_taskResult == RENDER_ERROR_PARSE) errMsg = "解析失败";
+        else if (g_taskResult == RENDER_ERROR_MEMORY) errMsg = "内存不足";
+        if (g_status) lv_label_set_text(g_status, errMsg);
+        if (g_content) {
+          lv_obj_clean(g_content);
+          lv_obj_t* msg = lv_label_create(g_content);
+          lv_label_set_text(msg, errMsg);
+          lv_obj_set_style_text_color(msg, lv_color_hex(0xFF6666), 0);
+          lv_obj_set_style_text_font(msg, &font_zh_16, 0);
+        }
+      }
+
+      g_stopRequested = false;
+      lv_bar_set_value(g_progressBar, 0, LV_ANIM_OFF);
+      lv_label_set_text(g_progressLabel, "");
+    }
+  }
 }
 
 /* ── 串口调试用：外部传入 URL 触发加载 ── */
 void BrowserScreen_navigate(const char* url) {
   if (!url || strlen(url) == 0) return;
-  g_fetchUrl = String(url);
-  historyPush(g_fetchUrl);
-  g_fetching = true;
-  g_firstLoad = false;
-  if (g_status) lv_label_set_text(g_status, "加载中");
-  if (g_content) lv_obj_clean(g_content);
-  if (g_kb) lv_obj_add_flag(g_kb, LV_OBJ_FLAG_HIDDEN);
+  historyPush(String(url));
   if (g_urlArea) lv_textarea_set_text(g_urlArea, url);
-  updateNavButtons();
+  startFetch(String(url));
   Serial.printf("[Browser] navigate: %s\n", url);
 }

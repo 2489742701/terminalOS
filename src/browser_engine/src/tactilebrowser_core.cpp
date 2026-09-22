@@ -1,5 +1,6 @@
 #include "tactilebrowser_core.h"
 #include "css_parser.h"
+#include "lvgl_renderer.h"
 #include <stdlib.h>
 #include <string.h>
 #include <esp_heap_caps.h>
@@ -92,6 +93,97 @@ RenderResult tactilebrowser_render_url(const char *url, void *container,
                            .document_url = url};
 
   return render_html_to_container(url, &context);
+}
+
+/* ══ 两阶段异步渲染 API 实现 ══ */
+
+/* Phase 1: 下载 HTML → 解析 DOM → 构建布局树（不触碰 LVGL）。
+   可在后台 FreeRTOS 任务中安全运行。stop_flag 提供协作式取消。 */
+RenderResult tactilebrowser_download_and_parse(const char *url, int max_width,
+                                               int max_height,
+                                               volatile bool *stop_flag,
+                                               LayoutNode **out_layout) {
+  if (!url || !out_layout || !global_renderer)
+    return RENDER_ERROR_UNKNOWN;
+  *out_layout = NULL;
+
+  /* 设置停止标志给下载函数和 DOM 遍历 */
+  arduino_set_stop_flag(stop_flag);
+  dom_renderer_set_stop_flag(stop_flag);
+
+  /* 下载 HTML */
+  MemoryBuffer buffer = {0};
+  RenderResult dl_result = global_html_downloader(url, &buffer);
+  if (dl_result != RENDER_SUCCESS) {
+    arduino_set_stop_flag(nullptr);
+    dom_renderer_set_stop_flag(nullptr);
+    return dl_result;
+  }
+  if (!buffer.data || buffer.size == 0) {
+    arduino_set_stop_flag(nullptr);
+    dom_renderer_set_stop_flag(nullptr);
+    return RENDER_ERROR_NETWORK;
+  }
+
+  /* 协作式停止检查 */
+  if (stop_flag && *stop_flag) {
+    free(buffer.data);
+    arduino_set_stop_flag(nullptr);
+    dom_renderer_set_stop_flag(nullptr);
+    return RENDER_ERROR_UNKNOWN;
+  }
+
+  /* 解析 HTML → DOM */
+  lxb_html_document_t *document = html_parser.parse_html(buffer.data, buffer.size);
+  free(buffer.data);  /* DOM 已解析，HTML 缓冲可以释放 */
+  if (!document) {
+    arduino_set_stop_flag(nullptr);
+    dom_renderer_set_stop_flag(nullptr);
+    return RENDER_ERROR_PARSE;
+  }
+
+  /* 构建布局树（收集 CSS + 遍历 DOM + 计算尺寸 + 定位） */
+  global_renderer_struct.platform_data = NULL;  /* Phase 1 不触碰 LVGL */
+  RenderContext context = {.renderer = &global_renderer_struct,
+                           .root_container = NULL,
+                           .current_y = 0,
+                           .max_width = max_width,
+                           .max_height = max_height,
+                           .document_url = url};
+
+  RenderResult build_result = dom_renderer_build_layout_only(document, &context, out_layout);
+
+  /* DOM 文档可以释放了，布局树已自包含所有数据 */
+  lxb_html_document_destroy(document);
+
+  /* 清除停止标志 */
+  arduino_set_stop_flag(nullptr);
+  dom_renderer_set_stop_flag(nullptr);
+
+  return build_result;
+}
+
+/* Phase 2: 渲染布局树到 LVGL 控件（快速，在 UI 任务中调用） */
+RenderResult tactilebrowser_render_layout(LayoutNode *layout_root,
+                                          void *container, int max_width,
+                                          int max_height) {
+  if (!layout_root || !container || !global_renderer)
+    return RENDER_ERROR_UNKNOWN;
+
+  global_renderer_struct.platform_data = container;
+  RenderContext context = {.renderer = &global_renderer_struct,
+                           .root_container = container,
+                           .current_y = 0,
+                           .max_width = max_width,
+                           .max_height = max_height,
+                           .document_url = ""};
+
+  return dom_renderer_render_layout_only(layout_root, &context);
+}
+
+/* Phase 3: 释放布局树 */
+void tactilebrowser_free_layout(LayoutNode *layout_root) {
+  dom_renderer_free_layout(layout_root);
 }
 
 RenderResult tactilebrowser_render_html_string(const char *url,

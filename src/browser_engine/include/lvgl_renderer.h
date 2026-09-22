@@ -21,9 +21,13 @@ RenderResult arduino_download_html(const char *url, MemoryBuffer *buffer);
 bool arduino_html_was_truncated();
 
 /* 进度回调：下载/解析过程中定期调用，用于更新 UI 进度条。
-   downloaded = 已处理量, total = 总量, stage = 当前阶段描述 */
+    downloaded = 已处理量, total = 总量, stage = 当前阶段描述 */
 typedef void (*HtmlProgressCallback)(int downloaded, int total, const char *stage);
 void arduino_set_progress_callback(HtmlProgressCallback cb);
+
+/* 协作式停止：设置 stop_flag=true 后，arduino_download_html 和 DOM 遍历会尽快退出。
+   必须用 volatile 防止编译器优化掉检查。 */
+void arduino_set_stop_flag(volatile bool *flag);
 
 #ifdef __cplusplus
 }

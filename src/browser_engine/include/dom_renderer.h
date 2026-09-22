@@ -33,6 +33,17 @@ void dom_renderer_cleanup(void);
 // Main rendering function
 RenderResult render_html_to_container(const char *url, RenderContext *context);
 
+/* 两阶段拆分：build 只做下载+解析+构建布局树（不触碰 LVGL）；
+   render 只做 LVGL 控件创建（快速）。layout_engine.h 的 LayoutNode 前向声明。 */
+struct LayoutNode;
+void dom_renderer_set_stop_flag(volatile bool *flag);
+RenderResult dom_renderer_build_layout_only(lxb_html_document_t *document,
+                                            RenderContext *context,
+                                            struct LayoutNode **out_root);
+RenderResult dom_renderer_render_layout_only(struct LayoutNode *layout_root,
+                                             RenderContext *context);
+void dom_renderer_free_layout(struct LayoutNode *root);
+
 #ifdef __cplusplus
 }
 #endif
