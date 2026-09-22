@@ -1,4 +1,5 @@
 #include "launcher.h"
+#include <Arduino.h>
 #include "icons.h"
 #include "nav.h"
 #include "font_zh.h"
@@ -37,7 +38,19 @@ void tile_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (nav_is_locked()) return;
   TileData* td = (TileData*)lv_event_get_user_data(e);
-  if (!td || !td->target || !*td->target) return;
+  if (!td || !td->target) return;
+
+  /* 按需创建目标 Activity（注册表见 nav.cpp） */
+  if (!*td->target) nav_open(td->target);
+  if (!*td->target) {
+    Serial.println("[Launcher] open activity failed (low memory?)");
+    return;
+  }
+
+  /* 重量级应用（浏览器）独占：进入前销毁其余 Activity，把 DRAM 让给它 */
+  if (td->target == &nav_browser) {
+    nav_release_all_except(nav_launcher, nav_browser);
+  }
 
   lv_obj_t* splash = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(splash, lv_color_black(), 0);

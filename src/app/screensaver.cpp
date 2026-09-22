@@ -17,8 +17,8 @@
 #include "../config/pins.h"
 
 // ---- 可调参数 ----
-static const unsigned long ACTIVE_TIMEOUT_MS   = 30000;   // 30s 无操作 -> DIM
-static const unsigned long DIM_TIMEOUT_MS      = 10000;   // 10s 在 DIM -> OFF
+static const unsigned long ACTIVE_TIMEOUT_MS   = 300000;  // 5min 无操作 -> DIM（测试用，原 30s）
+static const unsigned long DIM_TIMEOUT_MS      = 100000;  // 100s 在 DIM -> OFF（原 10s）
 static const uint8_t       DIM_BACKLIGHT_PCT   = 15;      // DIM 背光亮度(%)
 
 

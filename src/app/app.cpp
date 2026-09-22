@@ -116,20 +116,16 @@ bool App::begin() {
   lv_indev_drv_register(&indevDrv);
 
 
-  // 7. 构建各屏并接线导航（黑底 + 白色线条图标）
-  nav_clock = ClockScreen_create();
-  nav_settings = SettingsScreen_create();
-  nav_wifi = WifiScreen_create();
-  WiFi.begin("NETGEAR", "13357728293");
-  nav_game = GameScreen_create();
-  nav_browser = BrowserScreen_create();
-  nav_draw = DrawScreen_create();
-  nav_memory = MemoryScreen_create();
-  nav_sysinfo = SysInfoScreen_create();
-  nav_weather = WeatherScreen_create();
+  /* 7. 只常驻 Launcher；其余应用改为按需创建（见 nav.cpp 的 Activity 注册表）。
+        10 屏常驻会把内部 DRAM 压到 ~93KB，浏览器连 48KB 后台任务栈都申请不到。
+        浏览器的后台任务必须在屏幕创建之前建好：此时 DRAM 最充足、尚无碎片。 */
+  BrowserScreen_preinit();
+
   nav_launcher = LauncherScreen_create();
   lv_obj_t* welcome = WelcomeScreen_create();
   lv_scr_load(welcome);
+
+  WiFi.begin("NETGEAR", "13357728293");
 
   // 8. 息屏/锁屏：解锁后回到 launcher（或由 returnScr 回到进入 DIM 时的屏）
   ScreenSaver::init(nav_launcher);
@@ -147,8 +143,16 @@ void App::loop() {
   lv_timer_handler();
   ScreenSaver::tick();
   lv_obj_t* act = lv_scr_act();
+  /* 诊断：监测 nav_browser 有效性变化 */
+  static lv_obj_t* last_act = nullptr;
+  if (act != last_act) {
+    Serial.printf("[App] screen changed: %p -> %p, nav_browser=%p valid=%d\n",
+      last_act, act, nav_browser, nav_browser ? (int)lv_obj_is_valid(nav_browser) : 0);
+    last_act = act;
+  }
   if (act == nav_clock) ClockScreen_update();
-  if (act == nav_wifi || WifiScreen_isConnecting()) WifiScreen_tick();
+  /* nav_wifi 可能已被释放（按需创建），判空后再 tick */
+  if (nav_wifi && (act == nav_wifi || WifiScreen_isConnecting())) WifiScreen_tick();
   if (act == nav_game) GameScreen_tick();
   if (act == nav_browser) BrowserScreen_tick();
   if (act == nav_sysinfo) SysInfoScreen_tick();

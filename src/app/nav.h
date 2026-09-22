@@ -13,6 +13,22 @@ extern lv_obj_t* nav_memory;
 extern lv_obj_t* nav_sysinfo;
 extern lv_obj_t* nav_weather;
 
+/* ══ Activity 注册表（阶段 1）══
+ * ESP32 没有 MMU/换页，lv_obj_create(NULL) 建的对象树会一直常驻，
+ * 直到显式 lv_obj_del()。所以除 Launcher 外，所有应用改为：
+ *   进入时按需创建（nav_open），离开/抢占时整体销毁（nav_release_*）。
+ * 这样同一时刻最多 2 棵对象树存活，把 DRAM 让给重量级应用（浏览器）。
+ * ══════════════════════════════════════════════════════════════════ */
+
+// 按需创建：若 *target 为空则调用注册表里的 create()，返回实例（失败返回 nullptr）
+lv_obj_t* nav_open(lv_obj_t** target);
+
+// 销毁除 keep1/keep2 之外的所有已加载 Activity，释放其对象树
+void nav_release_all_except(lv_obj_t* keep1, lv_obj_t* keep2 = nullptr);
+
+// 回到 Launcher：先销毁其他所有 Activity，再切屏（唯一的"退出应用"入口）
+void nav_back_home();
+
 inline uint32_t nav_lock_until = 0;
 
 inline bool nav_is_locked() {

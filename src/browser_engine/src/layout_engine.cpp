@@ -822,10 +822,24 @@ static char *layout_trim_text(const char *text) {
   return result;
 }
 
+/* widget 数量限制。
+   2026-09-23 实测（480x480，LVGL 池 128KB）：
+     屏壳常驻        ~23 KB（used 18%）
+     40 个网页 widget ~15 KB（40 个 → used 30%）
+     推算 150 个    ~57 KB → used 约 61%，池仍有 ~51KB 余量
+   所以 150 是安全的。原值 80 是当初 DRAM 紧张时的保守闸门，
+   但它并非内存保护 —— 它只是把第 81 个及以后的内容**直接丢弃**，
+   这才是页面"破碎"的真正原因。详见 docs/06。 */
+#define MAX_WIDGETS 150
+static int s_widgetCount = 0;
+
 static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
                                void *parent_widget) {
   if (!node || !render_ctx || !render_ctx->renderer)
     return;
+
+  /* widget 数量超限时停止创建新 widget，但仍递归子节点（已有容器内平铺） */
+  bool widget_limit_reached = (s_widgetCount >= MAX_WIDGETS);
 
   RenderInterface *iface = render_ctx->renderer->interface;
   if (!iface)
@@ -844,19 +858,20 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     renderer->platform_data = parent;
   }
 
-  if (node->type == ELEMENT_INPUT_TEXT && iface->create_text_input) {
+  if (node->type == ELEMENT_INPUT_TEXT && iface->create_text_input && !widget_limit_reached) {
 
     node->widget = iface->create_text_input(
         render_ctx->renderer, form_value, placeholder, node->box.x, node->box.y,
         node->box.width, node->box.height);
     widget = node->widget;
+    if (widget) s_widgetCount++;
     layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
                                  widget);
   } else if (node->type == ELEMENT_TEXTAREA) {
     /* 跳过 textarea：lv_textarea_create 创建大量 LVGL 对象导致 DRAM 不足崩溃。
        后续可用 label 或自定义容器替代。仍递归渲染子节点（textarea 内文本）。 */
 
-  } else if (node->text_content && strlen(node->text_content) > 0) {
+  } else if (node->text_content && strlen(node->text_content) > 0 && !widget_limit_reached) {
     /* 布局意图：trim 前导/尾部空格，避免开头空格太多 */
     char *trimmed_text = layout_trim_text(node->text_content);
     if (trimmed_text) {
@@ -872,6 +887,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     }
 
     widget = node->widget;
+    if (widget) s_widgetCount++;
 
     if (widget && iface->set_text_color) {
       iface->set_text_color(render_ctx->renderer, widget, node->box.color);
@@ -909,10 +925,11 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
       if (should_be_row && iface->set_flex_direction) {
         iface->set_flex_direction(render_ctx->renderer, parent, 2);
       }
-    } else if ((has_layout_intent || should_be_row) && iface->create_container) {
+    } else if ((has_layout_intent || should_be_row) && iface->create_container && !widget_limit_reached) {
       node->widget = iface->create_container(render_ctx->renderer, node->box.x,
                                              node->box.y, node->box.width,
                                              node->box.height);
+      if (node->widget) s_widgetCount++;
     }
 
     widget = node->widget;
@@ -949,5 +966,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
 void layout_render_tree(LayoutNode *root, RenderContext *render_ctx) {
   if (!root || !render_ctx)
     return;
+  s_widgetCount = 0;  /* 重置 widget 计数器 */
   layout_render_node(root, render_ctx, render_ctx->root_container);
+  Serial.printf("[Browser] widgets created: %d (limit %d)\n", s_widgetCount, MAX_WIDGETS);
 }

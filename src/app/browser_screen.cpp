@@ -38,7 +38,16 @@ enum BrowserState {
 
 /* ── UI 控件 ── */
 SwipeState g_swipe;
-lv_obj_t* g_urlArea = nullptr;
+lv_obj_t* g_urlArea = nullptr;   /* label：只显示 URL */
+String g_currentUrl;             /* URL 真值来源（label 无法回读） */
+static const char* DEFAULT_URL = "https://www.baidu.com";
+
+/* 统一更新 URL 显示 + 真值 */
+void setUrlText(const char* s) {
+  g_currentUrl = s ? s : "";
+  if (g_urlArea && lv_obj_is_valid(g_urlArea))
+    lv_label_set_text(g_urlArea, g_currentUrl.c_str());
+}
 lv_obj_t* g_content = nullptr;
 lv_obj_t* g_status = nullptr;
 lv_obj_t* g_goBtn = nullptr;
@@ -64,7 +73,9 @@ volatile int g_progressPct = 0;
 volatile char g_progressStage[32] = {0};
 volatile RenderResult g_taskResult = RENDER_SUCCESS;
 LayoutNode* g_layoutRoot = nullptr;     /* Phase 1 产出的布局树 */
-TaskHandle_t g_fetchTask = nullptr;     /* 后台任务句柄 */
+TaskHandle_t g_fetchTask = nullptr;     /* 常驻后台任务句柄 */
+String g_pendingUrl;                    /* 加载中被抢占时排队的下一次请求 */
+bool g_hasPending = false;
 String g_fetchUrl;
 bool g_firstLoad = true;
 
@@ -114,11 +125,22 @@ void progressCb(int downloaded, int total, const char* stage) {
 
 /* ── 事件回调 ── */
 void exit_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED)
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+    /* 退出时真释放：网页内容是最大的内存开销（数十个 widget + 布局树），
+       之前只切屏不释放，来回几次就把 DRAM 吃干净了。
+       注意：这里不能用 nav_back_home() —— 它会在本按钮的事件回调里
+       lv_obj_del() 掉当前所在的屏幕对象，LVGL 事件栈还没退完就可能踩到
+       已释放内存。只清内容 + 切屏；整棵屏树的销毁交给下次进其他应用时
+       nav_release_all_except() 处理（那时不在任何浏览器对象回调里）。 */
+    BrowserScreen_close();
     nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
+  }
 }
 
 void swipe_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+    Serial.println("[Browser] swipe_cb PRESSED");
+  }
   swipe_detect(e, g_swipe, nav_launcher, SWIPE_H, false, 40);
 }
 
@@ -145,24 +167,54 @@ void ensureEngineInit() {
   g_engineInited = true;
 }
 
-/* ── 后台下载解析任务（Phase 1，不触碰 LVGL） ── */
+/* 后台任务栈。必须在启动早期（DRAM 未碎片化时）一次性分配，常驻不销毁。
+   之前在每次加载时用 xTaskCreatePinnedToCore 现申请这块连续内存，跑到第二次
+   内部 DRAM 只剩 ~93KB，凑不出 48KB 连续块 → "Failed to create fetch task"。 */
+#define FETCH_STACK_BYTES 49152
+
+void fetch_task(void* param);  // 前向声明（定义在下方）
+
+void ensureFetchTask() {
+  if (g_fetchTask) return;
+  BaseType_t ret = xTaskCreatePinnedToCore(
+      fetch_task, "browser_fetch", FETCH_STACK_BYTES, NULL, 5, &g_fetchTask, 0);
+  if (ret != pdPASS) {
+    g_fetchTask = nullptr;
+    Serial.printf("[Browser] FATAL: fetch task create failed, DRAM free=%u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  } else {
+    Serial.printf("[Browser] fetch task created, stack=%u, DRAM free=%u\n",
+                  (unsigned)FETCH_STACK_BYTES,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  }
+}
+
+/* ── 后台下载解析任务（Phase 1，不触碰 LVGL）──
+ * 常驻循环：靠任务通知唤醒，干完活回到等待，不再 vTaskDelete。
+ * 好处：① 不产生堆碎片 ② 不存在失效句柄 ③ 不会分配失败。 */
 void fetch_task(void *param) {
-  String url = g_fetchUrl;
-  if (!url.startsWith("http://") && !url.startsWith("https://"))
-    url = "http://" + url;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // 等待 UI 通知
+    if (g_stopRequested) {                    // 唤醒时已被取消
+      g_taskDone = true;
+      continue;
+    }
 
-  Serial.printf("[Browser] fetch_task start: %s\n", url.c_str());
+    String url = g_fetchUrl;
+    if (!url.startsWith("http://") && !url.startsWith("https://"))
+      url = "http://" + url;
 
-  /* 引擎重建已在 startFetch（UI 任务）中完成，后台任务只做下载+解析 */
+    Serial.printf("[Browser] fetch_task start: %s\n", url.c_str());
 
-  g_taskResult = tactilebrowser_download_and_parse(
-      url.c_str(), 460, 360, &g_stopRequested, &g_layoutRoot);
+    g_taskResult = tactilebrowser_download_and_parse(
+        url.c_str(), 460, 360, &g_stopRequested, &g_layoutRoot);
 
-  Serial.printf("[Browser] fetch_task done: result=%d layout=%p\n",
-    (int)g_taskResult, g_layoutRoot);
+    Serial.printf("[Browser] fetch_task done: result=%d layout=%p DRAM free=%u\n",
+      (int)g_taskResult, g_layoutRoot,
+      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-  g_taskDone = true;
-  vTaskDelete(NULL);
+    g_taskDone = true;
+  }
 }
 
 /* ── 显示/隐藏加载遮罩 ── */
@@ -181,16 +233,24 @@ void hideLoadingOverlay() {
 
 /* ── 启动加载（创建后台任务） ── */
 void startFetch(const String& url) {
-  /* 如果有任务在跑，先停止它 */
-  if (g_fetchTask != nullptr) {
+  /* 正在加载：请求停止当前任务，并把本次请求排队，等 tick 收尾后自动续上。
+     原先这里用 vTaskDelay 死等旧任务退出，但 g_fetchTask 只在 tick 里清空，
+     而 tick 和 startFetch 同在 UI 任务 → 阻塞期间 tick 永远跑不到，必然白等。 */
+  if (g_state == BROWSER_LOADING) {
     g_stopRequested = true;
-    /* 等待旧任务退出（最多 2 秒） */
-    for (int i = 0; i < 200 && g_fetchTask != nullptr; i++) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    g_pendingUrl = url;
+    g_hasPending = true;
+    Serial.println("[Browser] busy: stopping current load, url queued");
+    return;
   }
 
   ensureEngineInit();
+  ensureFetchTask();
+  if (!g_fetchTask) return;  // 任务缺失，ensureFetchTask 已打印原因
+
+  Serial.printf("[Browser] load start: nav_browser=%p valid=%d DRAM=%u\n",
+    nav_browser, nav_browser ? (int)lv_obj_is_valid(nav_browser) : 0,
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
   /* 引擎重建在 UI 任务中做，避免后台任务操作全局状态与 UI 冲突 */
   tactilebrowser_core_cleanup();
@@ -211,31 +271,24 @@ void startFetch(const String& url) {
   if (g_content) lv_obj_clean(g_content);
   updateNavButtons();
 
-  /* 创建后台任务：64KB 栈（HTTPS + HTML 解析需要大栈），Core 0（和 WiFi 同核） */
-  BaseType_t ret = xTaskCreatePinnedToCore(
-      fetch_task, "browser_fetch", 65536, NULL, 5, &g_fetchTask, 0);
-  if (ret != pdPASS) {
-    Serial.println("[Browser] Failed to create fetch task!");
-    g_state = BROWSER_ERROR;
-    if (g_status) lv_label_set_text(g_status, "任务创建失败");
-    hideLoadingOverlay();
-  }
+  /* 唤醒常驻后台任务（不重新创建，不申请新栈） */
+  xTaskNotifyGive(g_fetchTask);
 }
 
 /* ── 导航回调 ── */
 void go_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  const char* url = lv_textarea_get_text(g_urlArea);
-  if (!url || strlen(url) == 0) return;
-  historyPush(String(url));
-  startFetch(String(url));
+  /* URL 栏是 label，不可编辑；加载的是当前显示的地址（串口 browser <url> 可改） */
+  if (g_currentUrl.length() == 0) return;
+  historyPush(g_currentUrl);
+  startFetch(g_currentUrl);
 }
 
 void back_nav_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (g_historyIdx <= 0) return;
   g_historyIdx--;
-  lv_textarea_set_text(g_urlArea, g_history[g_historyIdx].c_str());
+  setUrlText(g_history[g_historyIdx].c_str());
   startFetch(g_history[g_historyIdx]);
 }
 
@@ -243,7 +296,7 @@ void fwd_nav_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (g_historyIdx >= g_historySize - 1) return;
   g_historyIdx++;
-  lv_textarea_set_text(g_urlArea, g_history[g_historyIdx].c_str());
+  setUrlText(g_history[g_historyIdx].c_str());
   startFetch(g_history[g_historyIdx]);
 }
 
@@ -251,7 +304,7 @@ void home_nav_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   if (g_historySize == 0) return;
   g_historyIdx = 0;
-  lv_textarea_set_text(g_urlArea, g_history[0].c_str());
+  setUrlText(g_history[0].c_str());
   startFetch(g_history[0]);
 }
 
@@ -288,18 +341,24 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_set_style_text_font(exitLbl, &font_zh_16, 0);
   lv_obj_center(exitLbl);
 
-  g_urlArea = lv_textarea_create(scr);
+  /* URL 栏用 label 而非 textarea：
+     textarea 是 LVGL 里最贵的对象之一（内含 label + 光标 + 游标层），而它在本项目
+     根本无法输入（键盘依赖串口）。换成 label 直接省下一块 DRAM。
+     当前 URL 由 g_currentUrl 维护（label 只负责显示）。 */
+  g_urlArea = lv_label_create(scr);
   lv_obj_set_size(g_urlArea, 300, 36);
   lv_obj_align(g_urlArea, LV_ALIGN_TOP_LEFT, 46, 2);
-  lv_textarea_set_placeholder_text(g_urlArea, "输入网址");
-  lv_textarea_set_text(g_urlArea, "https://www.baidu.com");
-  lv_textarea_set_one_line(g_urlArea, true);
+  lv_label_set_long_mode(g_urlArea, LV_LABEL_LONG_DOT);  // 过长截断，不撑破布局
+  setUrlText(DEFAULT_URL);
+  lv_obj_add_flag(g_urlArea, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_set_style_text_font(g_urlArea, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(g_urlArea, lv_color_white(), 0);
   lv_obj_set_style_border_color(g_urlArea, lv_color_hex(0x444444), 0);
   lv_obj_set_style_border_width(g_urlArea, 1, 0);
   lv_obj_set_style_radius(g_urlArea, 6, 0);
   lv_obj_set_style_bg_color(g_urlArea, lv_color_hex(0x111111), 0);
+  lv_obj_set_style_bg_opa(g_urlArea, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_left(g_urlArea, 6, 0);
   lv_obj_add_event_cb(g_urlArea, url_focus_cb, LV_EVENT_CLICKED, NULL);
 
   g_goBtn = lv_btn_create(scr);
@@ -467,7 +526,7 @@ void BrowserScreen_tick() {
     /* 检查后台任务是否完成 */
     if (g_taskDone) {
       g_taskDone = false;
-      g_fetchTask = nullptr;
+      /* 注意：常驻任务，不要把 g_fetchTask 置空 */
 
       if (g_taskResult == RENDER_SUCCESS && g_layoutRoot) {
         /* Phase 2: 渲染布局树到 LVGL 控件（快速，在 UI 任务中） */
@@ -479,6 +538,11 @@ void BrowserScreen_tick() {
         if (r == RENDER_SUCCESS) {
           g_state = BROWSER_LOADED;
           if (g_status) lv_label_set_text(g_status, "已加载");
+          Serial.printf("[Browser] render done. DRAM free: %u, PSRAM free: %u\n",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+          Serial.printf("[Browser] g_urlArea=%p valid=%d nav_browser=%p\n",
+            g_urlArea, g_urlArea ? (int)lv_obj_is_valid(g_urlArea) : 0, nav_browser);
         } else {
           g_state = BROWSER_ERROR;
           if (g_status) lv_label_set_text(g_status, "渲染失败");
@@ -516,6 +580,15 @@ void BrowserScreen_tick() {
       g_stopRequested = false;
       lv_bar_set_value(g_progressBar, 0, LV_ANIM_OFF);
       lv_label_set_text(g_progressLabel, "");
+
+      /* 若加载期间用户又发起了请求（已在 startFetch 排队），此刻续上 */
+      if (g_hasPending) {
+        String next = g_pendingUrl;
+        g_hasPending = false;
+        g_pendingUrl = "";
+        Serial.printf("[Browser] resuming queued url: %s\n", next.c_str());
+        startFetch(next);
+      }
     }
   }
 }
@@ -524,7 +597,41 @@ void BrowserScreen_tick() {
 void BrowserScreen_navigate(const char* url) {
   if (!url || strlen(url) == 0) return;
   historyPush(String(url));
-  if (g_urlArea) lv_textarea_set_text(g_urlArea, url);
+  setUrlText(url);
+  Serial.printf("[Browser] DRAM free: %u, PSRAM free: %u\n",
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   startFetch(String(url));
   Serial.printf("[Browser] navigate: %s\n", url);
+}
+
+/* ── 退出浏览器：释放网页内容与布局树 ──
+ * 屏壳（顶栏/底栏等少量控件）保留，避免下次进入重建 + 悬空指针风险；
+ * 大头是 lv_obj_clean 掉的数十个内容 widget 和 free 掉的布局树。 */
+void BrowserScreen_close() {
+  /* 若后台任务还在跑，让它尽快退出；常驻任务不会被删除 */
+  g_stopRequested = true;
+  g_hasPending = false;
+  g_pendingUrl = "";
+
+  if (g_content) lv_obj_clean(g_content);
+
+  if (g_layoutRoot) {
+    tactilebrowser_free_layout(g_layoutRoot);
+    g_layoutRoot = nullptr;
+  }
+
+  hideLoadingOverlay();
+  g_state = BROWSER_IDLE;
+  if (g_status) lv_label_set_text(g_status,
+      WiFi.status() == WL_CONNECTED ? "就绪" : "无WiFi");
+
+  Serial.printf("[Browser] closed. DRAM free: %u, PSRAM free: %u\n",
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/* ── 启动早期调用：一次性建好常驻后台任务 ── */
+void BrowserScreen_preinit() {
+  ensureFetchTask();
 }
