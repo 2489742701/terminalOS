@@ -297,6 +297,11 @@ static void *lvgl_renderer_create_container(Renderer *renderer, int x, int y,
     lv_obj_set_height(container, LV_SIZE_CONTENT);
   }
   lv_obj_set_scroll_dir(container, LV_DIR_VER);
+  /* 去掉 LVGL 默认的边框/圆角/padding，避免嵌套容器出现一堆空框 */
+  lv_obj_set_style_border_width(container, 0, 0);
+  lv_obj_set_style_radius(container, 0, 0);
+  lv_obj_set_style_pad_all(container, 0, 0);
+  lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
   return container;
 }
 
