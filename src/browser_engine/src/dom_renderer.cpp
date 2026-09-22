@@ -131,12 +131,12 @@ static void import_external_stylesheet(const char *href, size_t href_len,
   memory_buffer_init(&css_buffer);
   RenderResult result = html_parser.download_html(absolute_url, &css_buffer);
 
-  /* CSS 超过 16KB 跳过解析：大 CSS 解析太久会阻塞 WiFi 任务。
-     简单网页的 CSS 一般 < 8KB，16KB 足够。 */
+  /* CSS 超过 64KB 跳过解析：百度首页 CSS 约 26KB，之前 16KB 限制导致 text-align 等属性丢失。
+     Lexbor 内存已重定向到 PSRAM，64KB 解析没问题。解析在 Core1 不阻塞 Core0 WiFi。 */
   if (result == RENDER_SUCCESS && css_buffer.data && css_buffer.size > 0 &&
-      css_buffer.size <= 16384) {
+      css_buffer.size <= 65536) {
     css_parser_add_stylesheet(css_buffer.data, css_buffer.size);
-  } else if (css_buffer.size > 16384) {
+  } else if (css_buffer.size > 65536) {
     Serial.printf("[Browser] CSS too large (%d bytes), skipping\n",
                   (int)css_buffer.size);
   }
@@ -160,7 +160,7 @@ static void collect_stylesheets(lxb_dom_node_t *node, const char *base_url) {
       if (!arduino_html_was_truncated()) {
         size_t css_len = 0;
         char *css_text = html_parser.get_element_text(element, &css_len);
-        if (css_text && css_len > 0 && css_len <= 8192) {
+        if (css_text && css_len > 0 && css_len <= 32768) {
           css_parser_add_stylesheet(css_text, css_len);
         }
         free(css_text);
