@@ -131,10 +131,12 @@ RenderResult arduino_download_html(const char *url, MemoryBuffer *buffer) {
     return RENDER_ERROR_NETWORK;
   }
 
-  /* 限制最大下载 64KB。百度等大网页截断后 Lexbor 解析会内存损坏，
-     64KB 能完整装下大多数有用的小网页，解析也够快不饿死 WiFi。 */
-  s_html_truncated = (contentLen > 65536);
-  if (contentLen <= 0 || contentLen > 65536) contentLen = 65536;
+  /* 限制最大下载 768KB。百度首页 730KB，前 256KB 全是 <head>，
+     <body> 标签在 256KB 之后，需要完整下载才能找到 body。
+     PSRAM 有 8MB，768KB 完全没问题。Lexbor 内存已重定向到 PSRAM，
+     DOM 节点不争抢 DRAM。下载时每 4KB vTaskDelay(1) 让 WiFi 喘气。 */
+  s_html_truncated = (contentLen > 786432);
+  if (contentLen <= 0 || contentLen > 786432) contentLen = 786432;
 
   buffer->data = (char *)heap_caps_malloc(contentLen + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!buffer->data) {

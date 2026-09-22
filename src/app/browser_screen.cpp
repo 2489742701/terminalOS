@@ -5,6 +5,8 @@
 #include <lvgl.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
 #include "lvgl_renderer.h"
 #include "tactilebrowser_core.h"
 
@@ -222,10 +224,61 @@ void fetchPage() {
   resetEngine();
   lv_obj_clean(g_content);
 
+  /* 诊断：渲染前打印内存情况 */
+  Serial.printf("[Diag] before render: DRAM free=%u, PSRAM free=%u\n",
+    (unsigned)xPortGetFreeHeapSize(),
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+  /* 诊断：渲染前打印 g_content 信息 */
+  if (g_content) {
+    int cc = 0;
+    lv_obj_t* ch = lv_obj_get_child(g_content, 0);
+    while (ch) { cc++; ch = lv_obj_get_child(g_content, cc); }
+    Serial.printf("[Diag] BEFORE render: g_content w=%d h=%d x=%d y=%d children=%d\n",
+      lv_obj_get_width(g_content), lv_obj_get_height(g_content),
+      lv_obj_get_x(g_content), lv_obj_get_y(g_content), cc);
+  } else {
+    Serial.println("[Diag] BEFORE render: g_content is NULL!");
+  }
+
   /* 内容区高度 = 410-40 = 370，宽度 = 480 */
   RenderResult result = tactilebrowser_render_url(url.c_str(), g_content, 460, 360);
 
   Serial.printf("[Browser] render result: %d\n", (int)result);
+
+  /* 诊断：渲染后打印 g_content 信息 */
+  if (g_content) {
+    int cc = 0;
+    lv_obj_t* ch = lv_obj_get_child(g_content, 0);
+    while (ch) { cc++; ch = lv_obj_get_child(g_content, cc); }
+    Serial.printf("[Diag] AFTER render: g_content w=%d h=%d x=%d y=%d children=%d\n",
+      lv_obj_get_width(g_content), lv_obj_get_height(g_content),
+      lv_obj_get_x(g_content), lv_obj_get_y(g_content), cc);
+  } else {
+    Serial.println("[Diag] AFTER render: g_content is NULL!");
+  }
+
+  /* 诊断：打印 g_content 的子对象信息 */
+  if (g_content) {
+    int childCount = 0;
+    lv_obj_t* child = lv_obj_get_child(g_content, 0);
+    while (child) {
+      childCount++;
+      child = lv_obj_get_child(g_content, childCount);
+    }
+    Serial.printf("[Browser] g_content children=%d w=%d h=%d x=%d y=%d\n",
+      childCount, lv_obj_get_width(g_content), lv_obj_get_height(g_content),
+      lv_obj_get_x(g_content), lv_obj_get_y(g_content));
+    /* 打印前 3 个子对象的信息 */
+    for (int i = 0; i < 3 && i < childCount; i++) {
+      lv_obj_t* c = lv_obj_get_child(g_content, i);
+      const char* txt = "";
+      if (lv_obj_check_type(c, &lv_label_class)) txt = lv_label_get_text(c);
+      Serial.printf("[Browser] child[%d]: x=%d y=%d w=%d h=%d txt='%.30s'\n",
+        i, lv_obj_get_x(c), lv_obj_get_y(c),
+        lv_obj_get_width(c), lv_obj_get_height(c), txt);
+    }
+  }
 
   if (result == RENDER_SUCCESS)         lv_label_set_text(g_status, "已加载");
   else if (result == RENDER_ERROR_NETWORK) lv_label_set_text(g_status, "网络错误");
@@ -382,12 +435,24 @@ lv_obj_t* BrowserScreen_create() {
   /* lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN); */
   /* g_kb = kb; */
 
+  /* 诊断：确认 g_content 创建后的尺寸 */
+  Serial.printf("[Diag] BrowserScreen_create: g_content=%p w=%d h=%d x=%d y=%d\n",
+    g_content, g_content ? lv_obj_get_width(g_content) : -1,
+    g_content ? lv_obj_get_height(g_content) : -1,
+    g_content ? lv_obj_get_x(g_content) : -1,
+    g_content ? lv_obj_get_y(g_content) : -1);
 
   return scr;
 }
 
 /* ── tick：首次自动加载百度 + 处理加载请求 ── */
 void BrowserScreen_tick() {
+  /* 诊断：tick 开头打印 g_content 尺寸 */
+  if (g_firstLoad || g_fetching) {
+    Serial.printf("[Diag] tick: g_content=%p w=%d h=%d\n",
+      g_content, g_content ? lv_obj_get_width(g_content) : -1,
+      g_content ? lv_obj_get_height(g_content) : -1);
+  }
   /* 首次进入浏览器自动加载百度 */
   if (g_firstLoad && !g_fetching) {
     g_fetchUrl = "https://www.baidu.com";

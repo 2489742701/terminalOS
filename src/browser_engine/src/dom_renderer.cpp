@@ -187,10 +187,15 @@ static void collect_stylesheets(lxb_dom_node_t *node, const char *base_url) {
   }
 }
 
+/* DOM 节点计数（诊断用，不限制数量：Lexbor 内存已重定向到 PSRAM） */
+static int g_layoutNodeCount = 0;
+
 static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
                                               RenderContext *context) {
   if (!dom_node)
     return NULL;
+
+  g_layoutNodeCount++;
 
   lxb_dom_node_type_t node_type = dom_node->type;
 
@@ -476,10 +481,29 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
   return layout_node;
 }
 
+/* 诊断：递归计算布局树节点数 */
+static int count_layout_nodes(LayoutNode *node) {
+  if (!node) return 0;
+  int count = 1;
+  LayoutNode *child = node->first_child;
+  while (child) {
+    count += count_layout_nodes(child);
+    child = child->next_sibling;
+  }
+  return count;
+}
+
 static RenderResult dom_renderer_render_document(lxb_html_document_t *document,
                                                  RenderContext *context) {
   if (!document || !context || !context->renderer)
     return RENDER_ERROR_UNKNOWN;
+
+  /* 诊断：渲染前打印容器高度 */
+  if (context->renderer->interface->get_height) {
+    int h = context->renderer->interface->get_height(context->renderer,
+                                                      context->root_container);
+    Serial.printf("[Diag] before render: container height=%d\n", h);
+  }
 
   // Collect stylesheets - 完全重建 CSS 解析器，清除上一次加载的脏状态
   // （仅 css_parser_reset 不够，Lexbor CSS parser 内部状态会残留导致下次崩溃）
@@ -496,15 +520,75 @@ static RenderResult dom_renderer_render_document(lxb_html_document_t *document,
   if (!body)
     return RENDER_ERROR_PARSE;
 
+  /* 诊断：打印 body 的 DOM 子节点信息 */
+  {
+    lxb_dom_node_t *body_node = lxb_dom_interface_node(body);
+    lxb_dom_node_t *child = lxb_dom_node_first_child(body_node);
+    int domChildCount = 0;
+    while (child && domChildCount < 20) {
+      domChildCount++;
+      const char *typeStr = "unknown";
+      if (child->type == LXB_DOM_NODE_TYPE_TEXT) typeStr = "text";
+      else if (child->type == LXB_DOM_NODE_TYPE_ELEMENT) typeStr = "element";
+      else if (child->type == LXB_DOM_NODE_TYPE_COMMENT) typeStr = "comment";
+      
+      if (child->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+        lxb_dom_element_t *elem = (lxb_dom_element_t *)child;
+        size_t tag_len = 0;
+        const char *tag = (const char *)lxb_dom_element_local_name(elem, &tag_len);
+        Serial.printf("[Diag] body child[%d]: %s tag='%.*s'\n",
+                      domChildCount, typeStr, (int)tag_len, tag);
+      } else if (child->type == LXB_DOM_NODE_TYPE_TEXT) {
+        size_t text_len = 0;
+        lxb_char_t *txt = lxb_dom_node_text_content(child, &text_len);
+        Serial.printf("[Diag] body child[%d]: text len=%d '%.40s'\n",
+                      domChildCount, (int)text_len, txt ? (char*)txt : "");
+        if (txt) {
+          lxb_dom_document_t *owner = child->owner_document;
+          if (owner) lxb_dom_document_destroy_text(owner, txt);
+          else free(txt);
+        }
+      } else {
+        Serial.printf("[Diag] body child[%d]: %s\n", domChildCount, typeStr);
+      }
+      child = lxb_dom_node_next(child);
+    }
+    if (domChildCount == 0) {
+      Serial.println("[Diag] body has NO DOM children!");
+    }
+    Serial.printf("[Diag] body DOM children count (first 20): %d\n", domChildCount);
+  }
+
   // Clear container
   if (context->renderer->interface->clear_container) {
     context->renderer->interface->clear_container(context->renderer,
                                                   context->root_container);
   }
 
+  /* 诊断：clear_container 后打印容器高度 */
+  if (context->renderer->interface->get_height) {
+    int h = context->renderer->interface->get_height(context->renderer,
+                                                      context->root_container);
+    Serial.printf("[Diag] after clear_container: container height=%d\n", h);
+  }
+
   // Build layout tree from DOM
+  g_layoutNodeCount = 0;  /* 重置节点计数器 */
   LayoutNode *layout_root =
       build_layout_tree_from_dom(lxb_dom_interface_node(body), context);
+
+  /* 诊断：打印布局树节点数 */
+  int nodeCount = count_layout_nodes(layout_root);
+  Serial.printf("[Diag] layout tree nodes=%d (root=%p)\n",
+                nodeCount, layout_root);
+  if (layout_root) {
+    int childCount = 0;
+    LayoutNode *c = layout_root->first_child;
+    while (c) { childCount++; c = c->next_sibling; }
+    Serial.printf("[Diag] root children=%d, root type=%d, root text=%p\n",
+                  childCount, (int)layout_root->type, layout_root->text_content);
+  }
+
   if (layout_root) {
     // Calculate dimensions
     layout_calculate_dimensions(layout_root, context->max_width);
@@ -514,6 +598,13 @@ static RenderResult dom_renderer_render_document(lxb_html_document_t *document,
 
     // Render to screen
     layout_render_tree(layout_root, context);
+
+    /* 诊断：layout_render_tree 后打印容器高度 */
+    if (context->renderer->interface->get_height) {
+      int h = context->renderer->interface->get_height(context->renderer,
+                                                        context->root_container);
+      Serial.printf("[Diag] after layout_render_tree: container height=%d\n", h);
+    }
 
     // Update context Y position
     context->current_y =
@@ -576,6 +667,24 @@ RenderResult render_html_to_container(const char *url, RenderContext *context) {
 
   if (!buffer.data || buffer.size == 0) {
     return RENDER_ERROR_NETWORK;
+  }
+
+  /* 诊断：打印 HTML 开头和 body 标签位置 */
+  Serial.printf("[Diag] HTML size=%d, first 200 chars:\n", (int)buffer.size);
+  Serial.printf("[Diag] %.200s\n", buffer.data);
+  {
+    const char *bodyPos = strstr(buffer.data, "<body");
+    if (bodyPos) {
+      int offset = (int)(bodyPos - buffer.data);
+      Serial.printf("[Diag] '<body' found at offset %d, context:\n", offset);
+      Serial.printf("[Diag] %.100s\n", bodyPos);
+    } else {
+      Serial.println("[Diag] '<body' NOT found in HTML!");
+    }
+    /* 检查 HTML 是否以 <!DOCTYPE html> 开头 */
+    if (buffer.size > 20) {
+      Serial.printf("[Diag] HTML starts with: %.20s\n", buffer.data);
+    }
   }
 
   // Parse HTML

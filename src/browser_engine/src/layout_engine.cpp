@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -747,6 +748,9 @@ void layout_position_node(LayoutNode *node, int parent_x, int parent_y) {
   }
 }
 
+/* 诊断：widget 创建计数器（文件作用域，layout_render_tree 中打印总数） */
+static int g_widgetCount = 0;
+
 static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
                                void *parent_widget) {
   if (!node || !render_ctx || !render_ctx->renderer)
@@ -760,6 +764,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
   void *parent = parent_widget ? parent_widget : render_ctx->root_container;
   void *widget = NULL;
 
+
   const char *form_value = node->form_value ? node->form_value : "";
   const char *placeholder = node->placeholder ? node->placeholder : NULL;
 
@@ -769,20 +774,19 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
   }
 
   if (node->type == ELEMENT_INPUT_TEXT && iface->create_text_input) {
+    if (g_widgetCount < 5) Serial.printf("[Diag] creating text_input...\n");
     node->widget = iface->create_text_input(
         render_ctx->renderer, form_value, placeholder, node->box.x, node->box.y,
         node->box.width, node->box.height);
     widget = node->widget;
     layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
                                  widget);
-  } else if (node->type == ELEMENT_TEXTAREA && iface->create_text_area) {
-    node->widget =
-        iface->create_text_area(render_ctx->renderer, form_value, node->box.x,
-                                node->box.y, node->box.width, node->box.height);
-    widget = node->widget;
-    layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
-                                 widget);
+  } else if (node->type == ELEMENT_TEXTAREA) {
+    /* 跳过 textarea：lv_textarea_create 创建大量 LVGL 对象导致 DRAM 不足崩溃。
+       后续可用 label 或自定义容器替代。仍递归渲染子节点（textarea 内文本）。 */
+    if (g_widgetCount < 5) Serial.printf("[Diag] textarea skipped\n");
   } else if (node->text_content && strlen(node->text_content) > 0) {
+    if (g_widgetCount < 5) Serial.printf("[Diag] creating label/button, type=%d text='%.20s'\n", (int)node->type, node->text_content);
     if (node->type == ELEMENT_BUTTON && iface->create_button) {
       node->widget = iface->create_button(
           render_ctx->renderer, node->text_content, node->box.x, node->box.y);
@@ -809,6 +813,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
       }
     }
   } else if (node->type == ELEMENT_DIV || node->type == ELEMENT_CONTAINER) {
+    if (g_widgetCount < 5) Serial.printf("[Diag] creating div/container, parent=%p root=%p\n", parent, render_ctx->root_container);
     bool reuse_parent =
         (node->parent == NULL && parent == render_ctx->root_container);
     if (reuse_parent) {
@@ -828,6 +833,15 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
 
   renderer->platform_data = saved_parent;
 
+  /* 诊断：widget 创建时打印 */
+  if (widget) {
+    g_widgetCount++;
+    if (g_widgetCount <= 10 || g_widgetCount % 50 == 0) {
+      Serial.printf("[Diag] widget#%d created: type=%d parent=%p widget=%p\n",
+                    g_widgetCount, (int)node->type, parent, widget);
+    }
+  }
+
   void *next_parent = widget ? widget : parent;
 
   LayoutNode *child = node->first_child;
@@ -844,5 +858,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
 void layout_render_tree(LayoutNode *root, RenderContext *render_ctx) {
   if (!root || !render_ctx)
     return;
+  g_widgetCount = 0;  /* 诊断：重置计数器 */
   layout_render_node(root, render_ctx, render_ctx->root_container);
+  Serial.printf("[Diag] layout_render_tree done: total widgets=%d\n", g_widgetCount);
 }

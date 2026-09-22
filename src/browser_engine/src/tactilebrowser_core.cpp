@@ -2,15 +2,51 @@
 #include "css_parser.h"
 #include <stdlib.h>
 #include <string.h>
+#include <esp_heap_caps.h>
+#include <Arduino.h>
+extern "C" {
+#include <lexbor/core/lexbor.h>
+}
+
+/* ── Lexbor 内存重定向到 PSRAM ──
+ * Lexbor 解析大 HTML 时会创建大量 DOM 节点，每个节点用 malloc 分配 DRAM。
+ * 百度首页 730KB HTML 会创建数千个节点，DRAM 被占满导致 WiFi 任务饿死。
+ * 重定向到 PSRAM（8MB 充裕），DRAM 不再争抢。
+ * lexbor_memory_setup() 必须在任何 Lexbor 对象创建之前调用，且只需调一次。 */
+static void *lexbor_psram_malloc(size_t size) {
+  return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static void *lexbor_psram_realloc(void *ptr, size_t size) {
+  return heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static void *lexbor_psram_calloc(size_t n, size_t size) {
+  return heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+static void lexbor_psram_free(void *ptr) {
+  heap_caps_free(ptr);
+}
+static bool s_lexbor_psram_inited = false;
+static void init_lexbor_psram() {
+  if (s_lexbor_psram_inited) return;
+  lxb_status_t st = lexbor_memory_setup(lexbor_psram_malloc, lexbor_psram_realloc,
+                                        lexbor_psram_calloc, lexbor_psram_free);
+  if (st == LXB_STATUS_OK) {
+    s_lexbor_psram_inited = true;
+    Serial.println("[Browser] Lexbor PSRAM redirect enabled");
+  } else {
+    Serial.printf("[Browser] Lexbor PSRAM redirect FAILED: %d\n", (int)st);
+  }
+}
 
 // Global state
 static RenderInterface *global_renderer = NULL;
 static RenderResult (*global_html_downloader)(const char *url,
-                                              MemoryBuffer *buffer) = NULL;
+                                               MemoryBuffer *buffer) = NULL;
 static Renderer global_renderer_struct = {0};
 
 // Initialize the core library
 bool tactilebrowser_core_init(void) {
+  init_lexbor_psram();  /* Lexbor 内存重定向到 PSRAM，必须在任何解析之前 */
   if (!html_parser_init())
     return false;
   if (!dom_renderer_init())
