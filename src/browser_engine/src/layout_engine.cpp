@@ -749,8 +749,6 @@ void layout_position_node(LayoutNode *node, int parent_x, int parent_y) {
   }
 }
 
-/* 诊断：widget 创建计数器（文件作用域，layout_render_tree 中打印总数） */
-static int g_widgetCount = 0;
 
 /* 布局意图：判断 div 是否应为行容器（flex row）。
    规则：div 有 ≥2 个"简单"子节点（link/span/只含文本的div）且无块级子节点（p/h1-h6/ul/ol）→ row。
@@ -847,7 +845,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
   }
 
   if (node->type == ELEMENT_INPUT_TEXT && iface->create_text_input) {
-    if (g_widgetCount < 5) Serial.printf("[Diag] creating text_input...\n");
+
     node->widget = iface->create_text_input(
         render_ctx->renderer, form_value, placeholder, node->box.x, node->box.y,
         node->box.width, node->box.height);
@@ -857,12 +855,12 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
   } else if (node->type == ELEMENT_TEXTAREA) {
     /* 跳过 textarea：lv_textarea_create 创建大量 LVGL 对象导致 DRAM 不足崩溃。
        后续可用 label 或自定义容器替代。仍递归渲染子节点（textarea 内文本）。 */
-    if (g_widgetCount < 5) Serial.printf("[Diag] textarea skipped\n");
+
   } else if (node->text_content && strlen(node->text_content) > 0) {
     /* 布局意图：trim 前导/尾部空格，避免开头空格太多 */
     char *trimmed_text = layout_trim_text(node->text_content);
     if (trimmed_text) {
-      if (g_widgetCount < 5) Serial.printf("[Diag] creating label/button, type=%d text='%.20s'\n", (int)node->type, trimmed_text);
+
       if (node->type == ELEMENT_BUTTON && iface->create_button) {
         node->widget = iface->create_button(
             render_ctx->renderer, trimmed_text, node->box.x, node->box.y);
@@ -895,7 +893,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
       }
     }
   } else if (node->type == ELEMENT_DIV || node->type == ELEMENT_CONTAINER) {
-    if (g_widgetCount < 5) Serial.printf("[Diag] div/container, parent=%p root=%p\n", parent, render_ctx->root_container);
+
     bool reuse_parent =
         (node->parent == NULL && parent == render_ctx->root_container);
     /* 布局意图：有 bg_color 或 text_align 或显式宽高 → 创建容器；
@@ -934,14 +932,6 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
 
   renderer->platform_data = saved_parent;
 
-  /* 诊断：widget 创建时打印 */
-  if (widget) {
-    g_widgetCount++;
-    if (g_widgetCount <= 10 || g_widgetCount % 50 == 0) {
-      Serial.printf("[Diag] widget#%d created: type=%d parent=%p widget=%p\n",
-                    g_widgetCount, (int)node->type, parent, widget);
-    }
-  }
 
   void *next_parent = widget ? widget : parent;
 
@@ -959,7 +949,5 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
 void layout_render_tree(LayoutNode *root, RenderContext *render_ctx) {
   if (!root || !render_ctx)
     return;
-  g_widgetCount = 0;  /* 诊断：重置计数器 */
   layout_render_node(root, render_ctx, render_ctx->root_container);
-  Serial.printf("[Diag] layout_render_tree done: total widgets=%d\n", g_widgetCount);
 }

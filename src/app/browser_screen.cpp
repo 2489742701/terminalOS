@@ -153,12 +153,7 @@ void fetch_task(void *param) {
 
   Serial.printf("[Browser] fetch_task start: %s\n", url.c_str());
 
-  /* 每次加载前完整重建引擎 */
-  tactilebrowser_core_cleanup();
-  tactilebrowser_core_init();
-  tactilebrowser_set_renderer(&g_renderer->base);
-  tactilebrowser_set_html_downloader(arduino_download_html);
-  arduino_set_progress_callback(progressCb);
+  /* 引擎重建已在 startFetch（UI 任务）中完成，后台任务只做下载+解析 */
 
   g_taskResult = tactilebrowser_download_and_parse(
       url.c_str(), 460, 360, &g_stopRequested, &g_layoutRoot);
@@ -196,6 +191,13 @@ void startFetch(const String& url) {
   }
 
   ensureEngineInit();
+
+  /* 引擎重建在 UI 任务中做，避免后台任务操作全局状态与 UI 冲突 */
+  tactilebrowser_core_cleanup();
+  tactilebrowser_core_init();
+  tactilebrowser_set_renderer(&g_renderer->base);
+  tactilebrowser_set_html_downloader(arduino_download_html);
+  arduino_set_progress_callback(progressCb);
 
   g_fetchUrl = url;
   g_stopRequested = false;

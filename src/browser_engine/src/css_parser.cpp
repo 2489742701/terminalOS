@@ -411,63 +411,94 @@ const char *css_parser_get_declarations(const char *selector, size_t length) {
   return NULL;
 }
 
-bool css_parser_parse_color_value(const char *value, uint32_t *color_out) {
-  if (!value || !color_out || !css_parser) {
+/* 手动解析颜色值，不依赖 Lexbor CSS 解析器（避免大 CSS 解析后内部状态破坏导致崩溃）。
+   支持 #RGB, #RRGGBB, rgb(r,g,b), 和常见颜色名称。 */
+static bool parse_color_manual(const char *value, uint32_t *color_out) {
+  if (!value || !color_out)
     return false;
-  }
 
-  if (!css_parser_prepare_memory()) {
+  /* 跳过前导空格 */
+  while (*value && isspace((unsigned char)*value))
+    value++;
+  if (!*value)
     return false;
-  }
 
-  const char *prefix = "color:";
-  const char *suffix = ";";
-  size_t value_len = strlen(value);
-  size_t buffer_len = strlen(prefix) + value_len + strlen(suffix) + 1;
-
-  char *buffer = (char *)malloc(buffer_len);
-  if (!buffer) {
-    return false;
-  }
-
-  snprintf(buffer, buffer_len, "%s%s%s", prefix, value, suffix);
-
-  lxb_css_rule_declaration_list_t *decl_list = lxb_css_declaration_list_parse(
-      css_parser, (const lxb_char_t *)buffer, strlen(buffer));
-
-  free(buffer);
-
-  if (!decl_list) {
-    lxb_css_memory_clean(css_memory);
-    return false;
-  }
-
-  bool parsed = false;
-  lxb_css_rule_t *rule = decl_list->first;
-  while (rule) {
-    if (rule->type == LXB_CSS_RULE_DECLARATION) {
-      lxb_css_rule_declaration_t *decl = (lxb_css_rule_declaration_t *)rule;
-      const lxb_css_value_color_t *color_value = NULL;
-
-      if (decl->type == LXB_CSS_PROPERTY_COLOR && decl->u.color) {
-        color_value = decl->u.color;
-      } else if (decl->type == LXB_CSS_PROPERTY_BACKGROUND_COLOR &&
-                 decl->u.background_color) {
-        color_value = decl->u.background_color;
+  /* #RGB 或 #RRGGBB */
+  if (value[0] == '#') {
+    const char *hex = value + 1;
+    size_t hex_len = strlen(hex);
+    /* 截掉尾部非十六进制字符 */
+    while (hex_len > 0 && !isxdigit((unsigned char)hex[hex_len - 1]))
+      hex_len--;
+    if (hex_len == 6) {
+      uint32_t r, g, b;
+      if (sscanf(hex, "%2x%2x%2x", &r, &g, &b) == 3) {
+        *color_out = (r << 16) | (g << 8) | b;
+        return true;
       }
-
-      if (color_value) {
-        *color_out = lexbor_color_to_uint32(color_value);
-        parsed = true;
-        break;
+    } else if (hex_len == 3) {
+      uint32_t r, g, b;
+      if (sscanf(hex, "%1x%1x%1x", &r, &g, &b) == 3) {
+        *color_out = (r << 20) | (r << 16) | (g << 12) | (g << 8) | (b << 4) | b;
+        return true;
       }
     }
-    rule = rule->next;
+    return false;
   }
 
-  lxb_css_rule_declaration_list_destroy(decl_list, true);
-  lxb_css_memory_clean(css_memory);
-  return parsed;
+  /* rgb(r, g, b) 或 rgba(r, g, b, a) — 忽略 alpha 通道 */
+  if (strncmp(value, "rgb(", 4) == 0 || strncmp(value, "rgba(", 5) == 0) {
+    int r, g, b;
+    if (sscanf(value, "rgb(%d,%d,%d)", &r, &g, &b) == 3 ||
+        sscanf(value, "rgb(%d, %d, %d)", &r, &g, &b) == 3 ||
+        sscanf(value, "rgba(%d,%d,%d", &r, &g, &b) == 3 ||
+        sscanf(value, "rgba(%d, %d, %d", &r, &g, &b) == 3) {
+      *color_out = ((uint32_t)(r & 0xFF) << 16) | ((uint32_t)(g & 0xFF) << 8) | (uint32_t)(b & 0xFF);
+      return true;
+    }
+    return false;
+  }
+
+  /* 常见颜色名称 */
+  struct { const char *name; uint32_t color; } names[] = {
+    {"black", 0x000000}, {"white", 0xFFFFFF}, {"red", 0xFF0000},
+    {"green", 0x008000}, {"blue", 0x0000FF}, {"yellow", 0xFFFF00},
+    {"gray", 0x808080}, {"grey", 0x808080}, {"orange", 0xFFA500},
+    {"purple", 0x800080}, {"pink", 0xFFC0CB}, {"brown", 0xA52A2A},
+    {"cyan", 0x00FFFF}, {"magenta", 0xFF00FF}, {"lime", 0x00FF00},
+    {"navy", 0x000080}, {"teal", 0x008080}, {"silver", 0xC0C0C0},
+    {"gold", 0xFFD700}, {"transparent", 0x000000},
+    {NULL, 0}
+  };
+  char lower[32];
+  size_t vlen = strlen(value);
+  if (vlen >= sizeof(lower))
+    return false;
+  for (size_t i = 0; i <= vlen; i++)
+    lower[i] = (char)tolower((unsigned char)value[i]);
+  /* 截掉尾部空格/分号 */
+  while (vlen > 0 && (lower[vlen-1] == ' ' || lower[vlen-1] == ';' || lower[vlen-1] == '\0'))
+    lower[--vlen] = '\0';
+  for (int i = 0; names[i].name; i++) {
+    if (strcmp(lower, names[i].name) == 0) {
+      *color_out = names[i].color;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool css_parser_parse_color_value(const char *value, uint32_t *color_out) {
+  if (!value || !color_out) {
+    return false;
+  }
+
+  /* 只用手动解析，完全不依赖 Lexbor CSS 解析器。
+     Lexbor 在解析大 CSS 后内部状态会破坏，后续调用 lxb_css_declaration_list_parse 会崩溃。
+     手动解析支持 #RGB, #RRGGBB, rgb(), rgba(), 常见颜色名。
+     解析失败就返回 false（颜色不应用，但不崩溃）。 */
+  return parse_color_manual(value, color_out);
 }
 
 void css_parser_parse_inline_style(const char *style, RenderContext *context,
