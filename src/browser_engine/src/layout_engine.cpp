@@ -800,6 +800,10 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     if (widget && iface->set_text_color) {
       iface->set_text_color(render_ctx->renderer, widget, node->box.color);
     }
+    /* 布局意图：应用 text-align（0=left, 1=center, 2=right） */
+    if (widget && iface->set_text_align && node->box.text_align != 0) {
+      iface->set_text_align(render_ctx->renderer, widget, node->box.text_align);
+    }
     layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
                                  widget);
 
@@ -816,21 +820,27 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     if (g_widgetCount < 5) Serial.printf("[Diag] div/container, parent=%p root=%p\n", parent, render_ctx->root_container);
     bool reuse_parent =
         (node->parent == NULL && parent == render_ctx->root_container);
+    /* 布局意图：有 bg_color 或 text_align 或显式宽高 → 创建容器；
+       无样式 div → 透明传递，子节点直接平铺到 parent */
+    bool has_layout_intent = node->box.has_explicit_bg_color ||
+                             node->box.text_align != 0 ||
+                             (node->box.width > 0 && !node->box.width_auto);
     if (reuse_parent) {
-      /* root div 直接复用 parent */
       node->widget = parent;
-    } else if (node->box.has_explicit_bg_color && iface->create_container) {
-      /* 有显式背景色才创建容器，否则子节点直接平铺到 parent */
+    } else if (has_layout_intent && iface->create_container) {
       node->widget = iface->create_container(render_ctx->renderer, node->box.x,
                                              node->box.y, node->box.width,
                                              node->box.height);
     }
-    /* 无显式背景色的 div 不创建容器，子节点直接渲染到 parent（当换行处理） */
 
     widget = node->widget;
-    if (widget) {
+    if (widget && widget != parent) {
       layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
                                    widget);
+      /* 容器也应用 text_align */
+      if (iface->set_text_align && node->box.text_align != 0) {
+        iface->set_text_align(render_ctx->renderer, widget, node->box.text_align);
+      }
     }
   }
 
