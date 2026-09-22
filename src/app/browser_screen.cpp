@@ -272,11 +272,9 @@ void fetchPage() {
     /* 打印前 3 个子对象的信息 */
     for (int i = 0; i < 3 && i < childCount; i++) {
       lv_obj_t* c = lv_obj_get_child(g_content, i);
-      const char* txt = "";
-      if (lv_obj_check_type(c, &lv_label_class)) txt = lv_label_get_text(c);
-      Serial.printf("[Browser] child[%d]: x=%d y=%d w=%d h=%d txt='%.30s'\n",
+      Serial.printf("[Browser] child[%d]: x=%d y=%d w=%d h=%d\n",
         i, lv_obj_get_x(c), lv_obj_get_y(c),
-        lv_obj_get_width(c), lv_obj_get_height(c), txt);
+        lv_obj_get_width(c), lv_obj_get_height(c));
     }
   }
 
@@ -376,6 +374,9 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_set_scroll_dir(g_content, LV_DIR_VER);
   lv_obj_set_style_text_color(g_content, lv_color_hex(0xCCCCCC), 0);
   lv_obj_set_style_text_font(g_content, &font_zh_16, 0);
+  /* flex column 布局：div 不创建容器时子节点直接平铺，垂直排列 */
+  lv_obj_set_flex_flow(g_content, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_gap(g_content, 2, 0);
 
   /* ── 进度条 + 进度文字 (410-435) ── */
   g_progressBar = lv_bar_create(scr);

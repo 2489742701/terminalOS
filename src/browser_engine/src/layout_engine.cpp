@@ -813,16 +813,19 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
       }
     }
   } else if (node->type == ELEMENT_DIV || node->type == ELEMENT_CONTAINER) {
-    if (g_widgetCount < 5) Serial.printf("[Diag] creating div/container, parent=%p root=%p\n", parent, render_ctx->root_container);
+    if (g_widgetCount < 5) Serial.printf("[Diag] div/container, parent=%p root=%p\n", parent, render_ctx->root_container);
     bool reuse_parent =
         (node->parent == NULL && parent == render_ctx->root_container);
     if (reuse_parent) {
+      /* root div 直接复用 parent */
       node->widget = parent;
-    } else if (iface->create_container) {
+    } else if (node->box.has_explicit_bg_color && iface->create_container) {
+      /* 有显式背景色才创建容器，否则子节点直接平铺到 parent */
       node->widget = iface->create_container(render_ctx->renderer, node->box.x,
                                              node->box.y, node->box.width,
                                              node->box.height);
     }
+    /* 无显式背景色的 div 不创建容器，子节点直接渲染到 parent（当换行处理） */
 
     widget = node->widget;
     if (widget) {

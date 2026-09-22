@@ -221,7 +221,8 @@ static void *lvgl_renderer_create_label(Renderer *renderer, const char *text,
                                         int x, int y) {
   lv_obj_t *label = lv_label_create((lv_obj_t *)renderer->platform_data);
   lv_label_set_text(label, text);
-  lv_obj_set_pos(label, x, y);
+  /* 不设 pos，让 flex column 布局自动垂直排列 */
+  (void)x; (void)y;
   lv_obj_set_width(label, lv_pct(100));
   lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
   return label;
@@ -230,7 +231,7 @@ static void *lvgl_renderer_create_label(Renderer *renderer, const char *text,
 static void *lvgl_renderer_create_button(Renderer *renderer, const char *text,
                                          int x, int y) {
   lv_obj_t *btn = lv_btn_create((lv_obj_t *)renderer->platform_data);
-  lv_obj_set_pos(btn, x, y);
+  (void)x; (void)y;
   lv_obj_set_size(btn, 70, 35);
 
   lv_obj_t *btn_label = lv_label_create(btn);
