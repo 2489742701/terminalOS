@@ -21,6 +21,7 @@ AppEntry s_apps[] = {
 
     {"snake",    "贪吃蛇", Icon::Game,     &nav_game,     AppGroup::Game,    false},
     {"memory",   "记忆卡牌", Icon::Music,  &nav_memory,   AppGroup::Game,    false},
+    {"2048",     "2048",    Icon::Game,   &nav_2048,     AppGroup::Game,    false},
 };
 
 const int s_count = (int)(sizeof(s_apps) / sizeof(s_apps[0]));

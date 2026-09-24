@@ -9,6 +9,7 @@
 #include "browser_screen.h"
 #include "draw_screen.h"
 #include "memory_screen.h"
+#include "game2048_screen.h"
 #include "sysinfo_screen.h"
 #include "weather_screen.h"
 #include "games_screen.h"
@@ -64,6 +65,8 @@ ActivityEntry s_table[] = {
     {"browser",  &nav_browser,  BrowserScreen_create,  browserCanRelease, BrowserScreen_close},
     {"draw",     &nav_draw,     DrawScreen_create,     nullptr,         nullptr},
     {"memory",   &nav_memory,   MemoryScreen_create,   nullptr,         nullptr},
+    /* 2048：纯回合制（滑动才走一步），没有 tick，不用在 App::loop 里挂东西 */
+    {"2048",     &nav_2048,     Game2048Screen_create, nullptr,         nullptr},
     {"sysinfo",  &nav_sysinfo,  SysInfoScreen_create,  nullptr,         nullptr},
     {"weather",  &nav_weather,  WeatherScreen_create,  nullptr,         nullptr},
     /* 游戏栏目本身也是一个 Activity：从它进去的子游戏退出时要回来，

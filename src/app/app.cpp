@@ -55,6 +55,7 @@ lv_obj_t* nav_game = nullptr;
 lv_obj_t* nav_browser = nullptr;
 lv_obj_t* nav_draw = nullptr;
 lv_obj_t* nav_memory = nullptr;
+lv_obj_t* nav_2048 = nullptr;
 lv_obj_t* nav_sysinfo = nullptr;
 lv_obj_t* nav_weather = nullptr;
 lv_obj_t* nav_games = nullptr;

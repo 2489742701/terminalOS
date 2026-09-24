@@ -45,6 +45,7 @@ static ScreenEntry s_screens[] = {
   {"browser",   &nav_browser},
   {"draw",      &nav_draw},
   {"memory",    &nav_memory},
+  {"2048",      &nav_2048},
   {"sysinfo",   &nav_sysinfo},
   {"weather",   &nav_weather},
   {"games",     &nav_games},
@@ -57,7 +58,7 @@ static void printHelp() {
   Serial.println("=== Serial Console Commands ===");
   Serial.println("help              - show this help");
   Serial.println("nav <screen>      - navigate to screen");
-  Serial.println("  screens: launcher clock settings wifi game browser draw memory sysinfo weather games desktop taskmgr");
+  Serial.println("  screens: launcher clock settings wifi game 2048 browser draw memory sysinfo weather games desktop taskmgr");
   Serial.println("browser <url>     - open browser and load URL");
   Serial.println("vp <width>|vp 0   - browser layout viewport (0=auto, read <meta viewport>)");
   Serial.println("flat on|off       - browser 平铺排版 on=不建容器全部平铺 off=还原CSS版面");

@@ -119,11 +119,15 @@ python tools\verify_flow.py COM7 "https://m.baidu.com"
       emoji 区码位静默跳过；**中文缺字仍保留方框**（那是"字库里没有"的信号）
 - [~] 触摸坐标偏移 —— 已加两点校准 + `traw`/`tcal`/`tprobe` 三个串口命令；
       默认端点仍是历史写死的 0..480，**待上板量四角后填真值**
-- [~] 上滑时左下角白线 —— 高度怀疑是 LVGL 默认 `LV_SCROLLBAR_MODE_AUTO` 画的滚动条
-      （`desktop_screen.cpp` 早已显式 OFF，`browser_screen.cpp` 漏了）。已补 OFF，**待上板确认**
+- [x] 上滑时左下角白线 —— **已确认修好**（master 上板验证：白线没了）。
+      根因就是 LVGL 默认 `LV_SCROLLBAR_MODE_AUTO` 画的滚动条：
+      `desktop_screen.cpp` 早已显式 OFF，`browser_screen.cpp` 的 `g_content` 漏了。
+      📌 任何可滚动容器都要显式设 `LV_SCROLLBAR_MODE_OFF`，暗色 UI 上默认样式是浅色条。
 - [ ] 蓝牙接入（现为占位）
 - [ ] 缩略图 / 图片下载
-- [ ] 更多 2D / 3D 小游戏
+- [~] 更多 2D / 3D 小游戏 —— **已加 2048**（`src/app/game2048_screen.cpp`，游戏栏目第三个）。
+      纯回合制无 tick；合并逻辑有离线单测 `tools/test_2048_logic.py`，改规则前先跑它。
+      继续加游戏只需三步：写 `XxxScreen_create()` → `nav.cpp` 注册表 → `app_registry.cpp` 加条目。
 - [ ] LV_COLOR_DEPTH 16→8（性能下一步候选，待拍板）
 - [ ] SD 卡路线 A（资源外置）/ B（Lua 脚本层）二选一 —— 探测数据齐了，待 master 拍板
 
