@@ -19,6 +19,13 @@
  * 二级菜单 = **同一个屏 + 数据源栈**，不是每级建一个 Activity：
  *   · nav 表不会被撑爆
  *   · 不会每页多一棵常驻对象树（被"10 屏常驻导致 DRAM 不够"坑过）
+ *
+ * ── 分组口径（改分组 / 加项前先看这段）─────────────────────────────────
+ *   · 显示与亮度：只影响"这块屏怎么亮"（亮度 / 息屏 / 桌面图标）
+ *   · 浏览器设置：只影响浏览器的数据与行为（缓存 / 下载 / 排版）
+ *   · 系统设置  ：整机级（时间 / 固件 / 诊断屏入口）
+ * 判断标准就一条：**改了它，影响范围是屏、是浏览器，还是整机**。
+ * 拿不准的先放系统设置，别为了凑组硬塞。
  * ══════════════════════════════════════════════════════════════════════════ */
 
 namespace {
@@ -74,6 +81,37 @@ void setStatus(const char* s) {
 
 void swipe_cb(lv_event_t* e) {
   swipe_detect(e, g_swipe, nav_launcher, SWIPE_H, false, 40);
+}
+
+/* 跳到另一屏（系统设置里的诊断入口统一走这里）。
+   ⚠️ 那些屏的返回键是 nav_back_home（回桌面），不会退回设置页 ——
+      这是现状，别指望它像子菜单一样能返回。 */
+static void openScreen(lv_obj_t** target, const char* name) {
+  if (!*target) nav_open(target);
+  if (!*target) {
+    char m[48];
+    snprintf(m, sizeof(m), "内存不足，打不开%s", name);
+    setStatus(m);
+    return;
+  }
+  nav_go_anim(*target, LV_SCR_LOAD_ANIM_OVER_RIGHT, 300);
+}
+
+static void desktop_event_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openScreen(&nav_desktop, "桌面图标");
+}
+static void sysinfo_event_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openScreen(&nav_sysinfo, "系统信息");
+}
+static void taskmgr_event_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openScreen(&nav_taskmgr, "后台管理");
+}
+static void touchtest_event_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openScreen(&nav_touchtest, "触摸校准");
 }
 
 static void clear_cache_cb(lv_event_t* e) {
@@ -155,17 +193,6 @@ void sleep_event_cb(lv_event_t* e) {
   ScreenSaver::sleepNow();
 }
 
-/* 桌面图标：单独一屏放得下（塞不进开关列表） */
-void desktop_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  if (!nav_desktop) nav_open(&nav_desktop);
-  if (!nav_desktop) {
-    setStatus("内存不足，打不开桌面设置");
-    return;
-  }
-  nav_go_anim(nav_desktop, LV_SCR_LOAD_ANIM_OVER_RIGHT, 300);
-}
-
 void brightness_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
@@ -194,10 +221,11 @@ lv_obj_t* SettingsScreen_create() {
 
   /* ── 页面数据 ──────────────────────────────────────────────────────────
      静态局部数组：避免全局静态初始化顺序问题，且屏销毁后仍可复用。
-     运行时值（亮度/自动校时开关）在下面 patch 进去。 */
+     运行时值（亮度 / 自动校时开关）在下面 patch 进去。 */
   static SettingsItem rootItems[] = {
     siNav("显示与亮度", "display"),
-    siNav("通用", "general"),
+    siNav("浏览器设置", "browser"),
+    siNav("系统设置", "system"),
     siEnd(),
   };
   static SettingsItem displayItems[] = {
@@ -206,31 +234,38 @@ lv_obj_t* SettingsScreen_create() {
     siAction("桌面图标", desktop_event_cb),
     siEnd(),
   };
-  static SettingsItem generalItems[] = {
-    siReadOnly("时间源", timeSrcValue),
-    siToggle("自动校时", false, autosync_cb),
-    siAction("校准时间", calib_event_cb),
-    siReadOnly("固件", fwValue),
-    siReadOnly("浏览器缓存", cacheValue),
+  static SettingsItem browserItems[] = {
+    siReadOnly("页面缓存", cacheValue),
     siReadOnly("已下载页面", dlValue),
     siAction("清理缓存", clear_cache_cb),
     siAction("清理下载", clear_dl_cb),
     siEnd(),
   };
+  static SettingsItem systemItems[] = {
+    siReadOnly("时间源", timeSrcValue),
+    siToggle("自动校时", false, autosync_cb),
+    siAction("校准时间", calib_event_cb),
+    siReadOnly("固件", fwValue),
+    siAction("系统信息", sysinfo_event_cb),
+    siAction("后台管理", taskmgr_event_cb),
+    siAction("触摸校准", touchtest_event_cb),
+    siEnd(),
+  };
   static const SettingsPage pages[] = {
     {"root", "设置", rootItems},
     {"display", "显示与亮度", displayItems},
-    {"general", "通用", generalItems},
+    {"browser", "浏览器设置", browserItems},
+    {"system", "系统设置", systemItems},
   };
 
   displayItems[0].vinit = s_brightness;
-  generalItems[1].checked = NtpTime::autoSyncEnabled();
+  systemItems[1].checked = NtpTime::autoSyncEnabled();
 
   refreshStorageBufs();
-  settings_menu_begin(scr, bar, pages, 3, "root");
+  settings_menu_begin(scr, bar, pages, 4, "root");
 
   g_statusLab = lv_label_create(scr);
-  lv_label_set_text(g_statusLab, "联网后自动对时（NTP），或在「通用」里手动校准");
+  lv_label_set_text(g_statusLab, "联网后自动对时（NTP），或在「系统设置」里手动校准");
   lv_obj_set_style_text_color(g_statusLab, lv_color_hex(0x666666), 0);
   lv_obj_set_style_text_font(g_statusLab, &font_zh_16, 0);
   lv_obj_set_width(g_statusLab, 456);
