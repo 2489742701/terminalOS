@@ -57,11 +57,14 @@ inline SettingsItem siToggle(const char* title, bool on, lv_event_cb_t cb) {
   it.cb = cb; it.checked = on;
   return it;
 }
+/* 带 valueFn 时，滑块左侧会显示当前值（滑块宽度相应缩窄）。
+   不传的话拖滑块看不到数字，只有一个条 —— 用户没法知道现在是多少。 */
 inline SettingsItem siSlider(const char* title, int vmin, int vmax, int vinit,
-                             lv_event_cb_t cb) {
+                             lv_event_cb_t cb, const char* (*valueFn)() = nullptr) {
   SettingsItem it = {};
   it.title = title; it.type = SetType::Slider;
   it.cb = cb; it.vmin = vmin; it.vmax = vmax; it.vinit = vinit;
+  it.valueFn = valueFn;
   return it;
 }
 inline SettingsItem siReadOnly(const char* title, const char* (*valueFn)()) {

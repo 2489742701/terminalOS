@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "settings_menu.h"
+#include "settings_store.h"
 #include "nav.h"
 #include "status_bar.h"
 #include "font_zh.h"
@@ -38,9 +39,6 @@ lv_obj_t* g_statusLab = nullptr;
 lv_timer_t* g_ntpTimer = nullptr;
 SwipeState g_swipe;
 
-/* 亮度没有 getter，用静态变量记住上次值 —— 否则每次进设置滑块都跳回 100 */
-static uint8_t s_brightness = 100;
-
 /* 手动校时的"等待中"状态。sync 在后台任务里跑，这里靠定时器轮询结果，
    不在 UI 线程里阻塞等网络。 */
 static bool s_pending = false;
@@ -63,22 +61,16 @@ static char s_upBuf[28];
 static char s_calBuf[40];
 
 /* ── 循环切换型选项（点一次换下一个）─────────────────────────────────── */
-/* 末档 0 = **常亮（永不熄屏）**。
-   历史事故：默认档是 5 分钟（index 2），常亮紧随其后 —— 用户点一下设备就再也不息屏，
-   看着像坏了。所以常亮**保留**（master 要这个功能），但要点**两次**才生效：
-   息屏是省电 + 防烧屏，不该一次误触就关掉。 */
-static const unsigned long kIdleOpts[] = {30000, 60000, 300000, 0};
-static const char* const kIdleNames[] = {"30 秒", "1 分钟", "5 分钟", "常亮"};
-static const int kIdleCount = 4;
+/* 息屏超时用 **Slider 自定义**（0~600 秒，0 = 常亮），不再用预设档循环。
+   换掉循环档的两个理由：
+     1) 默认档紧挨着「常亮」时，用户点一下就永不熄屏，看着像坏了；
+     2) 预设档满足不了"我想设 90 秒"这类需求（master 要的就是自定义）。
+   滑块是连续动作，拖动时右侧实时显示数值，既直观也不会一次误触关掉息屏。 */
 
 static const int kVpOpts[] = {0, 720, 1024, 1280};  // 0 = 自动（读 meta viewport）
 static const char* const kVpNames[] = {"自动", "720 px", "1024 px", "1280 px"};
 static const int kVpCount = 4;
 
-static int indexOf(unsigned long v, const unsigned long* arr, int n, int dflt) {
-  for (int i = 0; i < n; i++) if (arr[i] == v) return i;
-  return dflt;
-}
 static int indexOfInt(int v, const int* arr, int n, int dflt) {
   for (int i = 0; i < n; i++) if (arr[i] == v) return i;
   return dflt;
@@ -148,13 +140,10 @@ const char* vpValue() {
   return s_vpBuf;
 }
 const char* idleValue() {
-  unsigned long ms = ScreenSaver::idleTimeout();
-  int i = indexOf(ms, kIdleOpts, kIdleCount, -1);
-  /* 值不在档位表里要**如实显示**，别假装在某个档 ——
-     否则会出现"显示 5 分钟、实际永不"这种看不出来的不一致。 */
-  if (ms == 0) snprintf(s_idleBuf, sizeof(s_idleBuf), "永不");
-  else if (i < 0) snprintf(s_idleBuf, sizeof(s_idleBuf), "%lu 秒", (unsigned long)(ms / 1000));
-  else snprintf(s_idleBuf, sizeof(s_idleBuf), "%s", kIdleNames[i]);
+  unsigned long sec = ScreenSaver::idleTimeout() / 1000;
+  if (sec == 0) snprintf(s_idleBuf, sizeof(s_idleBuf), "常亮");
+  else if (sec < 60) snprintf(s_idleBuf, sizeof(s_idleBuf), "%lu 秒", sec);
+  else snprintf(s_idleBuf, sizeof(s_idleBuf), "%lu 分 %lu 秒", sec / 60, sec % 60);
   return s_idleBuf;
 }
 const char* memValue() {
@@ -219,25 +208,17 @@ static void touchtest_event_cb(lv_event_t* e) {
   openScreen(&nav_touchtest, "触摸校准");
 }
 
-/* 循环切换：点一次走到下一个选项。改完立刻刷新右侧文字 + 底部提示。
-   ⚠️ 切到「常亮」（0）要二次确认 —— 见 kIdleOpts 上方注释的事故。 */
-static uint32_t s_alwaysOnArmUntil = 0;
-static void idle_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  /* -1 = 当前值不在档位表里（例如串口 `sleep 45000` 设的）→ 回到第一档 */
-  int i = indexOf(ScreenSaver::idleTimeout(), kIdleOpts, kIdleCount, -1);
-  int next = (i + 1) % kIdleCount;
-  if (kIdleOpts[next] == 0 && !(s_alwaysOnArmUntil && millis() <= s_alwaysOnArmUntil)) {
-    s_alwaysOnArmUntil = millis() + 3000;   /* 3 秒内再点一次才真的切常亮 */
-    setStatus("再点一次确认「常亮」——屏幕将不再熄灭");
-    return;
-  }
-  s_alwaysOnArmUntil = 0;
-  i = next;
-  ScreenSaver::setIdleTimeout(kIdleOpts[i]);
+/* 息屏超时滑块：单位是**秒**，0 = 常亮（永不熄屏）。 */
+static void idle_slider_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t* sl = (lv_obj_t*)lv_event_get_target(e);
+  int sec = lv_slider_get_value(sl);
+  ScreenSaver::setIdleTimeout((unsigned long)sec * 1000);
+  SettingsStore::saveIdle((unsigned long)sec * 1000);
   settings_menu_refresh_values();
-  char m[40];
-  snprintf(m, sizeof(m), "息屏超时：%s", kIdleNames[i]);
+  char m[56];
+  if (sec == 0) snprintf(m, sizeof(m), "常亮：屏幕不再熄灭，注意烧屏");
+  else snprintf(m, sizeof(m), "息屏超时：%s", idleValue());
   setStatus(m);
 }
 
@@ -246,6 +227,7 @@ static void vp_cb(lv_event_t* e) {
   int i = indexOfInt(BrowserScreen_getViewport(), kVpOpts, kVpCount, 0);
   i = (i + 1) % kVpCount;
   BrowserScreen_setViewport(kVpOpts[i]);
+  SettingsStore::saveViewport(kVpOpts[i]);
   settings_menu_refresh_values();
   char m[40];
   snprintf(m, sizeof(m), "排版视口：%s（下次加载生效）", kVpNames[i]);
@@ -347,6 +329,7 @@ void autosync_cb(lv_event_t* e) {
   lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
   bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
   NtpTime::setAutoSync(on);
+  SettingsStore::saveAutoSync(on);
   if (on) NtpTime::requestSync();
   setStatus(on ? "已开启自动校时" : "已关闭自动校时");
 }
@@ -367,8 +350,8 @@ void brightness_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   lv_obj_t* slider = (lv_obj_t*)lv_event_get_target(e);
   int val = lv_slider_get_value(slider);
-  s_brightness = (uint8_t)val;
   Display::setBacklightLevel((uint8_t)val);
+  SettingsStore::saveBrightness(val);
 }
 
 }  // namespace
@@ -402,7 +385,7 @@ lv_obj_t* SettingsScreen_create() {
   };
   static SettingsItem displayItems[] = {
     siSlider("亮度", 5, 100, 100, brightness_cb),
-    siAction("息屏超时", idle_cb, idleValue),
+    siSlider("息屏超时", 0, 600, 300, idle_slider_cb, idleValue),
     siAction("立即息屏", sleep_event_cb),
     siAction("桌面图标", desktop_event_cb),
     siEnd(),
@@ -460,8 +443,11 @@ lv_obj_t* SettingsScreen_create() {
     {"about", "关于本机", aboutItems},
   };
 
-  displayItems[0].vinit = s_brightness;
-  systemItems[1].checked = NtpTime::autoSyncEnabled();
+  /* 初值一律从 SettingsStore 读（它开机时已从 NVS 恢复并应用到各模块），
+     不再用 s_brightness 这类局部静态 —— 否则每次进设置页都跳回代码默认值。 */
+  displayItems[0].vinit = SettingsStore::brightness();
+  displayItems[1].vinit = (int)(SettingsStore::idleMs() / 1000);
+  systemItems[1].checked = SettingsStore::autoSync();
 
   refreshStorageBufs();
   settings_menu_begin(scr, bar, pages, 7, "root");

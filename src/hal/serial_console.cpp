@@ -15,7 +15,7 @@
 #include "../app/weather_screen.h"
 #include "../app/settings_menu.h"
 #include "../app/screensaver.h"
-#include "../app/screensaver.h"
+#include "../app/settings_store.h"
 #include "../app/news.h"
 #include "../browser_engine/include/layout_engine.h"
 #include "../hal/battery.h"
@@ -63,7 +63,8 @@ static void printHelp() {
   Serial.println("help              - show this help");
   Serial.println("nav <screen>      - navigate to screen");
   Serial.println("  screens: launcher clock settings wifi game 2048 browser draw memory sysinfo weather games desktop taskmgr touchtest");
-  Serial.println("sleep [ms]        - 息屏诊断：看状态/超时/已空闲多久；sleep 30000 直接设超时(0=永不)");
+  Serial.println("reboot              - 重启设备（验证 NVS 持久化用）");
+  Serial.println("sstore            - 打印 NVS 里记住的设置（息屏/亮度/自动校时/视口）");
   Serial.println("sleep [ms]        - 息屏诊断：看状态/超时/已空闲多久；sleep 30000 直接设超时(0=永不)");
   Serial.println("setpage <id>|back - 设置页二级菜单诊断：直接跳页 / 回上一级");
   Serial.println("browser <url>     - open browser and load URL");
@@ -736,15 +737,17 @@ static void executeLine(char* line) {
     printHelp();
   } else if (strcmp(cmd, "nav") == 0) {
     cmdNav(arg);
+  } else if (strcmp(cmd, "sstore") == 0) {
+    /* 打印 NVS 里记住的设置（息屏 / 亮度 / 自动校时 / 排版视口） */
+    SettingsStore::dump();
   } else if (strcmp(cmd, "sleep") == 0) {
     /* 息屏诊断：sleep —— 看当前状态/超时/已空闲多久；sleep 30000 —— 直接设超时(ms)，
        sleep 0 = 永不。排查"怎么还不息屏"先跑这个。 */
-    if (arg && *arg) ScreenSaver::setIdleTimeout(strtoul(arg, nullptr, 10));
-    ScreenSaver::dumpStatus();
-  } else if (strcmp(cmd, "sleep") == 0) {
-    /* 息屏诊断：sleep —— 看当前状态/超时/已空闲多久；sleep 30000 —— 直接设超时(ms)，
-       sleep 0 = 永不。排查"怎么还不息屏"先跑这个。 */
-    if (arg && *arg) ScreenSaver::setIdleTimeout(strtoul(arg, nullptr, 10));
+    if (arg && *arg) {
+      unsigned long ms = strtoul(arg, nullptr, 10);
+      ScreenSaver::setIdleTimeout(ms);
+      SettingsStore::saveIdle(ms);   /* 同步给 store，否则 dump 是旧值 / 重启丢失 */
+    }
     ScreenSaver::dumpStatus();
   } else if (strcmp(cmd, "setpage") == 0) {
     /* 诊断：直接跳到设置页的某个二级页（等价于点那一行）。

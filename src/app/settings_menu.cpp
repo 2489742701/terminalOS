@@ -102,8 +102,11 @@ void renderPage(const char* id) {
       lv_obj_add_flag(sw, LV_OBJ_FLAG_EVENT_BUBBLE);
       if (it->checked) lv_obj_add_state(sw, LV_STATE_CHECKED);
     } else if (it->type == SetType::Slider) {
+      /* 带 valueFn 时给左侧腾出位置放当前值 —— 否则拖滑块看不到数字，
+         只有一个条在那儿，用户没法知道现在是多少。 */
+      const int slW = it->valueFn ? 150 : 230;
       lv_obj_t* sl = lv_slider_create(row);
-      lv_obj_set_width(sl, 230);
+      lv_obj_set_width(sl, slW);
       lv_obj_align(sl, LV_ALIGN_RIGHT_MID, -16, 0);
       lv_slider_set_range(sl, it->vmin, it->vmax);
       lv_slider_set_value(sl, it->vinit, LV_ANIM_OFF);
@@ -112,6 +115,17 @@ void renderPage(const char* id) {
       lv_obj_set_style_bg_color(sl, lv_color_white(), LV_PART_KNOB);
       lv_obj_add_event_cb(sl, it->cb, LV_EVENT_VALUE_CHANGED, NULL);
       lv_obj_add_flag(sl, LV_OBJ_FLAG_EVENT_BUBBLE);
+      if (it->valueFn && s_valCount < MAX_ROWS) {
+        lv_obj_t* valLab = lv_label_create(row);
+        lv_label_set_text(valLab, it->valueFn());
+        lv_obj_set_style_text_color(valLab, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(valLab, &font_zh_16, 0);
+        lv_obj_align(valLab, LV_ALIGN_RIGHT_MID, -(16 + slW + 10), 0);
+        lv_obj_add_flag(valLab, LV_OBJ_FLAG_EVENT_BUBBLE);
+        s_valLabs[s_valCount] = valLab;
+        s_valFns[s_valCount] = it->valueFn;
+        s_valCount++;
+      }
     } else {
       /* Nav / ReadOnly / Action：右侧文字（+ Nav 的 >） */
       const char* v = it->valueFn ? it->valueFn() : nullptr;

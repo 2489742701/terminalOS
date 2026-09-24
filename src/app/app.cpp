@@ -5,6 +5,7 @@
 #include "../config/pins.h"
 #include <lvgl.h>
 #include "screensaver.h"
+#include "settings_store.h"
 #include "nav.h"
 #include "app_registry.h"
 #include "welcome.h"
@@ -234,6 +235,10 @@ bool App::begin() {
 
   // 8. 息屏/锁屏：解锁后回到 launcher（或由 returnScr 回到进入 DIM 时的屏）
   ScreenSaver::init(nav_launcher);
+
+  /* 8.2 恢复用户设置（NVS）：息屏超时 / 亮度 / 自动校时 / 排版视口。
+     必须在 ScreenSaver::init 之后 —— loadAll 会把值写进各模块。 */
+  SettingsStore::loadAll();
 
   Serial.println("[App] init ok");
 
