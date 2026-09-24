@@ -119,6 +119,23 @@ void layout_position_node(LayoutNode *node, int parent_x, int parent_y);
 // Render layout tree to screen
 void layout_render_tree(LayoutNode *root, RenderContext *render_ctx);
 
+/* ── 分段渲染（2026-09-25）──────────────────────────────────────────────
+ * 老做法：一次性把整棵树铺成 widget，撞到 MAX_WIDGETS 就把后面的内容**全部
+ * 丢弃** —— 长页面（必应/360 中文搜索）后半截直接消失，这才是"页面破碎"的
+ * 真因。新做法：
+ *   1) 排版/摊平/去垃圾只做一次（按 root 指针记已准备），之后翻段直接复用；
+ *   2) 先"干跑"一遍数出瓦片总数（label / 胶囊 / 输入框各算一块）；
+ *   3) 真正渲染时只铺 [start, start+count) 这一段。
+ * 于是翻段 = 用同一棵布局树重铺，不重新联网、不重新解析，代价只有几十毫秒。
+ *
+ * start<0 或 count<=0 = 不分段的旧行为（铺到 MAX_WIDGETS 为止）。
+ * ⚠️ 布局树被释放后必须调 layout_forget_prepare()，否则新树可能复用同一块
+ *    地址，被误判成"已准备"而跳过摊平。 */
+void layout_set_segment(int start, int count);
+int  layout_tile_total(void);      /* 本页瓦片总数（干跑得出） */
+int  layout_tile_rendered(void);   /* 本次渲染实际铺了多少块 */
+void layout_forget_prepare(void);  /* 布局树释放时调用 */
+
 // 记录本次排版使用的视口宽度。渲染阶段据此算缩放系数（屏幕宽/视口宽）。
 // 必须在排版（layout_calculate_dimensions）之前调用，否则缩放退化为 1.0（整页露不全）。
 void layout_set_viewport_width(int width);

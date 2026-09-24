@@ -783,6 +783,19 @@ static void executeLine(char* line) {
       else Serial.printf("[Console] viewport = %d%s\n", BrowserScreen_getViewport(),
                          BrowserScreen_getViewport() == 0 ? " (auto)" : "");
     }
+  } else if (strcmp(cmd, "seg") == 0) {
+    /* 分段渲染诊断：seg = 看状态；seg 2 = 跳到第 2 段；seg next / seg prev */
+    if (!arg || !*arg) {
+      BrowserScreen_segDump();
+    } else if (strcmp(arg, "next") == 0) {
+      BrowserScreen_segDump();
+      int st = BrowserScreen_segStart();
+      BrowserScreen_segGo(st + BrowserScreen_segSize());
+    } else if (strcmp(arg, "prev") == 0) {
+      BrowserScreen_segGo(BrowserScreen_segStart() - BrowserScreen_segSize());
+    } else {
+      BrowserScreen_segGo(atoi(arg) * BrowserScreen_segSize());
+    }
   } else if (strcmp(cmd, "serve") == 0 || strcmp(cmd, "servestop") == 0) {
     /* 起/停内置页面服务：电脑浏览器打开 http://<板子IP>/ 看存下来的页面 */
     BrowserScreen_serve(strcmp(cmd, "serve") == 0);

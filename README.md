@@ -98,9 +98,16 @@ python tools\verify_flow.py COM7 "https://m.baidu.com"
 - 息屏状态机（`src/app/screensaver.cpp`）：ACTIVE（亮）→ DIM（PWM 15% 暗显时间）→ OFF（关背光）
   - DIM 态上滑 ≥120px 解锁；OFF 态触摸回 DIM
 - **浏览器**（`src/app/browser_screen.cpp` + `src/browser_engine/`）：HTML → Lexbor 解析 → 平铺排版 → LVGL 渲染
-  - 平铺排版（不建容器，避免 CSS 坐标压盖）、链接可点、搜索首页（必应/百度切换 + 常用词胶囊）
-  - 页面缓存：URI→HTML 存 PSRAM，TTL 5 分钟，3 槽 LRU，命中则跳过下载
-  - 下载当前页到 LittleFS（`dl` 或底栏下载键）+ 内置 HTTP 服务（`serve`），PC 浏览器访问设备 IP 看原始 HTML
+  - 平铺排版（不建容器，避免 CSS 坐标压盖）、链接可点、搜索首页（**必应 / 360 两颗引擎独立一行** + 常用词胶囊）
+  - **分段渲染**（2026-09-25）：一次只铺 60 块瓦片，内容末尾给「上一段 / 第 x/y 段 / 下一段」。
+    布局树渲染完**不释放**当本地缓存，翻段只是重铺同一棵树 —— 实测 19~73 ms，不联网、不重新解析。
+    ⚠️ 在此之前 `MAX_WIDGETS=200` 是硬闸门，长页面（必应/360 中文搜索）后半截会被**直接丢弃**。
+    诊断：串口 `seg` / `seg next` / `seg <n>`
+  - 页面缓存**三级**：① PSRAM 2 槽（当前页 + 上一页，TTL 5 分钟）
+    ② **SD 卡 `/gt/p<hash>.html`，TTL 30 分钟（跨重启）** ③ LittleFS 下载
+    ⚠️ SD 只在已挂载时参与（串口 `sd` 挂载；挂载要占用与 LCD 共用的 SPI，绝不在浏览中偷偷 mount）
+  - 下载当前页（底栏下载键）：**插了 SD 卡优先写卡**，否则退回 LittleFS
+  - 内置 HTTP 服务（`serve`），PC 浏览器访问设备 IP 看原始 HTML
 - NTP 校时（`src/hal/ntp_time.cpp`，手写避开 `Time` 库）、背光 PWM（LEDC，PIN_BL=38）
 
 - **中文拼音输入法**（`src/app/ime_pinyin.c`）：384 音节 / 2000 常用字，Flash 常量表二分查；

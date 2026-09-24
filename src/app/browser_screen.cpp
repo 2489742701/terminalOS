@@ -15,6 +15,7 @@
 #include "layout_engine.h"
 #include <FS.h>
 #include <LittleFS.h>
+#include "../hal/sd_card.h"
 #include "screensaver.h"
 #include "news.h"
 
@@ -227,6 +228,32 @@ bool g_hasPending = false;
 /* 网页里的链接被点击时暂存的跳转目标（见 link_click_cb：不能在事件回调里清内容） */
 String g_linkPending;
 bool g_linkPendingSet = false;
+
+/* ── 分段渲染（master 2026-09-25：「点加载下半页，则加载下半页截断上半」）──
+ * 引擎一次只铺 PAGE_SEG_TILES 块瓦片，内容末尾给一条「上一段 / 第 x/y 段 / 下一段」。
+ * 布局树渲染完**不释放**，留着当本地缓存：翻段只是拿同一棵树重铺一遍，
+ * 不重新联网、不重新解析（实测几十毫秒）。
+ * ⛔ 翻段按钮在 g_content 里 → 绝不能在它自己的 CLICKED 回调里 contentReset()
+ *    （会把正在派发事件的对象删掉）。回调只置 g_segPending，由 tick 真正执行。 */
+static const int PAGE_SEG_TILES = 60;   /* 一段铺多少块瓦片 */
+static int g_segStart = 0;              /* 当前段的起始瓦片下标 */
+static int g_segTotal = 0;              /* 本页瓦片总数（引擎干跑得出，0=未知） */
+static int g_segPending = -1;           /* >=0 = 待执行的翻段目标 */
+
+/* 释放布局树的唯一出口：树没了，引擎里"已摊平"的标记必须一起清，
+   否则新树可能复用同一块地址被误判成已准备 → 跳过摊平 → 版面错乱。 */
+static void freeLayoutTree() {
+  if (g_layoutRoot) {
+    tactilebrowser_free_layout(g_layoutRoot);
+    g_layoutRoot = nullptr;
+  }
+  layout_forget_prepare();
+  g_segStart = 0;
+  g_segTotal = 0;
+  g_segPending = -1;
+}
+/* addSegBar / renderPageSeg 定义在 tick 之前，这里**不能**再前向声明一次：
+   匿名 namespace 里的重复声明会被当成两个不同的重载，调用处报 ambiguous。 */
 String g_fetchUrl;
 bool g_firstLoad = true;
 
@@ -351,12 +378,98 @@ static void pageCachePut(const String& uri, const uint8_t* data, size_t len) {
   Serial.printf("[Browser] cache put: %s (%u B)\n", uri.c_str(), (unsigned)len);
 }
 
+/* ── SD 卡页面缓存（master 2026-09-25：「然后缓存到sd卡」）──────────────
+ * PSRAM 那份只留 2 页（当前页 + 上一页），退出浏览器就没了；SD 这份是
+ * **持久化**的：同一个 URL 下次再打开（哪怕重启过）直接从卡里读回 HTML，
+ * 不联网、不走 TLS。
+ *
+ * ⚠️ 只在 SD **已经挂载**时生效。挂载要占用与 LCD 共用的那条 SPI，
+ *    绝不在浏览过程中偷偷 mount —— 串口 `sd` 命令才挂载。没挂载一律静默跳过。
+ * 文件格式与 LittleFS 那份一致：`<!--URL:<url> TS:<millis> EP:<epoch>-->\n<html>`
+ *    —— 文件名只有 hash，靠头部这行才能在离线时把 URL 认回来。
+ *    ⚠️ **必须同时记 epoch**：只记 millis() 的话，重启后 millis 归零，
+ *       `millis() - ts` 是个巨大的无符号数，每一份缓存都会被判成"过期"
+ *       （实测刚写进去、重启再打开就走了联网）。没校时（epoch 无效）时
+ *       才退回到"ts > millis() 就认为是上次开机写的，直接认"。 */
+static const uint32_t SD_PAGE_TTL_MS = 30 * 60 * 1000UL;
+
+static uint32_t url_hash(const String& s);   /* 定义在下面（LittleFS 那一段） */
+
+static void sdPagePath(const String& url, char* out, size_t n) {
+  /* ⚠️ 只能平铺在 /gt 下：SDCard::writeFile 只 mkdir **直接父目录**，
+     "/gt/pages/xxx" 的父目录 /gt/pages 建不出来（SD.mkdir 不递归）→ 写失败。 */
+  snprintf(out, n, "/gt/p%08x.html", (unsigned)url_hash(url));
+}
+
+static bool sdPageSave(const String& url, const uint8_t* data, size_t len) {
+  if (!SDCard::mounted() || !data || len == 0) return false;
+  if (len > PAGE_CACHE_MAX_ENTRY) return false;   /* 超大页不占卡 */
+  char path[48];
+  sdPagePath(url, path, sizeof(path));
+  /* 头部和正文拼成一块再写：只写一次，不会出现"只有头没有正文"的半截文件。
+     ⚠️ concat(cstr, len) 而不是 String(cstr) —— 后者遇到 NUL 会截断 HTML。 */
+  String out;
+  out.reserve(len + url.length() + 64);
+  out += "<!--URL:";
+  out += url;
+  out += " TS:";
+  out += String((unsigned long)millis());
+  out += " EP:";
+  out += String((unsigned long)time(nullptr));
+  out += "-->\n";
+  out.concat((const char*)data, (unsigned int)len);
+  bool ok = SDCard::writeFile(path, out);
+  Serial.printf("[Browser] SD cache %s: %s (%u B)\n", ok ? "put" : "FAIL",
+                path, (unsigned)len);
+  return ok;
+}
+
+/* 命中且未过期返回 true，HTML 正文放 out。hash 撞了 / 过期 / 没挂载都返回 false。 */
+static bool sdPageLoad(const String& url, String& out) {
+  if (!SDCard::mounted()) return false;
+  char path[48];
+  sdPagePath(url, path, sizeof(path));
+  String raw;
+  if (!SDCard::readFile(path, raw)) return false;
+  if (!raw.startsWith("<!--URL:")) return false;
+  int e = raw.indexOf("-->");
+  if (e < 0) return false;
+  String head = raw.substring(8, e);
+  int tp = head.lastIndexOf(" TS:");
+  if (tp < 0) return false;
+  if (head.substring(0, tp) != url) return false;      /* hash 碰撞 */
+  unsigned long ts = strtoul(head.substring(tp + 4).c_str(), nullptr, 10);
+  int ep = head.indexOf(" EP:");
+  unsigned long epv = (ep >= 0)
+      ? strtoul(head.substring(ep + 4).c_str(), nullptr, 10) : 0;
+
+  /* 过期判定：有校时就按真实时间算（跨重启也准），没有才用 millis。 */
+  time_t now = time(nullptr);
+  bool expired = false;
+  if (epv > 1000000000UL && now > 1000000000) {
+    expired = (unsigned long)(now - epv) > (SD_PAGE_TTL_MS / 1000UL);
+  } else if (ts) {
+    /* millis() 会回绕，无符号减法天然正确；ts > now = 上次开机写的，认。 */
+    expired = (ts <= (unsigned long)millis()) &&
+              ((unsigned long)(millis() - ts) > SD_PAGE_TTL_MS);
+  }
+  if (expired) {
+    Serial.printf("[Browser] SD cache expired: %s\n", url.c_str());
+    return false;
+  }
+  out = raw.substring(e + 3);
+  while (out.length() && (out[0] == '\n' || out[0] == '\r')) out.remove(0, 1);
+  return out.length() > 0;
+}
+
 /* 下载器包装：真下载完之后顺手塞一份进缓存。
    引擎拿到 buffer 后会自己 free，所以这里必须拷一份。 */
 static RenderResult cache_download_html(const char* url, MemoryBuffer* buffer) {
   RenderResult r = arduino_download_html(url, buffer);
-  if (r == RENDER_SUCCESS && buffer && buffer->data && buffer->size > 0)
+  if (r == RENDER_SUCCESS && buffer && buffer->data && buffer->size > 0) {
     pageCachePut(String(url), (const uint8_t*)buffer->data, buffer->size);
+    sdPageSave(String(url), (const uint8_t*)buffer->data, buffer->size);
+  }
   return r;
 }
 
@@ -409,6 +522,20 @@ static void downloadCurrentPage() {
   if (!g_currentUrl.length()) { toast("还没有页面"); return; }
   int ci = pageCacheFind(g_currentUrl);
   if (ci < 0) { toast("页面已释放，请刷新后再下载"); return; }
+
+  /* SD 卡优先：容量比片内 LittleFS 大得多，插了卡就没必要占 Flash。
+     没插卡（未挂载）就退回原来的 LittleFS 路径。 */
+  if (SDCard::mounted()) {
+    if (sdPageSave(g_currentUrl, g_pageCache[ci].data, g_pageCache[ci].len)) {
+      char msg[80];
+      snprintf(msg, sizeof(msg), "已存到SD卡 %u KB",
+               (unsigned)(g_pageCache[ci].len / 1024));
+      toast(msg);
+    } else {
+      toast("写SD卡失败");
+    }
+    return;
+  }
 
   if (!LittleFS.begin(false)) {
     Serial.println("[Browser] LittleFS mount failed, formatting...");
@@ -631,6 +758,18 @@ void fetch_task(void *param) {
 
     /* 用宽视口排版（max_height 在布局阶段未使用，传 0 即可） */
     int ci = pageCacheFind(url);
+    if (ci < 0) {
+      /* PSRAM 里没有 → 退到 SD 卡那份（跨会话/重启仍然有效）。
+         读回来塞进 PSRAM 缓存，下面走的就是同一条"缓存命中"路径。 */
+      String html;
+      if (sdPageLoad(url, html)) {
+        pageCachePut(url, (const uint8_t*)html.c_str(), html.length());
+        ci = pageCacheFind(url);
+        if (ci >= 0)
+          Serial.printf("[Browser] SD cache hit: %s (%u B)\n", url.c_str(),
+                        (unsigned)g_pageCache[ci].len);
+      }
+    }
     if (ci >= 0) {
       Serial.printf("[Browser] cache hit: %s (%u B, age %us)\n",
                     url.c_str(), (unsigned)g_pageCache[ci].len,
@@ -711,7 +850,7 @@ void startFetch(const String& url) {
   g_fetchUrl = url;
   g_stopRequested = false;
   g_taskDone = false;
-  g_layoutRoot = nullptr;
+  freeLayoutTree();          /* 上一次的布局树（分段缓存）到此为止 */
   g_state = BROWSER_LOADING;
 
   /* 显示加载 UI */
@@ -798,18 +937,21 @@ static String urlEncode(const String& s) {
 enum PendingUiKind { UI_PEND_NONE = 0, UI_PEND_SEARCH, UI_PEND_DOWNLOADS };
 static volatile int g_uiPendingKind = UI_PEND_NONE;
 
-/* 搜索引擎：目前**只有必应**（master 2026-09-25 拍板退回单一引擎）。
-   历史：曾短暂加过 360(www.so.com) 和百度，后来撤了 ——
-     36氪(36kr) 是科技媒体、**没有搜索**，跟 360 不是一家，别再搞混。
+/* 搜索引擎（master 2026-09-25：必应 + 360，两个都摆出来直接点选）
+   ⚠️ 36氪(36kr) 是科技媒体、**没有搜索**，跟 360 不是一家，别再搞混。
    ⚠️ 必应必须用桌面 Chrome120 UA（移动 UA 只给 5 条、无分页），
       这条规矩在 browser_engine 那边，别动。
-   ⚠️ 要再加引擎：往 kEngines 里加一行、再把首页那个切换 chip 加回来即可。 */
+   360 设备实测：www.so.com/s?q=esp32 -> 110 widget / 44 链接 / 390ms，能用。 */
 struct SearchEngine { const char* name; const char* tpl; };
 static const SearchEngine kEngines[] = {
     {"必应", "https://cn.bing.com/search?q="},
+    {"360",  "https://www.so.com/s?q="},
 };
 static const int kEngineCount = (int)(sizeof(kEngines) / sizeof(kEngines[0]));
 static int g_engineIdx = 0;
+
+/* 选某个引擎（index）。切完重画首页显示当前选中态 */
+static void engine_pick_cb(lv_event_t* e);
 
 static void startSearch(const String& q) {
   String enc = urlEncode(q);
@@ -822,6 +964,15 @@ static void startSearch(const String& q) {
   ime_hide();
   g_linkPending = url;
   g_linkPendingSet = true;
+}
+
+static void engine_pick_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  if (idx < 0 || idx >= kEngineCount) return;
+  g_engineIdx = idx;
+  Serial.printf("[Search] engine -> %s\n", kEngines[idx].name);
+  g_uiPendingKind = UI_PEND_SEARCH;   /* 下一 tick 重画，别在回调里 clean */
 }
 
 static void search_go_cb(lv_event_t* e) {
@@ -1089,6 +1240,7 @@ static void showSearchHome() {
   hideLoadingOverlay();
   if (g_searchKb) lv_obj_add_flag(g_searchKb, LV_OBJ_FLAG_HIDDEN);
   ime_hide();
+  freeLayoutTree();     /* 离开网页：翻段用的布局树可以丢了 */
   contentReset();
   g_state = BROWSER_LOADED;
   g_currentUrl = "";
@@ -1121,6 +1273,22 @@ static void showSearchHome() {
   lv_obj_add_event_cb(g_searchTa, ime_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
   lv_obj_t* go = makeChipBtn(row, "搜索", search_go_cb, NULL);
+
+  /* 搜索引擎**另起一行**（master 2026-09-25），两个都摆出来直接点选，
+     选中的白底黑字 —— 比"点一下循环切换"清楚。 */
+  lv_obj_t* egRow = makeRow(g_content, false);
+  for (int i = 0; i < kEngineCount; i++) {
+    lv_obj_t* b = makeChipBtn(egRow, kEngines[i].name, engine_pick_cb,
+                              (void*)(intptr_t)i);
+    lv_obj_set_size(b, 76, 32);
+    if (i == g_engineIdx) {
+      lv_obj_set_style_bg_color(b, lv_color_white(), 0);
+      lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_color(b, lv_color_white(), 0);
+      lv_obj_t* lb = lv_obj_get_child(b, 0);
+      if (lb) lv_obj_set_style_text_color(lb, lv_color_black(), 0);
+    }
+  }
 
   lv_obj_set_size(go, 96, 40);
 
@@ -1957,6 +2125,78 @@ void BrowserScreen_clearCache() {
 
 int BrowserScreen_clearDownloads() { return clearSavedPages(); }
 
+/* ── 分段导航条 ──
+   铺在内容末尾，随每一段一起重建（contentReset 会把它一起清掉）。
+   ⚠️ 按钮回调里**只置标志**：真正翻段在 tick 里做。 */
+static void seg_prev_cb(lv_event_t* e) {
+  (void)e;
+  if (g_segStart <= 0) return;
+  g_segPending = g_segStart - PAGE_SEG_TILES;
+}
+static void seg_next_cb(lv_event_t* e) {
+  (void)e;
+  if (g_segTotal > 0 && g_segStart + PAGE_SEG_TILES >= g_segTotal) return;
+  g_segPending = g_segStart + PAGE_SEG_TILES;
+}
+
+static void addSegBar() {
+  if (!g_content || !lv_obj_is_valid(g_content)) return;
+  int segs = (g_segTotal + PAGE_SEG_TILES - 1) / PAGE_SEG_TILES;
+  int cur = g_segStart / PAGE_SEG_TILES + 1;
+
+  lv_obj_t* row = lv_obj_create(g_content);
+  lv_obj_set_width(row, lv_pct(100));
+  lv_obj_set_height(row, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_gap(row, 10, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(row, 0, 0);
+  lv_obj_set_style_pad_all(row, 0, 0);
+  lv_obj_set_style_pad_top(row, 10, 0);
+
+  lv_obj_t* pb = makeChipBtn(row, "上一段", seg_prev_cb, NULL);
+  lv_obj_set_size(pb, 84, 34);
+
+  char t[32];
+  snprintf(t, sizeof(t), "%d / %d 段", cur, segs);
+  lv_obj_t* tl = lv_label_create(row);
+  lv_label_set_text(tl, t);
+  lv_obj_set_style_text_color(tl, lv_color_hex(0x999999), 0);
+  lv_obj_set_style_text_font(tl, &font_zh_16, 0);
+
+  lv_obj_t* nb = makeChipBtn(row, "下一段", seg_next_cb, NULL);
+  lv_obj_set_size(nb, 84, 34);
+
+  /* 到头/到尾的那颗压暗（set_nav_enabled 会连子 label 一起压，LVGL 8 的
+     opa 不级联，只设按钮的话文字还是纯白，看不出"这颗不能按"）。 */
+  if (g_segStart <= 0) set_nav_enabled(pb, false);
+  if (g_segStart + PAGE_SEG_TILES >= g_segTotal) set_nav_enabled(nb, false);
+}
+
+/* 真正翻段：清掉当前段 → 用同一棵布局树重铺下一段 → 回到顶部。
+   不联网、不解析，只有几十毫秒。 */
+static void renderPageSeg(int start) {
+  if (!g_layoutRoot || !g_content || !lv_obj_is_valid(g_content)) return;
+  if (start < 0) start = 0;
+  if (g_segTotal > 0 && start >= g_segTotal)
+    start = ((g_segTotal - 1) / PAGE_SEG_TILES) * PAGE_SEG_TILES;
+  g_segStart = start;
+  contentReset();
+  layout_set_segment(start, PAGE_SEG_TILES);
+  uint32_t t0 = millis();
+  RenderResult r = tactilebrowser_render_layout(g_layoutRoot, g_content,
+                                                CONTENT_W, CONTENT_H);
+  Serial.printf("[Browser] seg %d..%d of %d -> %d, %u ms\n", start,
+                start + PAGE_SEG_TILES, g_segTotal, (int)r,
+                (unsigned)(millis() - t0));
+  if (g_segTotal > PAGE_SEG_TILES) addSegBar();
+  lv_obj_update_layout(g_content);
+  lv_obj_scroll_to_y(g_content, 0, LV_ANIM_OFF);
+}
+
 /* ── tick：状态机驱动 ── */
 void BrowserScreen_tick() {
   pageServerTick();   /* 存下来的页面要能被电脑访问 */
@@ -1979,6 +2219,14 @@ void BrowserScreen_tick() {
     g_uiPendingKind = UI_PEND_NONE;
     if (kind == UI_PEND_DOWNLOADS) showDownloadsHome();
     else showSearchHome();
+    return;
+  }
+
+  /* 分段翻页：按钮在 g_content 里，不能在自己的回调里清内容区。 */
+  if (g_segPending >= 0) {
+    int st = g_segPending;
+    g_segPending = -1;
+    renderPageSeg(st);
     return;
   }
 
@@ -2050,11 +2298,17 @@ void BrowserScreen_tick() {
         hideLoadingOverlay();
         /* 渲染时把整棵树从视口宽压缩到内容区宽 */
         uint32_t tRender = millis();
+        g_segStart = 0;
+        /* 只铺第一段：长页面不再因为撞到 widget 上限而被砍掉后半截。 */
+        layout_set_segment(0, PAGE_SEG_TILES);
         RenderResult r = tactilebrowser_render_layout(g_layoutRoot, g_content, CONTENT_W, CONTENT_H);
         uint32_t renderMs = millis() - tRender;
-        tactilebrowser_free_layout(g_layoutRoot);
-        g_layoutRoot = nullptr;
-        Serial.printf("[Browser] render_layout took %u ms\n", (unsigned)renderMs);
+        g_segTotal = layout_tile_total();
+        /* ⚠️ 布局树**故意不释放**：它是翻段的本地缓存。
+           只有下一次 startFetch() 或退出浏览器（freeLayoutTree）才释放。 */
+        Serial.printf("[Browser] render_layout took %u ms, tiles=%d, seg=%d\n",
+                      (unsigned)renderMs, g_segTotal, PAGE_SEG_TILES);
+        if (r == RENDER_SUCCESS && g_segTotal > PAGE_SEG_TILES) addSegBar();
 
         if (r == RENDER_SUCCESS) {
           g_state = BROWSER_LOADED;
@@ -2198,10 +2452,7 @@ void BrowserScreen_close() {
      （tick 里只有 g_firstLoad 为真时才画，而它一生只为真一次）。 */
   g_firstLoad = true;
 
-  if (g_layoutRoot) {
-    tactilebrowser_free_layout(g_layoutRoot);
-    g_layoutRoot = nullptr;
-  }
+  freeLayoutTree();
 
   hideLoadingOverlay();
   g_state = BROWSER_IDLE;
@@ -2251,4 +2502,24 @@ void BrowserScreen_ime(const char* py) {
   lv_textarea_set_text(g_searchTa, py);   /* 触发 VALUE_CHANGED -> ime_update */
   const char* han = ime_lookup(py);
   Serial.printf("[IME] py=%s -> %s\n", py, han ? han : "(no candidate)");
+}
+
+/* ── 分段渲染：串口诊断入口 ──
+   翻段只能在 tick 里真正执行（清内容区会删掉正在派发事件的对象），
+   这里只是记下目标。 */
+void BrowserScreen_segGo(int start) {
+  if (start < 0) start = 0;
+  if (g_segTotal > 0 && start >= g_segTotal)
+    start = ((g_segTotal - 1) / PAGE_SEG_TILES) * PAGE_SEG_TILES;
+  g_segPending = start;
+}
+
+int BrowserScreen_segStart() { return g_segStart; }
+int BrowserScreen_segSize() { return PAGE_SEG_TILES; }
+
+void BrowserScreen_segDump() {
+  int segs = (g_segTotal + PAGE_SEG_TILES - 1) / PAGE_SEG_TILES;
+  Serial.printf("[Browser] seg: tree=%p tiles=%d segSize=%d pages=%d cur=%d start=%d pending=%d\n",
+                (void*)g_layoutRoot, g_segTotal, PAGE_SEG_TILES, segs,
+                g_segStart / PAGE_SEG_TILES, g_segStart, g_segPending);
 }

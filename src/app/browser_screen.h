@@ -40,3 +40,10 @@ int  BrowserScreen_getViewport();
 void BrowserScreen_news(const char* platform);
 
 void BrowserScreen_ime(const char* py);
+
+/* ── 分段渲染诊断（串口 `seg`）──
+   seg / seg <n> / seg next / seg prev */
+void BrowserScreen_segGo(int start);
+void BrowserScreen_segDump();
+int  BrowserScreen_segStart();
+int  BrowserScreen_segSize();

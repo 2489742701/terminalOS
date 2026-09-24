@@ -893,6 +893,55 @@ static char *layout_trim_text(const char *text) {
    200 个 ≈ 76KB → used 约 78%，池仍有 ~28KB 余量。 */
 #define MAX_WIDGETS 200
 static int s_widgetCount = 0;
+
+/* ── 分段渲染状态（见 layout_engine.h 的注释块）─────────────────────────
+   s_segStart/s_segCount：当前渲染窗口；start<0 = 不分段的旧行为。
+   s_tileIdx：本次遍历走到第几块瓦片。
+   s_tileTotal：干跑得出的瓦片总数。
+   s_dryRun：干跑中（只数不建控件）。
+   s_preparedRoot：已经摊平/去垃圾/行合并过的树，翻段时不再重做。 */
+static int  s_segStart = -1;
+static int  s_segCount = 0;
+static int  s_tileIdx = 0;
+static int  s_tileTotal = 0;
+static bool s_dryRun = false;
+static void *s_preparedRoot = NULL;
+
+void layout_set_segment(int start, int count) {
+  if (count > 0 && start >= 0) {
+    s_segStart = start;
+    s_segCount = count;
+  } else {
+    s_segStart = -1;
+    s_segCount = 0;
+  }
+}
+int layout_tile_total(void) { return s_tileTotal; }
+int layout_tile_rendered(void) { return s_tileIdx; }
+void layout_forget_prepare(void) { s_preparedRoot = NULL; s_tileTotal = 0; }
+
+/* 申领一块瓦片：返回"是否真的建控件"。
+   干跑时永远不建；分段时只建落在窗口里的；MAX_WIDGETS 是绝对安全闸。
+   ⚠️ **同一个节点只占一块**：下面的分支是 if / else-if 链，胶囊分支判定为
+   false 时会**掉到下一个分支**再判一次（实测：干跑把每个胶囊都数了两遍，
+   154 vs 真实 138）。所以这里按节点记结果，重复调用直接返回上次的值。 */
+static void *s_tileNode = NULL;
+static bool s_tileResult = false;
+
+static bool seg_take_tile(LayoutNode *node) {
+  if (s_tileNode == (void *)node) return s_tileResult;
+  s_tileNode = (void *)node;
+  int i = s_tileIdx++;
+  if (s_dryRun)
+    s_tileResult = false;
+  else if (s_widgetCount >= MAX_WIDGETS)
+    s_tileResult = false;
+  else if (s_segStart < 0)
+    s_tileResult = true;
+  else
+    s_tileResult = (i >= s_segStart && i < s_segStart + s_segCount);
+  return s_tileResult;
+}
 /* 平铺诊断 dump 的行上限（串口 `flatdump <n>` 可调）。
    默认 60：再多就刷屏，且会拖慢渲染。查「下一页」这类排在
    后面的行时把它调大（实测必应分页在第 60 行之后）。 */
@@ -937,9 +986,8 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
   if (!node || !render_ctx || !render_ctx->renderer)
     return;
 
-  /* widget 数量超限时停止创建新 widget，但仍递归子节点（已有容器内平铺） */
-  bool widget_limit_reached = (s_widgetCount >= MAX_WIDGETS);
-
+  /* 是否建控件由 seg_take_tile(node) 决定（分段窗口 + MAX_WIDGETS 安全闸）；
+     不建控件时仍递归子节点，让瓦片序号能连续数下去。 */
   RenderInterface *iface = render_ctx->renderer->interface;
   if (!iface)
     return;
@@ -963,7 +1011,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
         把 textarea 整个跳过，结果必应里**根本看不见搜索框**。
         现在 LVGL 池已在 PSRAM、DRAM 有 250KB，这个限制不成立。 */
   if ((node->type == ELEMENT_INPUT_TEXT || node->type == ELEMENT_TEXTAREA) &&
-      iface->create_text_input && !widget_limit_reached) {
+      iface->create_text_input && seg_take_tile(node)) {
     /* textarea 的 form_value 是它的**整段 innerText**（可能几十 KB），
        原样塞给单行输入框会拖慢渲染，截到 256 B 足够看。 */
     char *capped = NULL;
@@ -985,7 +1033,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     s_rowContainer = NULL;            /* 输入框是区块，胶囊行到此为止 */
     layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
                                  widget);
-  } else if (s_flatMode && flat_wants_chip(node) && !widget_limit_reached &&
+  } else if (s_flatMode && flat_wants_chip(node) && seg_take_tile(node) &&
              iface->create_chip && iface->create_row_wrap) {
     /* 平铺：链接/小按钮 → 带框胶囊，排进一个 flex row-wrap 行里。
        这样"能点"看得出来，导航条也还是横的一排（放不下自动换行）。 */
@@ -1022,7 +1070,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
       }
     }
     free(trimmed_text);
-  } else if (node->text_content && strlen(node->text_content) > 0 && !widget_limit_reached) {
+  } else if (node->text_content && strlen(node->text_content) > 0 && seg_take_tile(node)) {
     /* 布局意图：trim 前导/尾部空格，避免开头空格太多 */
     char *trimmed_text = layout_trim_text(node->text_content);
     if (trimmed_text) {
@@ -1108,7 +1156,7 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
         if (should_be_row && iface->set_flex_direction) {
           iface->set_flex_direction(render_ctx->renderer, parent, 2);
         }
-      } else if ((has_layout_intent || should_be_row) && iface->create_container && !widget_limit_reached) {
+      } else if ((has_layout_intent || should_be_row) && iface->create_container && seg_take_tile(node)) {
         node->widget = iface->create_container(render_ctx->renderer, node->box.x,
                                                node->box.y, node->box.width,
                                                node->box.height);
@@ -1729,40 +1777,62 @@ void layout_render_tree(LayoutNode *root, RenderContext *render_ctx) {
 
   int nodes = 0, heightBefore = 0;
 
-  if (s_flatMode) {
-    /* 平铺：不缩放、不钳制、不还原版面 */
-    layout_tree_stats(root, &nodes, &heightBefore);
-    layout_flatten_tree(root, render_ctx->max_width);
-    int dropped = layout_drop_junk(root, 0);
-    layout_merge_inline_rows(root, render_ctx->max_width);
-    Serial.printf("[Browser] layout: FLAT tiles, nodes=%d width=%d junkDropped=%d\n",
-                  nodes, render_ctx->max_width, dropped);
-  } else {
-    /* 缩放系数 = 屏幕可用宽 / 排版视口宽。只缩不放。 */
-    float f = 1.0f;
-    if (s_layoutWidth > 0 && render_ctx->max_width > 0) {
-      f = (float)render_ctx->max_width / (float)s_layoutWidth;
+  /* 摊平/缩放/去垃圾/行合并**只做一次**（这些步骤会改写树，重复跑会串味）。
+     翻段时树还是同一棵（s_preparedRoot 命中），直接跳到渲染。 */
+  bool prepared = (s_preparedRoot == (void *)root);
+
+  if (!prepared) {
+    if (s_flatMode) {
+      /* 平铺：不缩放、不钳制、不还原版面 */
+      layout_tree_stats(root, &nodes, &heightBefore);
+      layout_flatten_tree(root, render_ctx->max_width);
+      int dropped = layout_drop_junk(root, 0);
+      layout_merge_inline_rows(root, render_ctx->max_width);
+      Serial.printf("[Browser] layout: FLAT tiles, nodes=%d width=%d junkDropped=%d\n",
+                    nodes, render_ctx->max_width, dropped);
+    } else {
+      /* 缩放系数 = 屏幕可用宽 / 排版视口宽。只缩不放。 */
+      float f = 1.0f;
+      if (s_layoutWidth > 0 && render_ctx->max_width > 0) {
+        f = (float)render_ctx->max_width / (float)s_layoutWidth;
+      }
+      if (f > 1.0f) f = 1.0f;    /* 视口比屏幕窄时无需放大 */
+      if (f < 0.15f) f = 0.15f;  /* 下限，避免缩到不可见 */
+
+      int heightAfter = 0;
+      layout_tree_stats(root, &nodes, &heightBefore);
+      if (f < 0.999f)
+        layout_scale_tree(root, f);
+      /* 兜底：钳进屏幕宽度（左右不越界，上下不管） */
+      layout_clamp_horizontal(root, render_ctx->max_width);
+      if (f < 0.999f)
+        layout_tree_stats(root, &nodes, &heightAfter);
+      else
+        heightAfter = heightBefore;
+
+      Serial.printf("[Browser] layout: viewport=%d screen=%d scale=%.2f nodes=%d contentH=%d->%d\n",
+                    s_layoutWidth, render_ctx->max_width, (double)f, nodes,
+                    heightBefore, heightAfter);
     }
-    if (f > 1.0f) f = 1.0f;    /* 视口比屏幕窄时无需放大 */
-    if (f < 0.15f) f = 0.15f;  /* 下限，避免缩到不可见 */
-
-    int heightAfter = 0;
-    layout_tree_stats(root, &nodes, &heightBefore);
-    if (f < 0.999f)
-      layout_scale_tree(root, f);
-    /* 兜底：钳进屏幕宽度（左右不越界，上下不管） */
-    layout_clamp_horizontal(root, render_ctx->max_width);
-    if (f < 0.999f)
-      layout_tree_stats(root, &nodes, &heightAfter);
-    else
-      heightAfter = heightBefore;
-
-    Serial.printf("[Browser] layout: viewport=%d screen=%d scale=%.2f nodes=%d contentH=%d->%d\n",
-                  s_layoutWidth, render_ctx->max_width, (double)f, nodes,
-                  heightBefore, heightAfter);
   }
 
+  if (!prepared) {
+    /* 干跑：按同样的顺序走一遍，只数瓦片不建控件 —— 得到本页瓦片总数，
+       才知道一共要分几段。 */
+    s_dryRun = true;
+    s_tileIdx = 0;
+    s_tileNode = NULL;      /* 新的一遍：清掉"同一节点已领过瓦片"的记忆 */
+    layout_render_node(root, render_ctx, render_ctx->root_container, 0);
+    s_tileTotal = s_tileIdx;
+    s_dryRun = false;
+    s_preparedRoot = (void *)root;
+    Serial.printf("[Browser] tiles total: %d\n", s_tileTotal);
+  }
+
+  s_tileIdx = 0;
+  s_tileNode = NULL;
   layout_render_node(root, render_ctx, render_ctx->root_container, 0);
-  Serial.printf("[Browser] widgets created: %d (limit %d), clickable links=%d\n",
-                s_widgetCount, MAX_WIDGETS, lvgl_renderer_link_count());
+  Serial.printf("[Browser] widgets created: %d (limit %d), tiles %d/%d, clickable links=%d\n",
+                s_widgetCount, MAX_WIDGETS, s_tileIdx, s_tileTotal,
+                lvgl_renderer_link_count());
 }
