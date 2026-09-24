@@ -151,9 +151,14 @@ lv_obj_t* mkBtn(lv_obj_t* scr, const char* txt, lv_event_cb_t cb, int x, int y, 
   return b;
 }
 
+/* ⚠️ 滑动退出**只能**发生在左边缘 40px 内（`swipe_detect` 的 edgeWidth 参数）。
+   2026-09-24 master 实测：整屏都挂着滑动退出时，**一拖就退出了，根本没法测** ——
+   这个屏的全部意义就是"按住拖着看十字跟不跟手"，两者直接冲突。
+   现在只有从左边缘起手才会触发返回，其余区域随便拖。
+   另外底部那颗「返回」按钮是明路，不依赖手势。 */
 void swipe_cb(lv_event_t* e) {
   static SwipeState st;
-  swipe_detect(e, st, nav_launcher, SWIPE_H);
+  swipe_detect(e, st, nav_launcher, SWIPE_H, false, 40);
 }
 
 }  // namespace
@@ -182,7 +187,7 @@ lv_obj_t* TouchTestScreen_create() {
   lv_obj_align(g_infoLab, LV_ALIGN_TOP_LEFT, 16, 34);
 
   lv_obj_t* hint = lv_label_create(scr);
-  lv_label_set_text(hint, "手指按在哪，十字就该出现在哪");
+  lv_label_set_text(hint, "手指按在哪，十字就该出现在哪（左边缘右滑返回）");
   lv_obj_set_style_text_color(hint, lv_color_hex(0x888888), 0);
   lv_obj_set_style_text_font(hint, &font_zh_16, 0);
   lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 56);
