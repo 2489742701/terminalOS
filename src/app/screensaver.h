@@ -29,6 +29,11 @@ class ScreenSaver {
   // 会先记下当前屏，唤醒后回锁屏页，滑动解锁再回到原来那屏。
   static void sleepNow();
 
+  /* 自动息屏：无操作多久进 DIM。**0 = 永不息屏**。
+     原先是编译期常量（300000），设置页够不着 —— 改成运行时变量才有「自动息屏」这一项。 */
+  static void setIdleTimeout(unsigned long ms);
+  static unsigned long idleTimeout();
+
  private:
   enum State { ACTIVE, DIM, OFF };
 

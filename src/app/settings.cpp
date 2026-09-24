@@ -6,6 +6,8 @@
 #include "screensaver.h"
 #include "../hal/display.h"
 #include "../hal/ntp_time.h"
+#include "../hal/touch.h"
+#include "../hal/geoip.h"
 #include <lvgl.h>
 #include <WiFi.h>
 #include <Arduino.h>
@@ -21,11 +23,13 @@
  *   · 不会每页多一棵常驻对象树（被"10 屏常驻导致 DRAM 不够"坑过）
  *
  * ── 分组口径（改分组 / 加项前先看这段）─────────────────────────────────
- *   · 显示与亮度：只影响"这块屏怎么亮"（亮度 / 息屏 / 桌面图标）
- *   · 浏览器设置：只影响浏览器的数据与行为（缓存 / 下载 / 排版）
- *   · 系统设置  ：整机级（时间 / 固件 / 诊断屏入口）
- * 判断标准就一条：**改了它，影响范围是屏、是浏览器，还是整机**。
- * 拿不准的先放系统设置，别为了凑组硬塞。
+ *   判断标准就一条：**改了它，影响范围是 屏 / 网络 / 浏览器 / 系统 的哪一个**。
+ *   拿不准的先放系统设置，别为了凑组硬塞。
+ *   · 显示与亮度：只影响"这块屏怎么亮"
+ *   · 网络与连接：WiFi 及其带来的联网信息（IP / 定位）
+ *   · 浏览器设置：只影响浏览器的数据与行为
+ *   · 系统设置  ：整机级（时间 / 输入 / 诊断入口）
+ *   · 关于本机  ：**只读**，设备是什么、还剩多少资源
  * ══════════════════════════════════════════════════════════════════════════ */
 
 namespace {
@@ -43,10 +47,38 @@ static bool s_pending = false;
 static uint32_t s_pendingStart = 0;
 static uint32_t s_seenUnix = 0;
 
-/* valueFn 必须返回静态缓冲：label 会在 refresh_values() 时被反复读 */
+/* valueFn 必须返回静态缓冲：label 会在 refresh_values() 时被反复读。
+   ⚠️ 每行一个独立缓冲 —— 共用一份会出现"值互相覆盖"的鬼畜现象。 */
 static char s_timeSrcBuf[32];
 static char s_cacheBuf[32];
 static char s_dlBuf[32];
+static char s_wifiBuf[40];
+static char s_ipBuf[24];
+static char s_rssiBuf[24];
+static char s_geoBuf[32];
+static char s_vpBuf[20];
+static char s_idleBuf[20];
+static char s_memBuf[24];
+static char s_upBuf[28];
+static char s_calBuf[40];
+
+/* ── 循环切换型选项（点一次换下一个）─────────────────────────────────── */
+static const unsigned long kIdleOpts[] = {30000, 60000, 300000, 0};  // 0 = 永不
+static const char* const kIdleNames[] = {"30 秒", "1 分钟", "5 分钟", "永不"};
+static const int kIdleCount = 4;
+
+static const int kVpOpts[] = {0, 720, 1024, 1280};  // 0 = 自动（读 meta viewport）
+static const char* const kVpNames[] = {"自动", "720 px", "1024 px", "1280 px"};
+static const int kVpCount = 4;
+
+static int indexOf(unsigned long v, const unsigned long* arr, int n, int dflt) {
+  for (int i = 0; i < n; i++) if (arr[i] == v) return i;
+  return dflt;
+}
+static int indexOfInt(int v, const int* arr, int n, int dflt) {
+  for (int i = 0; i < n; i++) if (arr[i] == v) return i;
+  return dflt;
+}
 
 /* ── 各行的"值" ───────────────────────────────────────────────────────── */
 const char* timeSrcValue() {
@@ -74,6 +106,66 @@ static void refreshStorageBufs() {
 const char* cacheValue() { return s_cacheBuf; }
 const char* dlValue() { return s_dlBuf; }
 const char* fwValue() { return "GEEK TERMINAL v0.1"; }
+/* 常量直接返回字面量即可（不用缓冲）。"x" 用 ASCII：font_zh_16 里没有 U+00D7 */
+const char* chipValue() { return "ESP32-S3"; }
+const char* screenValue() { return "480x480 ST7701S"; }
+
+const char* wifiStatusValue() {
+  if (WiFi.status() == WL_CONNECTED)
+    snprintf(s_wifiBuf, sizeof(s_wifiBuf), "已连接 %s", WiFi.SSID().c_str());
+  else
+    snprintf(s_wifiBuf, sizeof(s_wifiBuf), "未连接");
+  return s_wifiBuf;
+}
+const char* ipValue() {
+  if (WiFi.status() == WL_CONNECTED)
+    snprintf(s_ipBuf, sizeof(s_ipBuf), "%s", WiFi.localIP().toString().c_str());
+  else
+    snprintf(s_ipBuf, sizeof(s_ipBuf), "-");
+  return s_ipBuf;
+}
+const char* rssiValue() {
+  if (WiFi.status() == WL_CONNECTED)
+    snprintf(s_rssiBuf, sizeof(s_rssiBuf), "%d dBm", (int)WiFi.RSSI());
+  else
+    snprintf(s_rssiBuf, sizeof(s_rssiBuf), "-");
+  return s_rssiBuf;
+}
+const char* geoValue() {
+  if (GeoIP::valid())
+    snprintf(s_geoBuf, sizeof(s_geoBuf), "%s %s", GeoIP::region(), GeoIP::city());
+  else
+    snprintf(s_geoBuf, sizeof(s_geoBuf), "未定位");
+  return s_geoBuf;
+}
+const char* vpValue() {
+  int i = indexOfInt(BrowserScreen_getViewport(), kVpOpts, kVpCount, 0);
+  snprintf(s_vpBuf, sizeof(s_vpBuf), "%s", kVpNames[i]);
+  return s_vpBuf;
+}
+const char* idleValue() {
+  int i = indexOf(ScreenSaver::idleTimeout(), kIdleOpts, kIdleCount, 2);
+  snprintf(s_idleBuf, sizeof(s_idleBuf), "%s", kIdleNames[i]);
+  return s_idleBuf;
+}
+const char* memValue() {
+  snprintf(s_memBuf, sizeof(s_memBuf), "%u KB 空闲", (unsigned)(ESP.getFreeHeap() / 1024));
+  return s_memBuf;
+}
+const char* uptimeValue() {
+  uint32_t s = millis() / 1000;
+  snprintf(s_upBuf, sizeof(s_upBuf), "%u 时 %02u 分 %02u 秒",
+           (unsigned)(s / 3600), (unsigned)((s / 60) % 60), (unsigned)(s % 60));
+  return s_upBuf;
+}
+const char* calValue() {
+  int x0, x1, y0, y1;
+  bool swap;
+  Touch::getCal(x0, x1, y0, y1, swap);
+  snprintf(s_calBuf, sizeof(s_calBuf), "%d,%d / %d,%d%s",
+           x0, x1, y0, y1, swap ? " 已交换" : "");
+  return s_calBuf;
+}
 
 void setStatus(const char* s) {
   if (g_statusLab && lv_obj_is_valid(g_statusLab)) lv_label_set_text(g_statusLab, s);
@@ -101,6 +193,10 @@ static void desktop_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   openScreen(&nav_desktop, "桌面图标");
 }
+static void wifi_event_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openScreen(&nav_wifi, "WiFi");
+}
 static void sysinfo_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   openScreen(&nav_sysinfo, "系统信息");
@@ -112,6 +208,61 @@ static void taskmgr_event_cb(lv_event_t* e) {
 static void touchtest_event_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   openScreen(&nav_touchtest, "触摸校准");
+}
+
+/* 循环切换：点一次走到下一个选项。改完立刻刷新右侧文字 + 底部提示 */
+static void idle_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = indexOf(ScreenSaver::idleTimeout(), kIdleOpts, kIdleCount, 2);
+  i = (i + 1) % kIdleCount;
+  ScreenSaver::setIdleTimeout(kIdleOpts[i]);
+  settings_menu_refresh_values();
+  char m[40];
+  snprintf(m, sizeof(m), "自动息屏：%s", kIdleNames[i]);
+  setStatus(m);
+}
+
+static void vp_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  int i = indexOfInt(BrowserScreen_getViewport(), kVpOpts, kVpCount, 0);
+  i = (i + 1) % kVpCount;
+  BrowserScreen_setViewport(kVpOpts[i]);
+  settings_menu_refresh_values();
+  char m[40];
+  snprintf(m, sizeof(m), "排版视口：%s（下次加载生效）", kVpNames[i]);
+  setStatus(m);
+}
+
+/* 页面服务器：把 LittleFS 里存下来的页面用 HTTP 共享出去（PC 访问设备 IP） */
+static void serve_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
+  bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  BrowserScreen_serve(on);
+  setStatus(on ? "页面服务器已开启" : "页面服务器已关闭");
+}
+
+static void refreshCalUi(const char* what) {
+  settings_menu_refresh_values();
+  char m[48];
+  snprintf(m, sizeof(m), "%s -> %s", what, calValue());
+  setStatus(m);
+}
+static void calFlipX_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  Touch::flipX(); refreshCalUi("翻转 X");
+}
+static void calFlipY_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  Touch::flipY(); refreshCalUi("翻转 Y");
+}
+static void calSwap_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  Touch::swapXY(); refreshCalUi("交换 XY");
+}
+static void calReset_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  Touch::resetCal(); refreshCalUi("恢复默认");
 }
 
 static void clear_cache_cb(lv_event_t* e) {
@@ -224,17 +375,30 @@ lv_obj_t* SettingsScreen_create() {
      运行时值（亮度 / 自动校时开关）在下面 patch 进去。 */
   static SettingsItem rootItems[] = {
     siNav("显示与亮度", "display"),
+    siNav("网络与连接", "network"),
     siNav("浏览器设置", "browser"),
     siNav("系统设置", "system"),
+    siNav("关于本机", "about"),
     siEnd(),
   };
   static SettingsItem displayItems[] = {
     siSlider("亮度", 5, 100, 100, brightness_cb),
-    siAction("息屏", sleep_event_cb),
+    siAction("自动息屏", idle_cb, idleValue),
+    siAction("立即息屏", sleep_event_cb),
     siAction("桌面图标", desktop_event_cb),
     siEnd(),
   };
+  static SettingsItem networkItems[] = {
+    siAction("WiFi 网络", wifi_event_cb),
+    siReadOnly("连接状态", wifiStatusValue),
+    siReadOnly("IP 地址", ipValue),
+    siReadOnly("信号强度", rssiValue),
+    siReadOnly("定位城市", geoValue),
+    siEnd(),
+  };
   static SettingsItem browserItems[] = {
+    siAction("排版视口", vp_cb, vpValue),
+    siToggle("页面服务器", false, serve_cb),
     siReadOnly("页面缓存", cacheValue),
     siReadOnly("已下载页面", dlValue),
     siAction("清理缓存", clear_cache_cb),
@@ -245,24 +409,43 @@ lv_obj_t* SettingsScreen_create() {
     siReadOnly("时间源", timeSrcValue),
     siToggle("自动校时", false, autosync_cb),
     siAction("校准时间", calib_event_cb),
-    siReadOnly("固件", fwValue),
+    siNav("触摸校准", "touch"),
     siAction("系统信息", sysinfo_event_cb),
     siAction("后台管理", taskmgr_event_cb),
-    siAction("触摸校准", touchtest_event_cb),
+    siEnd(),
+  };
+  static SettingsItem touchItems[] = {
+    siReadOnly("当前参数", calValue),
+    siAction("翻转 X", calFlipX_cb),
+    siAction("翻转 Y", calFlipY_cb),
+    siAction("交换 XY", calSwap_cb),
+    siAction("恢复默认", calReset_cb),
+    siAction("触摸测试", touchtest_event_cb),
+    siEnd(),
+  };
+  static SettingsItem aboutItems[] = {
+    siReadOnly("固件", fwValue),
+    siReadOnly("芯片", chipValue),
+    siReadOnly("屏幕", screenValue),
+    siReadOnly("空闲内存", memValue),
+    siReadOnly("运行时长", uptimeValue),
     siEnd(),
   };
   static const SettingsPage pages[] = {
     {"root", "设置", rootItems},
     {"display", "显示与亮度", displayItems},
+    {"network", "网络与连接", networkItems},
     {"browser", "浏览器设置", browserItems},
     {"system", "系统设置", systemItems},
+    {"touch", "触摸校准", touchItems},
+    {"about", "关于本机", aboutItems},
   };
 
   displayItems[0].vinit = s_brightness;
   systemItems[1].checked = NtpTime::autoSyncEnabled();
 
   refreshStorageBufs();
-  settings_menu_begin(scr, bar, pages, 4, "root");
+  settings_menu_begin(scr, bar, pages, 7, "root");
 
   g_statusLab = lv_label_create(scr);
   lv_label_set_text(g_statusLab, "联网后自动对时（NTP），或在「系统设置」里手动校准");

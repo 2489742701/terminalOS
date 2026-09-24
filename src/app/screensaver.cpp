@@ -17,7 +17,7 @@
 #include "../config/pins.h"
 
 // ---- 可调参数 ----
-static const unsigned long ACTIVE_TIMEOUT_MS   = 300000;  // 5min 无操作 -> DIM（测试用，原 30s）
+static unsigned long       ACTIVE_TIMEOUT_MS   = 300000;  // 无操作 -> DIM；**0 = 永不息屏**（设置页可改）
 static const unsigned long DIM_TIMEOUT_MS      = 100000;  // 100s 在 DIM -> OFF（原 10s）
 static const uint8_t       DIM_BACKLIGHT_PCT   = 15;      // DIM 背光亮度(%)
 
@@ -171,6 +171,14 @@ void ScreenSaver::unlock() {
  * 先 enterDim(true) 捕获当前屏（解锁后回到这里，而不是跳回主桌面），
  * 再 enterOff() 关背光。顺序不能反：enterOff 只改背光和状态，不记返回屏。
  */
+void ScreenSaver::setIdleTimeout(unsigned long ms) {
+  ACTIVE_TIMEOUT_MS = ms;
+}
+
+unsigned long ScreenSaver::idleTimeout() {
+  return ACTIVE_TIMEOUT_MS;
+}
+
 void ScreenSaver::sleepNow() {
   if (state != OFF) enterDim(true);   /* 记下返回屏 + 加载锁屏界面 */
   enterOff();                          /* 真正熄屏 */
@@ -199,7 +207,7 @@ void ScreenSaver::tick() {
   }
 
   if (state == ACTIVE) {
-    if (now - lastActivityMs > ACTIVE_TIMEOUT_MS) enterDim(true);
+    if (ACTIVE_TIMEOUT_MS > 0 && now - lastActivityMs > ACTIVE_TIMEOUT_MS) enterDim(true);
   } else if (state == DIM) {
     if (now - lastActivityMs > DIM_TIMEOUT_MS) enterOff();
     if (now - lastClockMs > 1000) { updateClock(); lastClockMs = now; }

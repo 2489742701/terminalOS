@@ -69,9 +69,12 @@ inline SettingsItem siReadOnly(const char* title, const char* (*valueFn)()) {
   it.title = title; it.type = SetType::ReadOnly; it.valueFn = valueFn;
   return it;
 }
-inline SettingsItem siAction(const char* title, lv_event_cb_t cb) {
+/* 带 valueFn 的版本 = "点整行切换，右侧显示当前值"（如自动息屏 30秒/1分钟/…）。
+   切完在 cb 里调 settings_menu_refresh_values() 立刻刷新右侧文字。 */
+inline SettingsItem siAction(const char* title, lv_event_cb_t cb,
+                             const char* (*valueFn)() = nullptr) {
   SettingsItem it = {};
-  it.title = title; it.type = SetType::Action; it.cb = cb;
+  it.title = title; it.type = SetType::Action; it.cb = cb; it.valueFn = valueFn;
   return it;
 }
 
