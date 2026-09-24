@@ -18,6 +18,7 @@
 #include "../hal/battery.h"
 #include "../hal/sd_card.h"
 #include "../hal/geoip.h"
+#include "../hal/touch.h"
 #include "../hal/display.h"
 
 namespace SerialConsole {
@@ -82,6 +83,10 @@ Serial.println("serve|servestop   - 把已存页面用 HTTP 共享出去（PC �
   Serial.println("geotest           - 设备侧实测各反向 geocoding 源(选源用)");
   Serial.println("sd [path] [depth] - TF 卡探测/列目录(懒挂载, 不敲就不碰 SPI)");
   Serial.println("sdbench [KB]      - TF 卡读写速度实测, 默认 256KB");
+  Serial.println("traw [s]          - 触摸裸坐标 dump(量四角, 诊断偏移)");
+  Serial.println("tcal x0 x1 y0 y1  - 触摸两点校准(默认 0 480 0 480)");
+  Serial.println("tprobe            - 读 GT911 配置的 X/Y_OUTPUT_MAX");
+  Serial.println("tswap [on|off]    - 触摸 X/Y 交换(面板贴反时试这个)");
   Serial.println("time              - show uptime");
   Serial.println("===============================");
 }
@@ -696,6 +701,9 @@ static void cmdReboot() {
   ESP.restart();
 }
 
+/* 触摸 X/Y 交换开关的当前状态（`tswap` 不带参数时取反） */
+static bool s_touchSwap = false;
+
 /* 解析并执行一行命令 */
 static void executeLine(char* line) {
   /* 去掉末尾的 \r */
@@ -792,6 +800,34 @@ static void executeLine(char* line) {
     /* 把当前页 HTML 存进 LittleFS（与底栏「下载」键同一条路径）。
        页面必须还在缓存里（5 分钟 TTL），否则先刷新再 dl。 */
     BrowserScreen_download();
+} else if (strcmp(cmd, "traw") == 0) {
+    /* 触摸裸坐标 dump：traw（默认 10 秒） / traw 20
+       用途：量四角裸值 -> 填 tcal。诊断"触摸偏移"的唯一可信手段。 */
+    uint32_t ms = (arg && *arg) ? (uint32_t)atoi(arg) : 10;
+    if (ms == 0) ms = 10;
+    Touch::dump(ms * 1000);
+} else if (strcmp(cmd, "tcal") == 0) {
+    /* 触摸两点校准：tcal <rawX0> <rawX1> <rawY0> <rawY1>
+       例：四角裸值 X 20..460、Y 15..455 -> tcal 20 460 15 455
+       不带参数 = 恢复默认 0 480 0 480。 */
+    int a0 = 0, a1 = 480, b0 = 0, b1 = 480;
+    if (arg && *arg) {
+      if (sscanf(arg, "%d %d %d %d", &a0, &a1, &b0, &b1) != 4) {
+        Serial.println("[Console] tcal 需要 4 个数：tcal x0 x1 y0 y1");
+        return;
+      }
+    }
+    Touch::setCal(a0, a1, b0, b1);
+} else if (strcmp(cmd, "tswap") == 0) {
+    /* X/Y 交换：tswap（切换）/ tswap on / tswap off */
+    bool on = true;
+    if (arg && *arg) on = !(strcmp(arg, "off") == 0 || strcmp(arg, "0") == 0);
+    else             on = !s_touchSwap;
+    s_touchSwap = on;
+    Touch::setSwap(on);
+} else if (strcmp(cmd, "tprobe") == 0) {
+    /* 读 GT911 配置里的 X/Y_OUTPUT_MAX —— 不是 480 就是偏移根因 */
+    Touch::probe();
 } else if (strcmp(cmd, "flatdump") == 0) {
     int n = (arg && *arg) ? atoi(arg) : 0;
     if (n <= 0) n = 60;

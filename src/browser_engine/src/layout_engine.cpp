@@ -1303,6 +1303,68 @@ static const char *kFlatJunkPhrases[] = {
 static const char *kFlatJunkPhrasesAscii[] = {"loading", "please wait",
                                               "just a moment", NULL};
 
+/* 广告 / 推广标记（2026-09-24）。
+   ⚠️ 必须带**长度闸门**：搜「广告投放」时结果摘要里满是"广告"二字，那是正经内容。
+   真正当标记用的都是独立短节点（「广告」6 字节、「推广」6 字节），
+   所以超过 16 字节的一律放过。 */
+#define FLAT_AD_TEXT_MAX_BYTES 16
+static const char *kFlatAdPhrases[] = {"广告", "推广", "赞助", "广告信息",
+                                       "商业推广", "推广链接", NULL};
+
+/* 页脚法定文本：备案号 / 隐私 / 条款 / 版权。
+   比广告标记长 ——「京ICP备05002793号-1」≈20 字节，「隐私政策 | 服务条款」≈20 字节，
+   闸门放到 40。再长的正文里出现"条款"是正常的，不杀。 */
+#define FLAT_FOOTER_TEXT_MAX_BYTES 40
+static const char *kFlatFooterPhrases[] = {
+    "备案",     "公网安备",   "隐私",     "条款",     "版权所有",
+    "著作权",   "法律声明",   "免责声明", "侵权投诉", "用户协议",
+    "意见反馈", NULL};
+
+/* ASCII 广告标记（长度闸门同中文那档，略放宽到 24 以容纳 "all rights reserved" 的前半） */
+static const char *kFlatAdPhrasesAscii[] = {"sponsored", "advertisement",
+                                            "ad choices", "ads by", NULL};
+static const char *kFlatFooterPhrasesAscii[] = {
+    "all rights reserved", "privacy policy", "terms of service",
+    "cookie policy",       "privacy",        "terms of",
+    "copyright",           "icp",            NULL};
+
+/* 短文本转小写到栈上（<256 B 才转，够用且不上堆） */
+static void flat_lower_copy(char *out, const char *s, size_t n) {
+  for (size_t i = 0; i <= n; i++) {
+    char c = s[i];
+    out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+  }
+}
+
+static bool flat_is_ad_text(const char *s) {
+  size_t n = strlen(s);
+  if (n == 0 || n > FLAT_AD_TEXT_MAX_BYTES) return false;
+  /* ⚠️ 必须**全等**（trim 后 strcmp），不能用 strstr：
+     2026-09-24 实测搜「广告投放」，子串规则把 '广告投放' / '投放广告'
+     各丢了 6 次 —— 那是搜索词和相关搜索，是正经内容。
+     广告标记是徽章，文本就是「广告」二字，全等才不会误伤。 */
+  while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+  for (int i = 0; kFlatAdPhrases[i]; i++)
+    if (strcmp(s, kFlatAdPhrases[i]) == 0) return true;
+  char low[64];
+  flat_lower_copy(low, s, strlen(s));
+  for (int i = 0; kFlatAdPhrasesAscii[i]; i++)
+    if (strcmp(low, kFlatAdPhrasesAscii[i]) == 0) return true;
+  return false;
+}
+
+static bool flat_is_footer_text(const char *s) {
+  size_t n = strlen(s);
+  if (n == 0 || n > FLAT_FOOTER_TEXT_MAX_BYTES) return false;
+  for (int i = 0; kFlatFooterPhrases[i]; i++)
+    if (strstr(s, kFlatFooterPhrases[i])) return true;
+  char low[64];
+  flat_lower_copy(low, s, n);
+  for (int i = 0; kFlatFooterPhrasesAscii[i]; i++)
+    if (strstr(low, kFlatFooterPhrasesAscii[i])) return true;
+  return false;
+}
+
 static bool flat_is_separator_only(const char *s) {
   const unsigned char *p = (const unsigned char *)s;
   while (*p) {
@@ -1333,6 +1395,8 @@ static bool flat_is_junk_text(const char *s) {
     return true;
   if (flat_is_separator_only(s))
     return true;
+  if (flat_is_ad_text(s))     return true;
+  if (flat_is_footer_text(s)) return true;
   for (int i = 0; kFlatJunkPhrases[i]; i++) {
     if (strstr(s, kFlatJunkPhrases[i]))
       return true;
@@ -1427,6 +1491,14 @@ static int layout_drop_junk(LayoutNode *node, int depth) {
   for (LayoutNode *c = node->first_child; c; c = c->next_sibling)
     n += layout_drop_junk(c, depth + 1);
   if (node->text_content && flat_is_junk_text(node->text_content)) {
+    /* 广告/页脚命中值得看一眼（分隔符合并类命中太多，不打） */
+    static int s_junkLog = 0;
+    if (s_junkLog < 24 &&
+        (flat_is_ad_text(node->text_content) ||
+         flat_is_footer_text(node->text_content))) {
+      Serial.printf("[Junk] drop '%s'\n", node->text_content);
+      s_junkLog++;
+    }
     free(node->text_content);
     node->text_content = NULL;
     n++;

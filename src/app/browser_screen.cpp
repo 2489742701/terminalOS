@@ -1391,6 +1391,11 @@ lv_obj_t* BrowserScreen_create() {
   lv_obj_set_style_border_width(g_content, 0, 0);
   lv_obj_set_style_pad_all(g_content, 6, 0);
   lv_obj_set_scroll_dir(g_content, LV_DIR_VER);
+  /* ⚠️ 必须显式关滚动条：LVGL 默认 LV_SCROLLBAR_MODE_AUTO，会在可滚动时
+     沿内容区边沿画一条滚动条。本工程没启用自定义 scrollbar 样式（暗色 UI），
+     它用的是默认样式的浅色 —— 表现就是「滚动时边上一条白线」
+     （docs/09 B3 记的那条）。desktop_screen.cpp 早已这么处理，浏览器这里漏了。 */
+  lv_obj_set_scrollbar_mode(g_content, LV_SCROLLBAR_MODE_OFF);
   lv_obj_set_style_text_color(g_content, lv_color_hex(0xCCCCCC), 0);
   lv_obj_set_style_text_font(g_content, &font_zh_16, 0);
   lv_obj_set_flex_flow(g_content, LV_FLEX_FLOW_COLUMN);

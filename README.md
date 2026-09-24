@@ -113,14 +113,19 @@ python tools\verify_flow.py COM7 "https://m.baidu.com"
 
 ## 待办
 
-- [ ] SERP 广告过滤（广告/推广/sponsored）
-- [ ] 页脚备案/隐私/条款等垃圾一并丢掉
-- [ ] emoji 仍是豆腐块
-- [ ] 触摸坐标偏移；上滑时左下角一条白线
+- [x] SERP 广告过滤（广告/推广/sponsored）—— 2026-09-24，`layout_engine.cpp::flat_is_ad_text`
+- [x] 页脚备案/隐私/条款等垃圾 —— 同上，`flat_is_footer_text`。两者都带**长度闸门**防误杀正文
+- [x] emoji 豆腐块 —— 2026-09-24，给 vendored `lv_draw_sw_letter.c` 打补丁：
+      emoji 区码位静默跳过；**中文缺字仍保留方框**（那是"字库里没有"的信号）
+- [~] 触摸坐标偏移 —— 已加两点校准 + `traw`/`tcal`/`tprobe` 三个串口命令；
+      默认端点仍是历史写死的 0..480，**待上板量四角后填真值**
+- [~] 上滑时左下角白线 —— 高度怀疑是 LVGL 默认 `LV_SCROLLBAR_MODE_AUTO` 画的滚动条
+      （`desktop_screen.cpp` 早已显式 OFF，`browser_screen.cpp` 漏了）。已补 OFF，**待上板确认**
 - [ ] 蓝牙接入（现为占位）
 - [ ] 缩略图 / 图片下载
 - [ ] 更多 2D / 3D 小游戏
 - [ ] LV_COLOR_DEPTH 16→8（性能下一步候选，待拍板）
+- [ ] SD 卡路线 A（资源外置）/ B（Lua 脚本层）二选一 —— 探测数据齐了，待 master 拍板
 
 > 完整清单与背景见 [`docs/00` §7](docs/00-项目上手指南.md)。
 
@@ -149,9 +154,10 @@ clone 之后要先自备这些库（版本需一致，否则编不过）：
 
 若厂商库不在上述默认位置，改 `platformio.ini` 的 `lib_extra_dirs` 指向实际路径即可。
 
-> ⚠️ **另外还对 LVGL 源码打过补丁**（性能优化，不在本仓库内，需自行对照应用）：
-> `Lvgl/src/draw/sw/lv_draw_sw_blend.c`（透明像素短路）、`lv_draw_sw_arc.c`、`lv_conf.h`。
-> 不打补丁能正常编译运行，只是绘制性能会退回未优化的水平。
+> ⚠️ **另外还对 LVGL 源码打过补丁**（不在本仓库内，需自行对照应用）：
+> `Lvgl/src/draw/sw/lv_draw_sw_blend.c`（透明像素短路）、`lv_draw_sw_arc.c`、`lv_conf.h`、
+> `lv_draw_sw_letter.c`（2026-09-24：emoji 区码位不画缺字形方框，中文缺字仍保留方框作为“字库里没有”的信号）。
+> 不打补丁能正常编译运行，只是绘制性能退回未优化水平 / emoji 显示成豆腐块。
 
 ---
 
