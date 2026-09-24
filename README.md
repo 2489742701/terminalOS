@@ -103,17 +103,65 @@ python tools\verify_flow.py COM7 "https://m.baidu.com"
   - 下载当前页到 LittleFS（`dl` 或底栏下载键）+ 内置 HTTP 服务（`serve`），PC 浏览器访问设备 IP 看原始 HTML
 - NTP 校时（`src/hal/ntp_time.cpp`，手写避开 `Time` 库）、背光 PWM（LEDC，PIN_BL=38）
 
+- **中文拼音输入法**（`src/app/ime_pinyin.c`）：384 音节 / 2000 常用字，Flash 常量表二分查；
+  键盘上方候选条，监听 textarea 尾部 ASCII 拼音，上屏延迟一拍
+- **热点新闻**（`src/app/news.cpp`）：news.orz.ai 拉取，复用浏览器常驻 fetch 任务
+- **应用后台管理**（`src/app/taskmgr_screen.cpp`）：应用不常驻、按需启动，可逐个 / 全部关闭；
+  顶栏电池区可点进入，有后台应用时显示图标与数量
+- **TF/microSD**（`src/hal/sd_card.cpp`）：独立 SPIClass(HSPI) 实例，懒挂载
+- **天气 + IP 定位**（`src/hal/geoip.cpp`）：open-meteo 取天气，ip-api.com 定位，按实际位置显示
+
 ## 待办
 
-- [ ] **中文输入法**（拼音 IME）—— `lv_keyboard` 只有 ASCII，现在中文只能点预设胶囊
 - [ ] SERP 广告过滤（广告/推广/sponsored）
 - [ ] 页脚备案/隐私/条款等垃圾一并丢掉
 - [ ] emoji 仍是豆腐块
 - [ ] 触摸坐标偏移；上滑时左下角一条白线
 - [ ] 蓝牙接入（现为占位）
-- [ ] 新闻源：等 master 给源再填（首页已留占位框）
+- [ ] 缩略图 / 图片下载
+- [ ] 更多 2D / 3D 小游戏
+- [ ] LV_COLOR_DEPTH 16→8（性能下一步候选，待拍板）
 
 > 完整清单与背景见 [`docs/00` §7](docs/00-项目上手指南.md)。
+
+---
+
+## 构建依赖：第三方库不在本仓库内
+
+本仓库只放**自研代码**。编译需要的第三方库由 `platformio.ini` 的 `lib_extra_dirs`
+指向工程目录**之外**的厂商 BSP：
+
+    lib_extra_dirs = ${PROJECT_DIR}/../4.0inch_ESP32-4848S040/1-Demo/Demo_Arduino/Libraries
+
+clone 之后要先自备这些库（版本需一致，否则编不过）：
+
+| 库 | 版本 | 来源 |
+|---|---|---|
+| lvgl | 8.3.0-dev | 厂商 BSP（随板资料包） |
+| GFX Library for Arduino | 1.2.9 | 厂商 BSP |
+| ArduinoJson | 6.17.2 | 厂商 BSP |
+| NtpClientLib | 3.0.2-beta | 厂商 BSP |
+| Time | 1.6.1 | 厂商 BSP |
+| ArduinoZlib | 0.0.1 | 厂商 BSP |
+| HTTPClient / Touch_GT911 | — | 厂商 BSP |
+
+`lib_deps` 里这两个由 PlatformIO 自动下载，不用管：Adafruit BusIO、TAMC_GT911。
+
+若厂商库不在上述默认位置，改 `platformio.ini` 的 `lib_extra_dirs` 指向实际路径即可。
+
+> ⚠️ **另外还对 LVGL 源码打过补丁**（性能优化，不在本仓库内，需自行对照应用）：
+> `Lvgl/src/draw/sw/lv_draw_sw_blend.c`（透明像素短路）、`lv_draw_sw_arc.c`、`lv_conf.h`。
+> 不打补丁能正常编译运行，只是绘制性能会退回未优化的水平。
+
+---
+
+## 仓库历史说明
+
+本仓库由 geek-terminal 子目录拆分而来：用 `git subtree split` 抽出属于本工程的
+17 个 commit，再用 `tools/git_clean_history.py`（fast-export → 过滤 → fast-import
+自行实现，替代本机装不上的 git-filter-repo）剔除历史里的构建日志、
+arduino-cli.exe、lexbor 的 test/utils/examples 等非自研产物。
+仓库体积由 81MB 降到 23MB。
 
 ---
 
