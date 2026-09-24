@@ -117,12 +117,21 @@ python tools\verify_flow.py COM7 "https://m.baidu.com"
 - [x] 页脚备案/隐私/条款等垃圾 —— 同上，`flat_is_footer_text`。两者都带**长度闸门**防误杀正文
 - [x] emoji 豆腐块 —— 2026-09-24，给 vendored `lv_draw_sw_letter.c` 打补丁：
       emoji 区码位静默跳过；**中文缺字仍保留方框**（那是"字库里没有"的信号）
-- [~] 触摸坐标偏移 —— 已加两点校准 + `traw`/`tcal`/`tprobe` 三个串口命令；
-      默认端点仍是历史写死的 0..480，**待上板量四角后填真值**
+- [~] 触摸坐标偏移 —— 校准框架齐了（两点线性映射 + `traw`/`tcal`/`tprobe`/`tswap`），
+      并加了**触摸测试屏**（画板底部「触摸」按钮进，或串口 `nav touchtest`）：
+      十字准星 + 四角靶 + 翻转X / 翻转Y / 交换XY 一键试，抬手时串口打
+      `[TouchTest] screen=(x,y) raw=(rx,ry)`。端点默认仍是 0..480，**待上板量四角后填真值**
 - [x] 上滑时左下角白线 —— **已确认修好**（master 上板验证：白线没了）。
       根因就是 LVGL 默认 `LV_SCROLLBAR_MODE_AUTO` 画的滚动条：
       `desktop_screen.cpp` 早已显式 OFF，`browser_screen.cpp` 的 `g_content` 漏了。
       📌 任何可滚动容器都要显式设 `LV_SCROLLBAR_MODE_OFF`，暗色 UI 上默认样式是浅色条。
+- [~] 设置页改成「手机 OS 式二级菜单」—— **骨架 + 两组已跑通**（2026-09-24）。
+      新增数据驱动的列表渲染器 `src/app/settings_menu.cpp`：加一项 = 加一行数组元素，
+      不再是手摆绝对坐标。二级菜单 = **同一个屏 + 数据源栈**，不是每级建一个 Activity
+      （否则 nav 表被撑爆 + 每页多一棵常驻对象树吃 DRAM）。
+      已搬进去：`显示与亮度`（亮度/息屏/桌面图标）、`通用`（时间源/自动校时/校准时间/固件/缓存/下载）。
+      ⛔ 三条铁律见 [`docs/09` §I5](docs/09-坑点速查表.md)；诊断：串口 `setpage <id>` / `setpage back`。
+      剩下的组（网络 / 存储 / 关于…）照抄即可，**骨架对了再批量搬**。
 - [ ] 蓝牙接入（现为占位）
 - [ ] 缩略图 / 图片下载
 - [~] 更多 2D / 3D 小游戏 —— **已加 2048**（`src/app/game2048_screen.cpp`，游戏栏目第三个）。

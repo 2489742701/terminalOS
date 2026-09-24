@@ -13,6 +13,7 @@
 #include "../app/nav.h"
 #include "../app/browser_screen.h"
 #include "../app/weather_screen.h"
+#include "../app/settings_menu.h"
 #include "../app/news.h"
 #include "../browser_engine/include/layout_engine.h"
 #include "../hal/battery.h"
@@ -60,6 +61,7 @@ static void printHelp() {
   Serial.println("help              - show this help");
   Serial.println("nav <screen>      - navigate to screen");
   Serial.println("  screens: launcher clock settings wifi game 2048 browser draw memory sysinfo weather games desktop taskmgr touchtest");
+  Serial.println("setpage <id>|back - 设置页二级菜单诊断：直接跳页 / 回上一级");
   Serial.println("browser <url>     - open browser and load URL");
   Serial.println("vp <width>|vp 0   - browser layout viewport (0=auto, read <meta viewport>)");
   Serial.println("flat on|off       - browser 平铺排版 on=不建容器全部平铺 off=还原CSS版面");
@@ -730,6 +732,11 @@ static void executeLine(char* line) {
     printHelp();
   } else if (strcmp(cmd, "nav") == 0) {
     cmdNav(arg);
+  } else if (strcmp(cmd, "setpage") == 0) {
+    /* 诊断：直接跳到设置页的某个二级页（等价于点那一行）。
+       setpage root|display|general ，setpage back = 回上一级 */
+    if (arg && strncmp(arg, "back", 4) == 0) { settings_menu_back(nullptr); return; }
+    settings_menu_goto(arg && *arg ? arg : "root");
   } else if (strcmp(cmd, "browser") == 0) {
     cmdBrowser(arg);
   } else if (strcmp(cmd, "vp") == 0) {

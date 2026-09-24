@@ -16,6 +16,14 @@
 // 无需在主循环里手动 tick。开销：全局只 1 个 1s 定时器。
 lv_obj_t* StatusBar_create(lv_obj_t* parent, const char* title);
 
+/* 自定义返回动作版。二级菜单要"回上一级"而不是"回桌面"，就得用它。
+   ⚠️ backCb 在**延迟一拍的 lv_timer** 里被调用（不在事件回调里），
+      所以里面 nav_go / lv_obj_del 都安全；参数 e 恒为 nullptr，别去读它。 */
+lv_obj_t* StatusBar_createEx(lv_obj_t* parent, const char* title, lv_event_cb_t backCb);
+
+/* 切二级菜单时改顶栏标题。返回 false = 没改成（bar 为 root 顶栏或结构不符）。 */
+bool StatusBar_setTitle(lv_obj_t* bar, const char* title);
+
 // 电量百分比 0~100；返回 <0 表示本板无电量检测硬件（按 USB 供电处理）。
 // 若以后给电池分压接了 ADC，改本函数实现即可，UI 会自动显示百分比。
 int StatusBar_batteryPercent();

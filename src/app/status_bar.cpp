@@ -33,6 +33,7 @@ constexpr int MAX_BARS = 12;
 
 struct Bar {
   lv_obj_t* bar;
+  lv_event_cb_t backCb;   /* nullptr = 用默认的 nav_back_home（回桌面） */
   lv_obj_t* power;    /* 电池右侧的供电/电量文本 */
   lv_obj_t* time;
   lv_obj_t* wifi;
@@ -54,6 +55,7 @@ Bar* allocBar() {
       s_bars[i].tasks = nullptr;
       s_bars[i].taskCnt = nullptr;
       s_bars[i].wifiLevel = -1;   /* -1 = 强制首帧画一次 */
+      s_bars[i].backCb = nullptr;
       return &s_bars[i];
     }
   }
@@ -200,6 +202,24 @@ void update_cb(lv_timer_t* t) {
 
 }  // namespace
 
+lv_obj_t* StatusBar_create(lv_obj_t* parent, const char* title) {
+  return StatusBar_createEx(parent, title, nullptr);
+}
+
+/* 事后改标题（切二级菜单时用）。
+   布局：bar 的第一个孩子是 backBox；backBox 里 [0]=返回三角、[1]=标题 label。
+   ⚠️ 必须校验第二个孩子确实是 label —— root 顶栏（title==nullptr）那块是
+      电池容器，孩子是 canvas，直接 set_text 会把文本写到 canvas 上。 */
+bool StatusBar_setTitle(lv_obj_t* bar, const char* title) {
+  if (!bar || !title) return false;
+  lv_obj_t* box = lv_obj_get_child(bar, 0);
+  if (!box) return false;
+  lv_obj_t* lab = lv_obj_get_child(box, 1);
+  if (!lab || !lv_obj_check_type(lab, &lv_label_class)) return false;
+  lv_label_set_text(lab, title);
+  return true;
+}
+
 int StatusBar_batteryPercent() {
   /* 之前写死返回 -1（"本板没有电量检测硬件"）。这个结论证据不足：
      厂家 IO 表里 IO35/36/37 无功能标注，板上也焊了八角芯片。
@@ -221,8 +241,18 @@ bool StatusBar_bluetoothOn() {
  *    这里改用一次性 lv_timer：延迟到下一个 tick 才真正执行，此刻事件分发
  *    早已结束，删除是安全的。period=1ms 保证几乎无感。 */
 static void back_async_cb(lv_timer_t* t) {
-  (void)t;
-  nav_back_home();
+  /* 回调由 user_data 带进来：设置页的二级菜单要"回上一级"，
+     不能一律回桌面。为 nullptr 时保持原行为。 */
+  /* ⚠️ 本工程 LVGL(8.3) 没有 lv_timer_get_user_data()，直接读结构体字段 */
+  lv_event_cb_t cb = (lv_event_cb_t)(t ? t->user_data : nullptr);
+  if (cb) {
+    lv_timer_t* dummy = nullptr;
+    (void)dummy;
+    /* 复用同一个签名：设置页的 handler 忽略 e 即可 */
+    cb(nullptr);
+  } else {
+    nav_back_home();
+  }
 }
 
 /* 点电池区 -> 打开后台管理。同样是延迟一拍：
@@ -242,17 +272,19 @@ static void bat_click_cb(lv_event_t* e) {
 
 static void back_click_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  lv_timer_t* t = lv_timer_create(back_async_cb, 1, nullptr);
+  lv_event_cb_t cb = (lv_event_cb_t)lv_event_get_user_data(e);
+  lv_timer_t* t = lv_timer_create(back_async_cb, 1, (void*)cb);
   if (t) lv_timer_set_repeat_count(t, 1);   /* 执行一次后 LVGL 自动删除 */
 }
 
-lv_obj_t* StatusBar_create(lv_obj_t* parent, const char* title) {
+lv_obj_t* StatusBar_createEx(lv_obj_t* parent, const char* title, lv_event_cb_t backCb) {
   Bar* b = allocBar();
   if (!b) {
     Serial.println("[StatusBar] no free slot (MAX_BARS reached)");
     return nullptr;
   }
 
+  b->backCb = backCb;
   lv_obj_t* bar = lv_obj_create(parent);
   b->bar = bar;
   lv_obj_set_size(bar, SCREEN_WIDTH, BAR_H);
@@ -287,7 +319,7 @@ lv_obj_t* StatusBar_create(lv_obj_t* parent, const char* title) {
     lv_obj_set_style_pad_column(backBox, 6, 0);
     lv_obj_clear_flag(backBox, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(backBox, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(backBox, back_click_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(backBox, back_click_cb, LV_EVENT_CLICKED, (void*)b->backCb);
 
     /* 24：以前给 18，三角形缩成一丁点。BAR_H=28，24 的图标还有 2px 上下留白，
        配合实心三角，远看也能一眼认出是返回键。 */
