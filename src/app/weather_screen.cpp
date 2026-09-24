@@ -19,6 +19,11 @@ lv_obj_t* g_tempLab = nullptr;
 lv_obj_t* g_descLab = nullptr;
 lv_obj_t* g_detailLab = nullptr;
 lv_obj_t* g_statusLab = nullptr;
+/* ⚠️ g_locLab 必须提到这里：它要在定位/取数完成后同步刷新城市名。
+   之前是 create 里的局部变量，建屏时赋一次值就再也不动，
+   于是首次进屏（GeoIP 还没定位）写死成默认的「北京」，
+   而状态行写的是真城市 —— 同一屏两个城市名打架。 */
+lv_obj_t* g_locLab = nullptr;
 lv_obj_t* g_refreshBtn = nullptr;
 bool g_fetching = false;
 bool g_forceLocate = false;
@@ -154,11 +159,13 @@ bool fetchOnce() {
   lv_label_set_text(g_detailLab, buf);
   snprintf(buf, sizeof(buf), "WMO %d · %s", (int)wcode, GeoIP::city());
   lv_label_set_text(g_statusLab, buf);
+  if (g_locLab) lv_label_set_text(g_locLab, GeoIP::city());
   return true;
 }
 
 void fetchWeather() {
   g_fetching = false;   /* 先落闸：fetchOnce 是阻塞的，别让下一帧重入 */
+  if (!g_statusLab) return;   /* 屏已销毁，别碰悬空指针 */
   if (WiFi.status() != WL_CONNECTED) {
     lv_label_set_text(g_statusLab, "未连接WiFi");
     g_fetching = false;
@@ -169,6 +176,14 @@ void fetchWeather() {
   if (g_forceLocate || !GeoIP::valid()) {
     GeoIP::locate(g_forceLocate);
     g_forceLocate = false;
+    /* 定位完就把城市标签掰正：fetchOnce 还要跑十几秒 HTTP，
+       而且它可能失败 —— 城市该先显示对，不该跟着天气一起卡住。 */
+    if (g_locLab) {
+      lv_label_set_text(g_locLab, GeoIP::city());
+      /* 实锤：把屏幕上真正的字打出来，光看 GeoIP::city() 不算验证 */
+      Serial.printf("[Weather] location label now = '%s'\n",
+                    lv_label_get_text(g_locLab));
+    }
   }
 
   /* DNS 在这个网络里会偶发失败（news.orz.ai 也遇到过一次），
@@ -189,6 +204,21 @@ lv_label_set_text(g_statusLab, "天气获取失败");
 
 }  // namespace
 
+/* 🔒 屏被销毁时把全局指针还清。之前一个都没清 —— 屏销毁后
+   g_tempLab/g_descLab/g_detailLab/g_statusLab/g_refreshBtn 全是悬空指针，
+   只要 tick 里 g_fetching 还残留 true 就会往已释放对象里写。
+   （跟 clock 屏那只忘记注销的 lv_timer 是同一类错误。） */
+void scr_delete_cb(lv_event_t* e) {
+  (void)e;
+  g_tempLab = nullptr;
+  g_descLab = nullptr;
+  g_detailLab = nullptr;
+  g_statusLab = nullptr;
+  g_refreshBtn = nullptr;
+  g_locLab = nullptr;
+  g_fetching = false;
+}
+
 lv_obj_t* WeatherScreen_create() {
   lv_obj_t* scr = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -202,12 +232,13 @@ lv_obj_t* WeatherScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
   StatusBar_create(scr, "天气");
+  lv_obj_add_event_cb(scr, scr_delete_cb, LV_EVENT_DELETE, NULL);
 
-  lv_obj_t* locLab = lv_label_create(scr);
-  lv_label_set_text(locLab, GeoIP::city());
-  lv_obj_set_style_text_color(locLab, lv_color_hex(0x888888), 0);
-  lv_obj_set_style_text_font(locLab, &font_zh_16, 0);
-  lv_obj_align(locLab, LV_ALIGN_TOP_MID, 0, 52);
+  g_locLab = lv_label_create(scr);
+  lv_label_set_text(g_locLab, GeoIP::city());
+  lv_obj_set_style_text_color(g_locLab, lv_color_hex(0x888888), 0);
+  lv_obj_set_style_text_font(g_locLab, &font_zh_16, 0);
+  lv_obj_align(g_locLab, LV_ALIGN_TOP_MID, 0, 52);
 
   g_tempLab = lv_label_create(scr);
   lv_label_set_text(g_tempLab, "--°C");
@@ -254,7 +285,7 @@ lv_obj_t* WeatherScreen_create() {
 }
 
 void WeatherScreen_tick() {
-  if (g_fetching) fetchWeather();
+  if (g_fetching && g_statusLab) fetchWeather();
 }
 
 /* 串口入口：weather —— 直接拉一次并打印诊断，不用点屏幕。

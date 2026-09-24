@@ -754,6 +754,12 @@ static void executeLine(char* line) {
     if (!SDCard::begin()) return;
     const char* p = (arg && *arg) ? arg : "/";
     SDCard::listDir(p, 1);
+} else if (strcmp(cmd, "sdbench") == 0) {
+    /* SD 卡读写速度实测：sdbench（默认 256KB） / sdbench 512
+       用途：量出「应用放 SD 卡、按需加载」读一个 app 要多久，好据实决策。
+       ⚠️ arg 可能是 nullptr，atoi 前必须判空。 */
+    uint32_t kb = (arg && *arg) ? (uint32_t)atoi(arg) : 256;
+    SDCard::bench(kb);
 } else if (strcmp(cmd, "weather") == 0) {
     /* 天气诊断：weather —— 建屏 + 拉一次，打印 HTTP 码和返回体 */
     if (!nav_weather) nav_open(&nav_weather);
@@ -768,6 +774,10 @@ static void executeLine(char* line) {
     Serial.printf("[GeoIP] ok=%d city=%s region=%s lat=%.4f lon=%.4f age=%us\n",
                   (int)ok, GeoIP::city(), GeoIP::region(), GeoIP::lat(),
                   GeoIP::lon(), (unsigned)GeoIP::ageSec());
+} else if (strcmp(cmd, "geotest") == 0) {
+    /* 反向 geocoding 选源：在设备侧实测各源的 HTTP 码。
+       PC 走代理（ip.sb 在 PC 上返回 Paris），PC 结果不作数，必须设备侧测。 */
+    GeoIP::probe();
 } else if (strcmp(cmd, "ls") == 0) {
     BrowserScreen_listPages();
   } else if (strcmp(cmd, "dl") == 0) {

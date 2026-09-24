@@ -43,6 +43,10 @@ uint64_t usedBytes();
 // 卡类型字符串："NONE" / "MMC" / "SD" / "SDHC" / "UNKNOWN"
 const char* typeName();
 
+// 读写速度实测（kb = 测试数据量，默认 256）。评估"应用放 SD 卡按需加载"用
+void bench(uint32_t kb);
+uint32_t spiHz();
+
 // 列目录到串口，depth 是递归层数（默认 1）
 void listDir(const char* path, int depth);
 

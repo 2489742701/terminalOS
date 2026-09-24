@@ -32,6 +32,9 @@ const char* region();   // 中文省/州
 double lat();
 double lon();
 
+// 设备侧实测各反向 geocoding 源（选源用，串口 geotest）
+void probe();
+
 // 缓存年龄（秒）。0xFFFFFFFF = 没有缓存
 uint32_t ageSec();
 
