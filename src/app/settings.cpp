@@ -63,13 +63,13 @@ static char s_upBuf[28];
 static char s_calBuf[40];
 
 /* ── 循环切换型选项（点一次换下一个）─────────────────────────────────── */
-/* ⚠️ 故意不给「永不 / 常亮」档。
-   历史事故：默认档是 5 分钟（index 2），而「永不」放在它后面 —— 用户点一下
-   设备就再也不息屏了，看着像坏了。息屏是省电与烧屏保护，不该一次点击就关掉。
-   真要常亮就单独做一项并明确提示，别混在循环里。 */
-static const unsigned long kIdleOpts[] = {30000, 60000, 300000};
-static const char* const kIdleNames[] = {"30 秒", "1 分钟", "5 分钟"};
-static const int kIdleCount = 3;
+/* 末档 0 = **常亮（永不熄屏）**。
+   历史事故：默认档是 5 分钟（index 2），常亮紧随其后 —— 用户点一下设备就再也不息屏，
+   看着像坏了。所以常亮**保留**（master 要这个功能），但要点**两次**才生效：
+   息屏是省电 + 防烧屏，不该一次误触就关掉。 */
+static const unsigned long kIdleOpts[] = {30000, 60000, 300000, 0};
+static const char* const kIdleNames[] = {"30 秒", "1 分钟", "5 分钟", "常亮"};
+static const int kIdleCount = 4;
 
 static const int kVpOpts[] = {0, 720, 1024, 1280};  // 0 = 自动（读 meta viewport）
 static const char* const kVpNames[] = {"自动", "720 px", "1024 px", "1280 px"};
@@ -219,16 +219,25 @@ static void touchtest_event_cb(lv_event_t* e) {
   openScreen(&nav_touchtest, "触摸校准");
 }
 
-/* 循环切换：点一次走到下一个选项。改完立刻刷新右侧文字 + 底部提示 */
+/* 循环切换：点一次走到下一个选项。改完立刻刷新右侧文字 + 底部提示。
+   ⚠️ 切到「常亮」（0）要二次确认 —— 见 kIdleOpts 上方注释的事故。 */
+static uint32_t s_alwaysOnArmUntil = 0;
 static void idle_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  /* -1 = 当前值不在档位表里（例如旧固件留下的 0=永不）→ 回到第一档 */
+  /* -1 = 当前值不在档位表里（例如串口 `sleep 45000` 设的）→ 回到第一档 */
   int i = indexOf(ScreenSaver::idleTimeout(), kIdleOpts, kIdleCount, -1);
-  i = (i + 1) % kIdleCount;
+  int next = (i + 1) % kIdleCount;
+  if (kIdleOpts[next] == 0 && !(s_alwaysOnArmUntil && millis() <= s_alwaysOnArmUntil)) {
+    s_alwaysOnArmUntil = millis() + 3000;   /* 3 秒内再点一次才真的切常亮 */
+    setStatus("再点一次确认「常亮」——屏幕将不再熄灭");
+    return;
+  }
+  s_alwaysOnArmUntil = 0;
+  i = next;
   ScreenSaver::setIdleTimeout(kIdleOpts[i]);
   settings_menu_refresh_values();
   char m[40];
-  snprintf(m, sizeof(m), "自动息屏：%s", kIdleNames[i]);
+  snprintf(m, sizeof(m), "息屏超时：%s", kIdleNames[i]);
   setStatus(m);
 }
 

@@ -29,6 +29,11 @@ class ScreenSaver {
   // 会先记下当前屏，唤醒后回锁屏页，滑动解锁再回到原来那屏。
   static void sleepNow();
 
+  /* 串口诊断 `sleep`：打印当前状态 / 超时 / 已空闲多久 / 是否被 suppressed 压着。
+     排查"怎么还不息屏"时第一件事就是跑它 —— 靠猜是猜不出来的。 */
+  static void dumpStatus();
+
+
   /* 自动息屏：无操作多久进 DIM。**0 = 永不息屏**。
      原先是编译期常量（300000），设置页够不着 —— 改成运行时变量才有「自动息屏」这一项。 */
   static void setIdleTimeout(unsigned long ms);

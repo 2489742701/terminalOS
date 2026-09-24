@@ -171,6 +171,25 @@ void ScreenSaver::unlock() {
  * 先 enterDim(true) 捕获当前屏（解锁后回到这里，而不是跳回主桌面），
  * 再 enterOff() 关背光。顺序不能反：enterOff 只改背光和状态，不记返回屏。
  */
+void ScreenSaver::dumpStatus() {
+  const char* st = (state == ACTIVE) ? "ACTIVE" : ((state == DIM) ? "DIM" : "OFF");
+  unsigned long now = millis();
+  unsigned long idle = now - lastActivityMs;
+  Serial.printf("[ScreenSaver] state=%s timeout=%lums%s idle=%lus suppressed=%d\n",
+                st, ACTIVE_TIMEOUT_MS, (ACTIVE_TIMEOUT_MS == 0 ? " (永不)" : ""),
+                idle / 1000, (int)suppressed);
+  if (ACTIVE_TIMEOUT_MS == 0) {
+    Serial.println("[ScreenSaver] timeout=0 -> 永不息屏（设置页「息屏超时」选了常亮）");
+  } else if (state == ACTIVE) {
+    long rem = (long)ACTIVE_TIMEOUT_MS - (long)idle;
+    Serial.printf("[ScreenSaver] -> DIM(背光15%%) in %lds，再 %lus 后 OFF(全黑)\n",
+                  rem > 0 ? rem / 1000 : 0, DIM_TIMEOUT_MS / 1000);
+  } else if (state == DIM) {
+    long rem = (long)DIM_TIMEOUT_MS - (long)idle;
+    Serial.printf("[ScreenSaver] -> OFF(全黑) in %lds\n", rem > 0 ? rem / 1000 : 0);
+  }
+}
+
 void ScreenSaver::setIdleTimeout(unsigned long ms) {
   ACTIVE_TIMEOUT_MS = ms;
 }

@@ -14,6 +14,8 @@
 #include "../app/browser_screen.h"
 #include "../app/weather_screen.h"
 #include "../app/settings_menu.h"
+#include "../app/screensaver.h"
+#include "../app/screensaver.h"
 #include "../app/news.h"
 #include "../browser_engine/include/layout_engine.h"
 #include "../hal/battery.h"
@@ -61,6 +63,8 @@ static void printHelp() {
   Serial.println("help              - show this help");
   Serial.println("nav <screen>      - navigate to screen");
   Serial.println("  screens: launcher clock settings wifi game 2048 browser draw memory sysinfo weather games desktop taskmgr touchtest");
+  Serial.println("sleep [ms]        - 息屏诊断：看状态/超时/已空闲多久；sleep 30000 直接设超时(0=永不)");
+  Serial.println("sleep [ms]        - 息屏诊断：看状态/超时/已空闲多久；sleep 30000 直接设超时(0=永不)");
   Serial.println("setpage <id>|back - 设置页二级菜单诊断：直接跳页 / 回上一级");
   Serial.println("browser <url>     - open browser and load URL");
   Serial.println("vp <width>|vp 0   - browser layout viewport (0=auto, read <meta viewport>)");
@@ -732,6 +736,16 @@ static void executeLine(char* line) {
     printHelp();
   } else if (strcmp(cmd, "nav") == 0) {
     cmdNav(arg);
+  } else if (strcmp(cmd, "sleep") == 0) {
+    /* 息屏诊断：sleep —— 看当前状态/超时/已空闲多久；sleep 30000 —— 直接设超时(ms)，
+       sleep 0 = 永不。排查"怎么还不息屏"先跑这个。 */
+    if (arg && *arg) ScreenSaver::setIdleTimeout(strtoul(arg, nullptr, 10));
+    ScreenSaver::dumpStatus();
+  } else if (strcmp(cmd, "sleep") == 0) {
+    /* 息屏诊断：sleep —— 看当前状态/超时/已空闲多久；sleep 30000 —— 直接设超时(ms)，
+       sleep 0 = 永不。排查"怎么还不息屏"先跑这个。 */
+    if (arg && *arg) ScreenSaver::setIdleTimeout(strtoul(arg, nullptr, 10));
+    ScreenSaver::dumpStatus();
   } else if (strcmp(cmd, "setpage") == 0) {
     /* 诊断：直接跳到设置页的某个二级页（等价于点那一行）。
        setpage root|display|general ，setpage back = 回上一级 */
