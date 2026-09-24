@@ -798,15 +798,15 @@ static String urlEncode(const String& s) {
 enum PendingUiKind { UI_PEND_NONE = 0, UI_PEND_SEARCH, UI_PEND_DOWNLOADS };
 static volatile int g_uiPendingKind = UI_PEND_NONE;
 
-/* 搜索引擎（master 2026-09-25：必应之外再加 360）
-   实测：www.so.com/s?q=  -> 200 / 449KB，能正常打开。
+/* 搜索引擎：目前**只有必应**（master 2026-09-25 拍板退回单一引擎）。
+   历史：曾短暂加过 360(www.so.com) 和百度，后来撤了 ——
+     36氪(36kr) 是科技媒体、**没有搜索**，跟 360 不是一家，别再搞混。
    ⚠️ 必应必须用桌面 Chrome120 UA（移动 UA 只给 5 条、无分页），
-      这条规矩在 browser_engine 那边，别动。 */
+      这条规矩在 browser_engine 那边，别动。
+   ⚠️ 要再加引擎：往 kEngines 里加一行、再把首页那个切换 chip 加回来即可。 */
 struct SearchEngine { const char* name; const char* tpl; };
 static const SearchEngine kEngines[] = {
     {"必应", "https://cn.bing.com/search?q="},
-    {"360",  "https://www.so.com/s?q="},
-    {"百度", "https://www.baidu.com/s?word="},
 };
 static const int kEngineCount = (int)(sizeof(kEngines) / sizeof(kEngines[0]));
 static int g_engineIdx = 0;
@@ -831,15 +831,6 @@ static void search_go_cb(lv_event_t* e) {
   const char* q = lv_textarea_get_text(g_searchTa);
   if (!q || !q[0]) return;
   startSearch(String(q));
-}
-
-/* 切换搜索引擎：切完当场重画搜索首页（行的重建走 UI_PEND 通道，别在回调里 clean） */
-static void engine_switch_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  g_engineIdx = (g_engineIdx + 1) % kEngineCount;
-  Serial.printf("[Search] engine -> %s\n", kEngines[g_engineIdx].name);
-  toast((String("搜索引擎：") + kEngines[g_engineIdx].name).c_str());
-  g_uiPendingKind = UI_PEND_SEARCH;
 }
 
 /* ── 热点新闻：起后台任务拉一个平台 ── */
@@ -1131,13 +1122,6 @@ static void showSearchHome() {
 
   lv_obj_t* go = makeChipBtn(row, "搜索", search_go_cb, NULL);
 
-  /* 搜索引擎切换：点一下换下一个（必应 -> 360 -> 百度 -> …），
-     名字旁显示当前引擎，选中态白底黑字。 */
-  lv_obj_t* eb = makeChipBtn(row, kEngines[g_engineIdx].name,
-                             engine_switch_cb, NULL);
-  lv_obj_set_size(eb, 68, 36);
-  lv_obj_set_style_bg_color(eb, lv_color_hex(0x2a2a2a), 0);
-  lv_obj_set_style_border_color(eb, lv_color_hex(0xFFD700), 0);
   lv_obj_set_size(go, 96, 40);
 
   /* 搜索引擎固定必应 —— 百度因体积与反爬已弃用（见文件头注释），不再给切换入口 */
