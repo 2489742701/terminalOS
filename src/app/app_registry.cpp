@@ -17,6 +17,7 @@ AppEntry s_apps[] = {
     {"draw",     "画板",   Icon::Terminal, &nav_draw,     AppGroup::Desktop, true},
     {"sysinfo",  "系统",   Icon::Power,    &nav_sysinfo,  AppGroup::Desktop, true},
     {"weather",  "天气",   Icon::Weather,  &nav_weather,  AppGroup::Desktop, true},
+    {"calendar", "日历",   Icon::Tasks,    &nav_calendar, AppGroup::Desktop, true},
     {"taskmgr",  "后台",   Icon::Switch,  &nav_taskmgr,  AppGroup::Desktop, true},
 
     {"snake",    "贪吃蛇", Icon::Game,     &nav_game,     AppGroup::Game,    false},

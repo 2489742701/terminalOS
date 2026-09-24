@@ -16,6 +16,7 @@
 #include "desktop_screen.h"
 #include "taskmgr_screen.h"
 #include "touchtest_screen.h"
+#include "calendar_screen.h"
 
 #include <esp_heap_caps.h>
 
@@ -71,6 +72,7 @@ ActivityEntry s_table[] = {
     {"2048",     &nav_2048,     Game2048Screen_create, nullptr,         nullptr},
     {"sysinfo",  &nav_sysinfo,  SysInfoScreen_create,  nullptr,         nullptr},
     {"weather",  &nav_weather,  WeatherScreen_create,  nullptr,         nullptr},
+    {"calendar", &nav_calendar, CalendarScreen_create, nullptr,         nullptr},
     /* 游戏栏目本身也是一个 Activity：从它进去的子游戏退出时要回来，
        所以它必须能按需创建（见 nav_games_or_home）。 */
     {"games",    &nav_games,    GamesScreen_create,    nullptr,         nullptr},

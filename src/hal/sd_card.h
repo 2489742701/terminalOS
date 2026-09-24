@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <Arduino.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * TF / microSD 卡（SPI 模式）
@@ -49,5 +50,10 @@ uint32_t spiHz();
 
 // 列目录到串口，depth 是递归层数（默认 1）
 void listDir(const char* path, int depth);
+
+/* 整文件读写（天气 JSON 缓存等）。未挂载 / 失败一律返回 false，调用方静默跳过。
+   ⚠️ 写之前会建父目录（/gt 这种）。别在没挂载时调 —— 会去动 SPI。 */
+bool writeFile(const char* path, const String& data);
+bool readFile(const char* path, String& out);
 
 }  // namespace SDCard

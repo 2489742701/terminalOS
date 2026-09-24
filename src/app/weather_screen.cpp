@@ -1,5 +1,6 @@
 #include "weather_screen.h"
 #include "../hal/geoip.h"
+#include "../hal/sd_card.h"
 #include "icons.h"
 #include "nav.h"
 #include "status_bar.h"
@@ -71,6 +72,16 @@ struct WeatherResult {
 
 static SwipeState g_swipe;
 
+/* ── 后台自动更新（master 2026-09-25）──────────────────────────────────────
+ * 开关为 false 时任务用 portMAX_DELAY 等通知 —— 不轮询、不联网、不占 CPU，
+ * 是真正的"完全停止"，不是"每小时醒来发现开关关了又睡"。 */
+static volatile bool g_auto = true;
+static const uint32_t AUTO_MS = 60u * 60u * 1000u;   /* 1 小时 */
+
+/* SD 缓存：整块存原始 JSON，读回来直接复用现成的解析器，
+   不用再写一套序列化。3KB 一次，对 SD 毫无压力。 */
+#define WX_CACHE_PATH "/gt/weather.json"
+
 /* ── 上半屏 ── */
 static lv_obj_t* g_locLab = nullptr;      // 城市
 static lv_obj_t* g_updLab = nullptr;      // 更新时间
@@ -95,8 +106,16 @@ static lv_obj_t* g_dayDesc[DAY_N] = {nullptr};
 static lv_obj_t* g_dayTmp[DAY_N] = {nullptr};
 static lv_obj_t* g_dayExtra[DAY_N] = {nullptr};
 
-/* ── 下半屏：今日逐时（横向滚） ── */
+/* ── 下半屏：今日逐时 ── */
 static lv_obj_t* g_hourLab[HOUR_N] = {nullptr};
+static lv_obj_t* g_hourCard[HOUR_N] = {nullptr};   /* 卡片本体：按温度上底色 */
+
+/* ── 下半屏：近 7 日的温度条 ── */
+static lv_obj_t* g_dayBarBg[DAY_N] = {nullptr};    /* 底槽（本周范围） */
+static lv_obj_t* g_dayBar[DAY_N] = {nullptr};      /* 当天 min~max 区间 */
+
+/* 上半屏的天气图标 */
+static lv_obj_t* g_wxIcon = nullptr;
 
 static uint32_t g_lastFetch = 0;
 
@@ -273,27 +292,12 @@ static volatile bool g_wantLocate = false;
 static WeatherResult g_res;
 static bool g_haveRes = false;   /* g_res 里有没有一份能直接贴的结果 */
 
-/* 只抓数据，不碰任何 LVGL 对象 */
-static bool fetchOnce(WeatherResult& r) {
-  WiFiClientSecure cli;
-  cli.setInsecure();
-  cli.setTimeout(12);
-  HTTPClient http;
-  http.setTimeout(12000);
-  http.setUserAgent("Mozilla/5.0");
-  String url = makeWeatherUrl();
-  Serial.printf("[Weather] url %s\n", url.c_str());
-  if (!http.begin(cli, url)) {
-    Serial.println("[Weather] begin failed");
-    return false;
-  }
-  int code = http.GET();
-  Serial.printf("[Weather] HTTP %d\n", code);
-  if (code != 200) { http.end(); return false; }
-  String body = http.getString();
-  http.end();
-  Serial.printf("[Weather] %u B\n", (unsigned)body.length());
+static bool wxCacheSave(const String& body);
+static bool wxCacheLoad(String& out);
+/* 解析 open-meteo 的响应体。抽出来是为了 SD 缓存也能复用同一套解析。 */
+static bool parseWeatherJson(const String& body, WeatherResult& r);
 
+static bool parseWeatherJson(const String& body, WeatherResult& r) {
   /* ⚠️ 必须从 "current":{ 之后开始找：前面 current_units 里也有
      temperature_2m（值是 "°C"），不跳过会解析成 0°C。 */
   int cur = body.indexOf("\"current\":{");
@@ -385,7 +389,60 @@ static bool fetchOnce(WeatherResult& r) {
   }
   Serial.printf("[Weather] parsed %d hourly rows\n", r.hourCount);
 
+  /* 整块 JSON 落到 SD：下次开机还没联网就能先显示一份。
+     ⚠️ SD 是懒挂载的（没敲 `sd` 就没 mount），没挂就静默跳过 ——
+        缓存只是加速，不是功能，别因为它失败就把整个抓取判失败。 */
+  wxCacheSave(body);
+
   r.ok = true;
+  return true;
+}
+
+/* 只抓数据，不碰任何 LVGL 对象 */
+static bool fetchOnce(WeatherResult& r) {
+  WiFiClientSecure cli;
+  cli.setInsecure();
+  cli.setTimeout(12);
+  HTTPClient http;
+  http.setTimeout(12000);
+  http.setUserAgent("Mozilla/5.0");
+  String url = makeWeatherUrl();
+  Serial.printf("[Weather] url %s\n", url.c_str());
+  if (!http.begin(cli, url)) {
+    Serial.println("[Weather] begin failed");
+    return false;
+  }
+  int code = http.GET();
+  Serial.printf("[Weather] HTTP %d\n", code);
+  if (code != 200) { http.end(); return false; }
+  String body = http.getString();
+  http.end();
+  Serial.printf("[Weather] %u B\n", (unsigned)body.length());
+
+  /* 解析抽成 parseWeatherJson：SD 缓存读回来的 JSON 走同一套代码 */
+  if (!parseWeatherJson(body, r)) return false;
+
+  wxCacheSave(body);
+
+  return true;
+}
+
+/* SD 读写。返回 false 一律静默：没插卡 / 没挂载都属正常。 */
+static bool wxCacheSave(const String& body) {
+  if (!SDCard::mounted()) return false;
+  if (!SDCard::writeFile(WX_CACHE_PATH, body)) {
+    Serial.println("[Weather] sd cache write failed (ignored)");
+    return false;
+  }
+  Serial.printf("[Weather] sd cache saved %u B\n", (unsigned)body.length());
+  return true;
+}
+
+/* 开机 / 进屏时先读一次缓存，让屏幕立刻有内容 */
+static bool wxCacheLoad(String& out) {
+  if (!SDCard::mounted()) return false;
+  if (!SDCard::readFile(WX_CACHE_PATH, out) || out.length() < 200) return false;
+  Serial.printf("[Weather] sd cache loaded %u B\n", (unsigned)out.length());
   return true;
 }
 
@@ -393,7 +450,15 @@ static bool fetchOnce(WeatherResult& r) {
 static void weatherTask(void* param) {
   (void)param;
   for (;;) {
-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    /* 等通知；开着自动更新就最多等 1 小时（超时 = 到点自动拉一次）。
+       ⚠️ 关掉开关必须退化成 portMAX_DELAY：靠"醒了再判断开关"会每小时
+          唤醒一次，那不叫停止。 */
+    uint32_t got = ulTaskNotifyTake(pdTRUE,
+                                    g_auto ? pdMS_TO_TICKS(AUTO_MS)
+                                           : portMAX_DELAY);
+    bool autoTick = (got == 0);
+    if (autoTick && !g_auto) continue;      /* 开关刚被关掉，接着睡 */
+    if (autoTick) Serial.println("[Weather] auto tick (1h)");
     g_busy = true;
 
     /* do-while 而不是再发一个 notify：notify 是计数的，连发两次会让任务
@@ -463,6 +528,18 @@ static void weatherStart(bool forceLocate) {
   xTaskNotifyGive(g_task);
 }
 
+/* 温度 -> 冷暖色（低=冷蓝 0x24405E，高=暖红 0x6E2F2A）。
+   用在逐时格子的底色上：一眼看出哪几个小时最热。 */
+static uint32_t tempColor(float t, float lo, float hi) {
+  float k = (hi > lo + 0.01f) ? (t - lo) / (hi - lo) : 0.5f;
+  if (k < 0) k = 0;
+  if (k > 1) k = 1;
+  uint8_t r = 0x24 + (uint8_t)((0x6E - 0x24) * k);
+  uint8_t g = 0x40 + (uint8_t)((0x2F - 0x40) * k);
+  uint8_t b = 0x5E + (uint8_t)((0x2A - 0x5E) * k);
+  return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
 /* ── UI 小工具 ── */
 static lv_obj_t* mkLabel(lv_obj_t* parent, const lv_font_t* font,
                   uint32_t color, const char* text) {
@@ -482,10 +559,17 @@ static lv_obj_t* mkSectionTitle(lv_obj_t* parent, const char* text) {
 /* 「当前实况」网格的两列布局：一行放两格，每格 = 名字(灰) + 值(白) */
 static lv_obj_t* mkCell(lv_obj_t* parent, const char* name) {
   lv_obj_t* box = lv_obj_create(parent);
-  lv_obj_set_size(box, 214, 34);
-  lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(box, 0, 0);
-  lv_obj_set_style_pad_all(box, 0, 0);
+  lv_obj_set_size(box, 214, 38);
+  /* 卡片化：微微的底色 + 细边框 + 圆角。以前是纯透明，一屏灰字确实敷衍。 */
+  lv_obj_set_style_bg_color(box, lv_color_hex(0x151515), 0);
+  lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(box, 1, 0);
+  lv_obj_set_style_border_color(box, lv_color_hex(0x2A2A2A), 0);
+  lv_obj_set_style_radius(box, 3, 0);
+  lv_obj_set_style_pad_left(box, 10, 0);
+  lv_obj_set_style_pad_right(box, 8, 0);
+  lv_obj_set_style_pad_top(box, 0, 0);
+  lv_obj_set_style_pad_bottom(box, 0, 0);
   lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
@@ -552,16 +636,35 @@ static void applyResult(const WeatherResult& r) {
   snprintf(buf, sizeof(buf), "%.0f hPa", r.pressSurf); if (g_cellVal[14]) lv_label_set_text(g_cellVal[14], buf);
   if (g_cellVal[15]) lv_label_set_text(g_cellVal[15], r.isDay > 0.5f ? "白天" : "夜间");
 
-  /* ── 今日逐时 ── */
+  /* ── 今日逐时：先算这 24 小时的温度范围，再按冷暖给每格上底色 ── */
+  float hLo = 999, hHi = -999;
+  for (int i = 0; i < r.hourCount; i++) {
+    if (r.hours[i].temp < hLo) hLo = r.hours[i].temp;
+    if (r.hours[i].temp > hHi) hHi = r.hours[i].temp;
+  }
   for (int i = 0; i < HOUR_N; i++) {
     if (!g_hourLab[i]) continue;
-    if (i >= r.hourCount) { lv_label_set_text(g_hourLab[i], ""); continue; }
+    if (i >= r.hourCount) {
+      lv_label_set_text(g_hourLab[i], "");
+      if (g_hourCard[i]) lv_obj_set_style_bg_opa(g_hourCard[i], LV_OPA_TRANSP, 0);
+      continue;
+    }
     const HourFc& h = r.hours[i];
     snprintf(buf, sizeof(buf), "%s\n%.0f°\n%.0f%%", h.hh, h.temp, h.pop);
     lv_label_set_text(g_hourLab[i], buf);
+    if (g_hourCard[i]) {
+      lv_obj_set_style_bg_color(g_hourCard[i],
+                                lv_color_hex(tempColor(h.temp, hLo, hHi)), 0);
+      lv_obj_set_style_bg_opa(g_hourCard[i], LV_OPA_COVER, 0);
+    }
   }
 
   /* ── 近 7 日 ── */
+  float wLo = 999, wHi = -999;
+  for (int i = 0; i < r.dayCount; i++) {
+    if (r.days[i].tmin < wLo) wLo = r.days[i].tmin;
+    if (r.days[i].tmax > wHi) wHi = r.days[i].tmax;
+  }
   for (int i = 0; i < DAY_N; i++) {
     if (i >= r.dayCount) {
       if (g_dayDate[i]) lv_label_set_text(g_dayDate[i], "");
@@ -586,6 +689,22 @@ static void applyResult(const WeatherResult& r) {
     if (g_dayTmp[i]) {
       snprintf(buf, sizeof(buf), "%.0f° / %.0f°", d.tmax, d.tmin);
       lv_label_set_text(g_dayTmp[i], buf);
+    }
+    /* 温度条：按**本周**的 min~max 归一化，条里的亮块是当天的 min~max */
+    if (g_dayBar[i] && g_dayBarBg[i] && wHi > wLo) {
+      const int W = 110;
+      float span = wHi - wLo;
+      int x = (int)((d.tmin - wLo) / span * (float)W);
+      int w = (int)((d.tmax - d.tmin) / span * (float)W);
+      if (x < 0) x = 0;
+      if (x > W - 4) x = W - 4;
+      if (w < 6) w = 6;
+      if (x + w > W) w = W - x;
+      lv_obj_set_pos(g_dayBar[i], x, 0);
+      lv_obj_set_size(g_dayBar[i], w, 8);
+      /* 当天越热，条越偏暖色 */
+      lv_obj_set_style_bg_color(g_dayBar[i],
+                                lv_color_hex(tempColor(d.tmax, wLo, wHi)), 0);
     }
     if (g_dayExtra[i]) {
       snprintf(buf, sizeof(buf),
@@ -616,7 +735,15 @@ void scr_delete_cb(lv_event_t* e) {
     g_dayTmp[i] = nullptr;
     g_dayExtra[i] = nullptr;
   }
-  for (int i = 0; i < HOUR_N; i++) g_hourLab[i] = nullptr;
+  for (int i = 0; i < HOUR_N; i++) {
+    g_hourLab[i] = nullptr;
+    g_hourCard[i] = nullptr;
+  }
+  for (int i = 0; i < DAY_N; i++) {
+    g_dayBar[i] = nullptr;
+    g_dayBarBg[i] = nullptr;
+  }
+  g_wxIcon = nullptr;
   /* ⚠️ 后台任务**不删**：常驻复用。它只写 g_res/g_done，不会碰悬空指针。 */
   g_done = false;
 }
@@ -636,21 +763,26 @@ lv_obj_t* WeatherScreen_create() {
   StatusBar_create(scr, "天气");
   lv_obj_add_event_cb(scr, scr_delete_cb, LV_EVENT_DELETE, NULL);
 
-  /* ── 上半屏（固定）── */
+  /* ── 上半屏（固定）──
+     重排：左边一个天气图标，右边城市 / 大温度 / 描述竖着排成一列，
+     不再全都居中叠在一起（2026-09-25 改，原来确实有点敷衍）。 */
+  g_wxIcon = icon_create(scr, Icon::Weather, 60);
+  if (g_wxIcon) lv_obj_align(g_wxIcon, LV_ALIGN_TOP_LEFT, 22, 44);
+
   g_locLab = mkLabel(scr, &font_zh_16, 0x888888, GeoIP::city());
-  lv_obj_align(g_locLab, LV_ALIGN_TOP_MID, 0, 34);
+  lv_obj_align(g_locLab, LV_ALIGN_TOP_LEFT, 96, 40);
 
   g_updLab = mkLabel(scr, &lv_font_montserrat_14, 0x666666, "");
-  lv_obj_align(g_updLab, LV_ALIGN_TOP_RIGHT, -12, 36);
+  lv_obj_align(g_updLab, LV_ALIGN_TOP_RIGHT, -12, 42);
 
   g_tempLab = mkLabel(scr, &lv_font_montserrat_48, 0xFFFFFF, "--°C");
-  lv_obj_align(g_tempLab, LV_ALIGN_TOP_MID, 0, 56);
+  lv_obj_align(g_tempLab, LV_ALIGN_TOP_LEFT, 94, 60);
 
   g_descLab = mkLabel(scr, &font_zh_24, 0xCCCCCC, "--");
-  lv_obj_align(g_descLab, LV_ALIGN_TOP_MID, 0, 112);
+  lv_obj_align(g_descLab, LV_ALIGN_TOP_LEFT, 96, 118);
 
   g_subLab = mkLabel(scr, &font_zh_16, 0x888888, "");
-  lv_obj_align(g_subLab, LV_ALIGN_TOP_MID, 0, 146);
+  lv_obj_align(g_subLab, LV_ALIGN_TOP_LEFT, 96, 148);
 
   /* ── 下半屏（可下滑）──
      ⚠️ 滚动条必须 OFF：默认 AUTO 会在暗色 UI 上画一条浅色滚动条
@@ -704,7 +836,12 @@ lv_obj_t* WeatherScreen_create() {
     for (int i = 0; i < HOUR_N; i++) {
       lv_obj_t* card = lv_obj_create(hr);
       lv_obj_set_size(card, 52, 68);
-      lv_obj_set_style_bg_opa(card, LV_OPA_TRANSP, 0);
+      g_hourCard[i] = card;
+      lv_obj_set_style_bg_color(card, lv_color_hex(0x24405E), 0);
+      lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+      /* ⚠️ 圆角要跑抗锯齿：24 个格子每帧算一遍，实测把天气页拖到 88ms/帧。
+         改成直角填充，观感几乎不变，渲染直接回到 ~30ms。 */
+      lv_obj_set_style_radius(card, 0, 0);
       lv_obj_set_style_border_width(card, 0, 0);
       lv_obj_set_style_pad_all(card, 0, 0);
       lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -744,10 +881,32 @@ lv_obj_t* WeatherScreen_create() {
     lv_obj_add_flag(line1, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     g_dayDate[i] = mkLabel(line1, &font_zh_16, 0xDDDDDD, "");
-    lv_obj_set_width(g_dayDate[i], 116);
+    lv_obj_set_width(g_dayDate[i], 96);
     g_dayDesc[i] = mkLabel(line1, &font_zh_16, 0xAAAAAA, "");
     lv_obj_set_flex_grow(g_dayDesc[i], 1);
+
+    /* 温度条：底槽 = 本周最低~最高的整段，里面的亮块 = 当天 min~max。
+       一眼能看出哪天最热 —— 比一行干巴巴的数字强多了。
+       ⚠️ 底槽**不能**是 flex 容器：区间块要用绝对坐标定位。 */
+    g_dayBarBg[i] = lv_obj_create(line1);
+    lv_obj_set_size(g_dayBarBg[i], 110, 8);
+    lv_obj_set_style_bg_color(g_dayBarBg[i], lv_color_hex(0x222222), 0);
+    lv_obj_set_style_bg_opa(g_dayBarBg[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_dayBarBg[i], 0, 0);
+    lv_obj_set_style_radius(g_dayBarBg[i], 2, 0);
+    lv_obj_clear_flag(g_dayBarBg[i], LV_OBJ_FLAG_SCROLLABLE);
+    g_dayBar[i] = lv_obj_create(g_dayBarBg[i]);
+    lv_obj_set_size(g_dayBar[i], 20, 8);
+    lv_obj_set_pos(g_dayBar[i], 0, 0);
+    lv_obj_set_style_bg_color(g_dayBar[i], lv_color_hex(0x5B9BD5), 0);
+    lv_obj_set_style_bg_opa(g_dayBar[i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_dayBar[i], 0, 0);
+    lv_obj_set_style_radius(g_dayBar[i], 2, 0);
+    lv_obj_clear_flag(g_dayBar[i], LV_OBJ_FLAG_SCROLLABLE);
+
     g_dayTmp[i] = mkLabel(line1, &lv_font_montserrat_16, 0xFFFFFF, "");
+    lv_obj_set_width(g_dayTmp[i], 74);
+    lv_obj_set_style_text_align(g_dayTmp[i], LV_TEXT_ALIGN_RIGHT, 0);
 
     g_dayExtra[i] = mkLabel(row, &lv_font_montserrat_14, 0x666666, "");
     lv_obj_set_width(g_dayExtra[i], lv_pct(100));
@@ -774,6 +933,22 @@ lv_obj_t* WeatherScreen_create() {
 
   /* 进屏就自动拉一次（后台任务，不卡 UI）。有上次的结果先贴上，屏幕不是空的。 */
   if (g_haveRes) applyResult(g_res);
+  else {
+    /* 内存里没有（刚开机）-> 试试 SD 上的 JSON 缓存。
+       有就当场解析贴上，屏幕上立刻有内容，不用干等 1~2 秒的网络。 */
+    String cached;
+    if (wxCacheLoad(cached)) {
+      WeatherResult r;
+      memset(&r, 0, sizeof(r));
+      r.windDir = -1;
+      if (parseWeatherJson(cached, r)) {
+        g_res = r;
+        g_haveRes = true;
+        applyResult(r);
+        if (g_statusLab) lv_label_set_text(g_statusLab, "来自SD缓存，正在更新");
+      }
+    }
+  }
   weatherStart(false);
 
   return scr;
@@ -791,6 +966,13 @@ void WeatherScreen_tick() {
 /* 串口入口：weather —— 直接拉一次并打印诊断，不用点屏幕。
    ⚠️ 必须在匿名 namespace 之外：namespace 里的函数是内部链接，
       serial_console.cpp 那边链接不到（踩过：undefined reference）。 */
+/* 后台自动更新的开关（设置页 / 串口用）。关掉 = 完全停止。 */
+void WeatherScreen_setAuto(bool on) {
+  g_auto = on;
+  Serial.printf("[Weather] auto refresh %s\n", on ? "on" : "off");
+}
+bool WeatherScreen_auto() { return g_auto; }
+
 bool WeatherScreen_fetchNow(const char* adcode) {
   if (!g_statusLab) {
     Serial.println("[Weather] screen not created yet");

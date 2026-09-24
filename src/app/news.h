@@ -24,10 +24,15 @@ struct NewsItem {
   char url[NEWS_URL_LEN];
 };
 
-/* 平台代码 + 中文名。UI 按这个顺序画 chip。 */
+/* 平台代码 + 中文名 + 是否已验证。
+   UI 按这个顺序画 chip —— **能正常打开看内容的排前面**（master 2026-09-25）。
+   verified=true 的源，名字旁边画一颗金色小星星：
+     选中态（白底黑字）时星星**仍然是金色**，只有文字变黑。
+   ⚠️ verified 不是"猜"的，是逐条点开前 4 条链接实测出来的，改之前先测。 */
 struct NewsPlatform {
   const char* code;
   const char* name;
+  bool verified;
 };
 extern const NewsPlatform kNewsPlatforms[];
 extern const int kNewsPlatformCount;

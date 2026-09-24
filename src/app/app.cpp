@@ -59,6 +59,7 @@ lv_obj_t* nav_memory = nullptr;
 lv_obj_t* nav_2048 = nullptr;
 lv_obj_t* nav_sysinfo = nullptr;
 lv_obj_t* nav_weather = nullptr;
+lv_obj_t* nav_calendar = nullptr;
 lv_obj_t* nav_games = nullptr;
 lv_obj_t* nav_desktop = nullptr;
 lv_obj_t* nav_taskmgr = nullptr;

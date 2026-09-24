@@ -51,6 +51,7 @@ static ScreenEntry s_screens[] = {
   {"2048",      &nav_2048},
   {"sysinfo",   &nav_sysinfo},
   {"weather",   &nav_weather},
+  {"calendar",  &nav_calendar},
   {"games",     &nav_games},
   {"desktop",   &nav_desktop},
 {"taskmgr",   &nav_taskmgr},
@@ -90,6 +91,7 @@ Serial.println("serve|servestop   - 把已存页面用 HTTP 共享出去（PC �
   Serial.println("bnews [platform]  - 走 UI 路径拉热点(后台任务 + 重绘, 验渲染不崩)");
   Serial.println("ime <pinyin>      - 中文输入法验证, 如 ime zhong");
   Serial.println("weather           - 建天气屏 + 拉一次, 打印 HTTP 码和返回体");
+  Serial.println("wxauto [on|off]   - 天气后台每小时自动更新开关(off=完全停止)");
   Serial.println("geo|geo reset     - IP 定位; reset = 清缓存强制重定位");
   Serial.println("geotest           - 设备侧实测各反向 geocoding 源(选源用)");
   Serial.println("sd [path] [depth] - TF 卡探测/列目录(懒挂载, 不敲就不碰 SPI)");
@@ -821,7 +823,19 @@ static void executeLine(char* line) {
     /* 天气诊断：weather —— 建屏 + 拉一次，打印 HTTP 码和返回体 */
     if (!nav_weather) nav_open(&nav_weather);
     if (nav_weather) { nav_go(nav_weather); WeatherScreen_fetchNow(arg); }
-} else if (strcmp(cmd, "geo") == 0) {
+} else if (strcmp(cmd, "wxauto") == 0) {
+    /* 天气后台自动更新开关。off = 完全停止（任务用 portMAX_DELAY 睡，不轮询） */
+    if (!arg || !arg[0]) {
+      Serial.printf("[Weather] auto refresh = %s\n",
+                    WeatherScreen_auto() ? "on" : "off");
+    } else if (strcmp(arg, "on") == 0 || strcmp(arg, "1") == 0) {
+      WeatherScreen_setAuto(true);
+    } else if (strcmp(arg, "off") == 0 || strcmp(arg, "0") == 0) {
+      WeatherScreen_setAuto(false);
+    } else {
+      Serial.println("Usage: wxauto [on|off]");
+    }
+  } else if (strcmp(cmd, "geo") == 0) {
     /* IP 定位：geo（用缓存/联网） / geo reset（清缓存强制重定位） */
     if (arg && strncmp(arg, "reset", 5) == 0) {
       GeoIP::reset();

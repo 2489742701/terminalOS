@@ -68,6 +68,90 @@ static lv_obj_t* g_searchKb = nullptr;      /* 键盘挂在屏上，不跟 conte
 static NewsItem g_news[NEWS_MAX_ITEMS];
 static int g_newsCount = 0;
 static char g_newsPlatform[16] = "baidu";
+
+/* ── 每个源一份缓存（2026-09-25 加）────────────────────────────────────────
+ * master：「各个新闻源应该再记录一下，半小时内更新」。
+ * 所以不能只缓存当前看的那个源 —— 切走再切回就白拉一次。
+ * 每源 NEWS_MAX_ITEMS(12) × (72+256) ≈ 3.9KB，9 个源 ~35KB。
+ * ⚠️ 必须放 PSRAM：内部 DRAM 只剩 ~85KB，35KB 静态数组放进去太贵。
+ *    malloc 失败就退回"不缓存"，功能不受影响。 */
+struct NewsSrcCache {
+  NewsItem items[NEWS_MAX_ITEMS];
+  int      count;
+  uint32_t ts;        /* 上次更新 millis() */
+  bool     used;      /* 这个槽位分配过 */
+};
+static NewsSrcCache* g_newsCache = nullptr;
+static int           g_newsCacheN = 0;
+static bool          g_newsCacheTried = false;
+
+#define NEWS_TTL_MS   (30 * 60 * 1000)   /* 30 分钟内不再联网 */
+
+static void newsCacheInit() {
+  if (g_newsCache || g_newsCacheTried) return;
+  g_newsCacheTried = true;
+  g_newsCacheN = kNewsPlatformCount;
+  /* 8MB PSRAM 里拿 35KB 毫无压力；拿不到就整功能降级，不硬来 */
+  g_newsCache = (NewsSrcCache*)heap_caps_calloc(
+      g_newsCacheN, sizeof(NewsSrcCache), MALLOC_CAP_SPIRAM);
+  Serial.printf("[Browser] news cache: %s (%u B in PSRAM)\n",
+                g_newsCache ? "ok" : "FAILED",
+                (unsigned)(g_newsCacheN * sizeof(NewsSrcCache)));
+}
+
+/* 平台 code -> 缓存槽位下标，-1 = 不在表里 */
+static int newsCacheSlot(const char* code) {
+  if (!g_newsCache || !code) return -1;
+  for (int i = 0; i < kNewsPlatformCount; i++) {
+    if (strcmp(kNewsPlatforms[i].code, code) == 0) return i;
+  }
+  return -1;
+}
+
+/* 有没过期（30 分钟内算新鲜） */
+static bool newsFresh(const char* code) {
+  int s = newsCacheSlot(code);
+  if (s < 0 || !g_newsCache[s].used || g_newsCache[s].count <= 0) return false;
+  if (g_newsCache[s].ts == 0) return false;
+  return (millis() - g_newsCache[s].ts) < NEWS_TTL_MS;
+}
+
+/* 把缓存倒进显示用的 g_news */
+static bool newsLoadFromCache(const char* code) {
+  int s = newsCacheSlot(code);
+  if (s < 0 || !g_newsCache[s].used || g_newsCache[s].count <= 0) return false;
+  int n = g_newsCache[s].count;
+  if (n > NEWS_MAX_ITEMS) n = NEWS_MAX_ITEMS;
+  memcpy(g_news, g_newsCache[s].items, n * sizeof(NewsItem));
+  g_newsCount = n;
+  snprintf(g_newsPlatform, sizeof(g_newsPlatform), "%s", code);
+  Serial.printf("[Browser] news cache hit %s (%d items, age %us)\n",
+                code, n, (unsigned)((millis() - g_newsCache[s].ts) / 1000));
+  return true;
+}
+
+/* 拉完写回缓存 */
+static void newsSaveToCache(const char* code) {
+  int s = newsCacheSlot(code);
+  if (s < 0) return;
+  int n = g_newsCount;
+  if (n > NEWS_MAX_ITEMS) n = NEWS_MAX_ITEMS;
+  if (n <= 0) return;                 /* 失败不留缓存：下次要真重试 */
+  memcpy(g_newsCache[s].items, g_news, n * sizeof(NewsItem));
+  g_newsCache[s].count = n;
+  g_newsCache[s].ts = millis();
+  g_newsCache[s].used = true;
+}
+
+/* 上次更新距今多久，给 UI 显示用（返回秒） */
+static uint32_t newsAgeSec(const char* code) {
+  int s = newsCacheSlot(code);
+  if (s < 0 || !g_newsCache[s].used || g_newsCache[s].ts == 0) return 0;
+  return (millis() - g_newsCache[s].ts) / 1000;
+}
+
+/* 每天自动刷一次：记录"当天已自动刷过"的日期（YYYYMMDD） */
+static uint32_t g_newsAutoDay = 0;
 static volatile int g_fetchKind = 0;   /* 0=网页 1=新闻 */
 #define FETCH_WEB  0
 #define FETCH_NEWS 1
@@ -530,6 +614,8 @@ void fetch_task(void *param) {
        复用这个常驻任务，省掉再开一个任务栈（任务栈只能从 DRAM 分配）。 */
     if (g_fetchKind == FETCH_NEWS) {
       g_newsCount = news_fetch(g_newsPlatform, g_news, NEWS_MAX_ITEMS);
+      /* 拉完立刻写回该源的缓存槽，下次 30 分钟内就不用联网了 */
+      if (g_newsCount > 0) newsSaveToCache(g_newsPlatform);
       Serial.printf("[Browser] news %s -> %d items, DRAM free=%u\n",
                     g_newsPlatform, g_newsCount,
                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -707,11 +793,30 @@ static String urlEncode(const String& s) {
   return out;
 }
 
+/* ⚠️ 这两个**必须定义在 startNews 之前**：缓存命中分支也要走 UI_PEND 通道
+   重建首页。原来定义在文件后面（下载管理那节），startNews 看不见。 */
+enum PendingUiKind { UI_PEND_NONE = 0, UI_PEND_SEARCH, UI_PEND_DOWNLOADS };
+static volatile int g_uiPendingKind = UI_PEND_NONE;
+
+/* 搜索引擎（master 2026-09-25：必应之外再加 360）
+   实测：www.so.com/s?q=  -> 200 / 449KB，能正常打开。
+   ⚠️ 必应必须用桌面 Chrome120 UA（移动 UA 只给 5 条、无分页），
+      这条规矩在 browser_engine 那边，别动。 */
+struct SearchEngine { const char* name; const char* tpl; };
+static const SearchEngine kEngines[] = {
+    {"必应", "https://cn.bing.com/search?q="},
+    {"360",  "https://www.so.com/s?q="},
+    {"百度", "https://www.baidu.com/s?word="},
+};
+static const int kEngineCount = (int)(sizeof(kEngines) / sizeof(kEngines[0]));
+static int g_engineIdx = 0;
+
 static void startSearch(const String& q) {
   String enc = urlEncode(q);
   if (!enc.length()) return;
-  String url = String("https://cn.bing.com/search?q=") + enc;
-  Serial.printf("[Search] \"%s\" -> %s\n", q.c_str(), url.c_str());
+  String url = String(kEngines[g_engineIdx].tpl) + enc;
+  Serial.printf("[Search] \"%s\" via %s -> %s\n", q.c_str(),
+                kEngines[g_engineIdx].name, url.c_str());
   if (g_searchKb && lv_obj_is_valid(g_searchKb))
     lv_obj_add_flag(g_searchKb, LV_OBJ_FLAG_HIDDEN);
   ime_hide();
@@ -728,13 +833,38 @@ static void search_go_cb(lv_event_t* e) {
   startSearch(String(q));
 }
 
+/* 切换搜索引擎：切完当场重画搜索首页（行的重建走 UI_PEND 通道，别在回调里 clean） */
+static void engine_switch_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  g_engineIdx = (g_engineIdx + 1) % kEngineCount;
+  Serial.printf("[Search] engine -> %s\n", kEngines[g_engineIdx].name);
+  toast((String("搜索引擎：") + kEngines[g_engineIdx].name).c_str());
+  g_uiPendingKind = UI_PEND_SEARCH;
+}
+
 /* ── 热点新闻：起后台任务拉一个平台 ── */
-static void startNews(const char* platform) {
+static void startNews(const char* platform, bool force = false) {
   if (g_state == BROWSER_LOADING) { toast("正在加载，请稍等"); return; }
   ensureFetchTask();
   if (!g_fetchTask) return;
 
   snprintf(g_newsPlatform, sizeof(g_newsPlatform), "%s", platform);
+
+  /* 30 分钟内的重复点击：直接用缓存画出来，不再打一次网络（master 2026-09-25）。
+     想强制刷新就点底部的「更新」按钮（news_refresh_cb）。 */
+  if (!force && newsFresh(platform)) {
+    if (newsLoadFromCache(platform)) {
+      g_state = BROWSER_LOADED;
+      g_currentUrl = "";
+      g_fetchKind = FETCH_WEB;
+      if (g_urlArea && lv_obj_is_valid(g_urlArea))
+        lv_label_set_text(g_urlArea, "热点新闻");
+      toast("已是最新");
+      g_uiPendingKind = UI_PEND_SEARCH;
+      return;
+    }
+  }
+
   /* ⚠️ 必须清停止标志 —— 这是"换了源却永远显示上一个源"的根因：
      g_stopRequested 只有 startFetch / tick 会清，而退出浏览器
      (BrowserScreen_close) 会把它置 true 且不再走那两处。于是下一次
@@ -752,6 +882,14 @@ static void startNews(const char* platform) {
   updateNavButtons();
   ScreenSaver::setSuppressed(true);
   xTaskNotifyGive(g_fetchTask);
+}
+
+/* 底部「更新」：强制刷新当前源（跳过 30 分钟节流）。
+   ⚠️ 回调里只调 startNews，真正的重建走 tick 通道（老规矩）。 */
+static void news_refresh_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  Serial.printf("[Browser] news refresh (force): %s\n", g_newsPlatform);
+  startNews(g_newsPlatform, true);
 }
 
 static void news_platform_cb(lv_event_t* e) {
@@ -955,6 +1093,7 @@ static void showSearchHome() {
   /* 诊断：这条日志是"浏览器有没有显示初始页"的判据。
      退出浏览器再进、如果这里不打，就是 g_firstLoad 没被重置。 */
   Serial.println("[Browser] showSearchHome");
+  newsCacheInit();   /* 多源缓存槽（PSRAM），只初始化一次 */
   if (!g_content || !lv_obj_is_valid(g_content)) return;
   hideLoadingOverlay();
   if (g_searchKb) lv_obj_add_flag(g_searchKb, LV_OBJ_FLAG_HIDDEN);
@@ -991,6 +1130,14 @@ static void showSearchHome() {
   lv_obj_add_event_cb(g_searchTa, ime_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
   lv_obj_t* go = makeChipBtn(row, "搜索", search_go_cb, NULL);
+
+  /* 搜索引擎切换：点一下换下一个（必应 -> 360 -> 百度 -> …），
+     名字旁显示当前引擎，选中态白底黑字。 */
+  lv_obj_t* eb = makeChipBtn(row, kEngines[g_engineIdx].name,
+                             engine_switch_cb, NULL);
+  lv_obj_set_size(eb, 68, 36);
+  lv_obj_set_style_bg_color(eb, lv_color_hex(0x2a2a2a), 0);
+  lv_obj_set_style_border_color(eb, lv_color_hex(0xFFD700), 0);
   lv_obj_set_size(go, 96, 40);
 
   /* 搜索引擎固定必应 —— 百度因体积与反爬已弃用（见文件头注释），不再给切换入口 */
@@ -1006,6 +1153,27 @@ static void showSearchHome() {
   for (int i = 0; i < 5; i++)
     makeChipBtn(pRow, kPresets[i], preset_cb, (void*)kPresets[i]);
 
+  /* ── 进页面自动拉一次（master 2026-09-25）──
+     规则：首次进（或当天还没自动刷过）就拉默认源 kNewsPlatforms[0]（豆瓣）。
+     ⚠️ 判断"当天"要用真实日期（NTP 校准后），不能用 millis()
+        —— millis 只有开机时长，重启就白记了。拿不到时间就退化为每次进都拉。 */
+  if (g_newsCount <= 0) {
+    time_t now = 0;
+    struct tm tmv;
+    time(&now);
+    uint32_t day = 0;
+    if (now > 1000000000 && localtime_r(&now, &tmv)) {
+      day = (uint32_t)((tmv.tm_year + 1900) * 10000 + (tmv.tm_mon + 1) * 100 +
+                       tmv.tm_mday);
+    }
+    if (day == 0 || day != g_newsAutoDay) {
+      g_newsAutoDay = day;
+      Serial.printf("[Browser] news auto-fetch day=%u src=%s\n", day,
+                    kNewsPlatforms[0].code);
+      startNews(kNewsPlatforms[0].code);
+    }
+  }
+
   /* ── 热点新闻（news.orz.ai）──
      平台 chip 点了会起后台任务；条目点了打开原文。数据来自 g_news，
      搜索首页每次重建时都重画一遍 —— 所以不用管"刷新后 UI 怎么更新"。 */
@@ -1016,19 +1184,81 @@ static void showSearchHome() {
 
   lv_obj_t* npRow = makeRow(g_content, true);
   for (int i = 0; i < kNewsPlatformCount; i++) {
-    lv_obj_t* b = makeChipBtn(npRow, kNewsPlatforms[i].name, news_platform_cb,
-                              (void*)kNewsPlatforms[i].code);
+    const NewsPlatform& np = kNewsPlatforms[i];
+    lv_obj_t* b = lv_btn_create(npRow);
     lv_obj_set_size(b, 76, 36);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x1a1a1a), 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x333333), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(b, 8, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(0x444444), 0);
+    lv_obj_set_flex_flow(b, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(b, 2, 0);
+    lv_obj_add_event_cb(b, news_platform_cb, LV_EVENT_CLICKED,
+                        (void*)np.code);
+
+    lv_obj_t* lb = lv_label_create(b);
+    lv_label_set_text(lb, np.name);
+    lv_obj_set_style_text_color(lb, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lb, &font_zh_16, 0);
+
+    /* 已验证能打开看的源 -> 名字后跟一颗金色小星星（master 2026-09-25）。
+       ⚠️ 星星单独一个 label：选中态要把**文字**刷成黑色，
+          而星星"选中的时候也是金色"，不能跟着变。 */
+    if (np.verified) {
+      lv_obj_t* st = lv_label_create(b);
+      lv_label_set_text(st, "*");
+      lv_obj_set_style_text_color(st, lv_color_hex(0xFFD700), 0);
+      lv_obj_set_style_text_font(st, &font_zh_16, 0);
+    }
+
     /* 当前正在看的源 -> 白底黑字（选中态）。
        master 2026-09-25：「正在被选中的热点新闻应该有一个高亮」——
        不然点完根本看不出列表是哪个源的。g_newsCount<=0 表示还没拉过，不高亮。 */
-    if (g_newsCount > 0 && strcmp(g_newsPlatform, kNewsPlatforms[i].code) == 0) {
+    if (g_newsCount > 0 && strcmp(g_newsPlatform, np.code) == 0) {
       lv_obj_set_style_bg_color(b, lv_color_white(), 0);
       lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
       lv_obj_set_style_border_color(b, lv_color_white(), 0);
-      lv_obj_t* lb = lv_obj_get_child(b, 0);
-      if (lb) lv_obj_set_style_text_color(lb, lv_color_black(), 0);
+      lv_obj_set_style_text_color(lb, lv_color_black(), 0);
     }
+  }
+
+  /* ── 更新按钮 + 上次更新时间 ──
+     master：「在底部留一个更新按钮，点击之后才会主动更新这个新闻源」。
+     默认 30 分钟内不会重复联网，所以要强制刷新就点它。 */
+  {
+    lv_obj_t* ur = lv_obj_create(g_content);
+    lv_obj_set_width(ur, lv_pct(100));
+    lv_obj_set_height(ur, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(ur, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ur, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(ur, 8, 0);
+    lv_obj_clear_flag(ur, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(ur, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ur, 0, 0);
+    lv_obj_set_style_pad_all(ur, 0, 0);
+
+    lv_obj_t* rb = makeChipBtn(ur, "更新", news_refresh_cb, NULL);
+    lv_obj_set_size(rb, 72, 32);
+
+    lv_obj_t* tl = lv_label_create(ur);
+    uint32_t age = newsAgeSec(g_newsPlatform);
+    if (g_newsCount > 0 && age) {
+      char t[40];
+      if (age < 60) snprintf(t, sizeof(t), "%s · 刚刚更新", g_newsPlatform);
+      else if (age < 3600) snprintf(t, sizeof(t), "%s · %u 分钟前更新",
+                                    g_newsPlatform, (unsigned)(age / 60));
+      else snprintf(t, sizeof(t), "%s · %u 小时前更新",
+                    g_newsPlatform, (unsigned)(age / 3600));
+      lv_label_set_text(tl, t);
+    } else {
+      lv_label_set_text(tl, "每 30 分钟更新一次");
+    }
+    lv_obj_set_style_text_color(tl, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_font(tl, &font_zh_16, 0);
   }
 
   lv_obj_t* box = lv_obj_create(g_content);
@@ -1098,10 +1328,8 @@ static void showSearchHome() {
  * ═══════════════════════════════════════════════════════════════════════════ */
 #define MAX_DL_ROWS 14
 
-enum PendingUiKind { UI_PEND_NONE = 0, UI_PEND_SEARCH, UI_PEND_DOWNLOADS };
-
-/* 自建 UI 之间的跳转：延迟到下一 tick 执行（理由见上） */
-static volatile int g_uiPendingKind = UI_PEND_NONE;
+/* 自建 UI 之间的跳转：延迟到下一 tick 执行（理由见上）
+   ⚠️ PendingUiKind / g_uiPendingKind 已移到文件前部（startNews 要用） */
 static char g_dlPendingPath[64] = {0};   /* 待离线打开的下载文件 */
 
 static void showDownloadsHome();   /* 下面会用到（定义在最后） */

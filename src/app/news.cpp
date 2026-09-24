@@ -24,10 +24,19 @@
 #define NEWS_HOST "news.orz.ai"
 #define NEWS_BUF_BYTES 65536
 
+/* 顺序 = 已验证可打开的在前，打不开的垫底。
+   2026-09-25 实测：豆瓣 / 36氪 / 掘金 / GitHub / HN / 百度 / B站 的前 4 条
+   链接全部 200 能打开；知乎全部 403（反爬），排最后且不给星。 */
 const NewsPlatform kNewsPlatforms[] = {
-    {"baidu", "百度"},   {"weibo", "微博"},   {"zhihu", "知乎"},
-    {"36kr", "36氪"},    {"bilibili", "B站"}, {"juejin", "掘金"},
-    {"github", "GitHub"}, {"hackernews", "HN"}, {"douban", "豆瓣"},
+    {"douban",     "豆瓣",    true},
+    {"36kr",       "36氪",    true},
+    {"juejin",     "掘金",    true},
+    {"github",     "GitHub",  true},
+    {"hackernews", "HN",      true},
+    {"baidu",      "百度",    true},
+    {"bilibili",   "B站",     true},
+    {"weibo",      "微博",    false},
+    {"zhihu",      "知乎",    false},
 };
 const int kNewsPlatformCount =
     (int)(sizeof(kNewsPlatforms) / sizeof(kNewsPlatforms[0]));

@@ -1,5 +1,6 @@
 #include "settings.h"
 #include "settings_menu.h"
+#include "weather_screen.h"
 #include "settings_store.h"
 #include "nav.h"
 #include "status_bar.h"
@@ -381,6 +382,22 @@ void anim_toggle_cb(lv_event_t* e) {
   settings_menu_refresh_values();
 }
 
+/* 天气后台自动更新。⚠️ 这个**立即生效**（不像动画要重启）：
+   关掉就是让常驻任务退回 portMAX_DELAY 睡眠 —— 不轮询、不联网、不占 CPU，
+   是真正的"完全停止"（master 2026-09-25 的要求）。 */
+const char* wxAutoValue() {
+  static char b[24];
+  snprintf(b, sizeof(b), "%s", WeatherScreen_auto() ? "每小时" : "已停止");
+  return b;
+}
+void wxauto_toggle_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
+  bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  WeatherScreen_setAuto(on);
+  settings_menu_refresh_values();
+}
+
 }  // namespace
 
 lv_obj_t* SettingsScreen_create() {
@@ -439,6 +456,7 @@ lv_obj_t* SettingsScreen_create() {
     siReadOnly("时间源", timeSrcValue),
     siToggle("自动校时", false, autosync_cb),
     siAction("校准时间", calib_event_cb),
+    siToggle("天气后台更新", true, wxauto_toggle_cb, wxAutoValue),
     siNav("触摸校准", "touch"),
     siAction("系统信息", sysinfo_event_cb),
     siAction("后台管理", taskmgr_event_cb),
@@ -477,6 +495,7 @@ lv_obj_t* SettingsScreen_create() {
   displayItems[1].vinit = (int)(SettingsStore::idleMs() / 1000);
   displayItems[2].checked = SettingsStore::animEnabled();   /* 动画开关 */
   systemItems[1].checked = SettingsStore::autoSync();
+  systemItems[3].checked = WeatherScreen_auto();   /* 天气后台更新 */
 
   refreshStorageBufs();
   settings_menu_begin(scr, bar, pages, 7, "root");

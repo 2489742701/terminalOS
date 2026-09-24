@@ -205,4 +205,39 @@ void listDir(const char* path, int depth) {
   root.close();
 }
 
+bool writeFile(const char* path, const String& data) {
+  if (!g_mounted || !path) return false;
+  /* 建父目录：/gt/weather.json -> 先 mkdir /gt */
+  const char* slash = strrchr(path, '/');
+  if (slash && slash > path) {
+    char dir[64];
+    int n = (int)(slash - path);
+    if (n >= (int)sizeof(dir)) n = (int)sizeof(dir) - 1;
+    memcpy(dir, path, (size_t)n);
+    dir[n] = '\0';
+    if (!SD.exists(dir)) SD.mkdir(dir);
+  }
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return false;
+  size_t w = f.write((const uint8_t*)data.c_str(), data.length());
+  f.close();
+  return w == data.length();
+}
+
+bool readFile(const char* path, String& out) {
+  if (!g_mounted || !path) return false;
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  out = "";
+  while (f.available()) {
+    char buf[256];
+    int n = f.read((uint8_t*)buf, sizeof(buf) - 1);
+    if (n <= 0) break;
+    buf[n] = '\0';
+    out += buf;
+  }
+  f.close();
+  return out.length() > 0;
+}
+
 }  // namespace SDCard

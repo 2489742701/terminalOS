@@ -13,6 +13,7 @@ extern lv_obj_t* nav_memory;
 extern lv_obj_t* nav_2048;     // 2048（游戏栏目）
 extern lv_obj_t* nav_sysinfo;
 extern lv_obj_t* nav_weather;
+extern lv_obj_t* nav_calendar;
 extern lv_obj_t* nav_games;    // 游戏栏目：贪吃蛇 / 记忆卡牌 / 2048
 extern lv_obj_t* nav_desktop;  // 桌面图标管理（设置里进入）
 extern lv_obj_t* nav_taskmgr;  // 后台管理（任务管理器）
