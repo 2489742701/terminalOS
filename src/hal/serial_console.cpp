@@ -56,7 +56,7 @@ static void printHelp() {
   Serial.println("=== Serial Console Commands ===");
   Serial.println("help              - show this help");
   Serial.println("nav <screen>      - navigate to screen");
-  Serial.println("  screens: launcher clock settings wifi game browser draw memory sysinfo weather games desktop");
+  Serial.println("  screens: launcher clock settings wifi game browser draw memory sysinfo weather games desktop taskmgr");
   Serial.println("browser <url>     - open browser and load URL");
   Serial.println("vp <width>|vp 0   - browser layout viewport (0=auto, read <meta viewport>)");
   Serial.println("flat on|off       - browser 平铺排版 on=不建容器全部平铺 off=还原CSS版面");
@@ -74,6 +74,14 @@ Serial.println("serve|servestop   - 把已存页面用 HTTP 共享出去（PC �
   Serial.println("perf [n] [h]        - h=只脏顶部 h 行（局部刷新），默认 480=整屏");
   Serial.println("reboot            - restart device");
   Serial.println("version           - show version info");
+  Serial.println("news [platform]   - 拉热点新闻(news.orz.ai), 省略则 baidu");
+  Serial.println("bnews [platform]  - 走 UI 路径拉热点(后台任务 + 重绘, 验渲染不崩)");
+  Serial.println("ime <pinyin>      - 中文输入法验证, 如 ime zhong");
+  Serial.println("weather           - 建天气屏 + 拉一次, 打印 HTTP 码和返回体");
+  Serial.println("geo|geo reset     - IP 定位; reset = 清缓存强制重定位");
+  Serial.println("geotest           - 设备侧实测各反向 geocoding 源(选源用)");
+  Serial.println("sd [path] [depth] - TF 卡探测/列目录(懒挂载, 不敲就不碰 SPI)");
+  Serial.println("sdbench [KB]      - TF 卡读写速度实测, 默认 256KB");
   Serial.println("time              - show uptime");
   Serial.println("===============================");
 }
