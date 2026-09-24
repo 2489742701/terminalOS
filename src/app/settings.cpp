@@ -169,8 +169,14 @@ void setStatus(const char* s) {
   if (g_statusLab && lv_obj_is_valid(g_statusLab)) lv_label_set_text(g_statusLab, s);
 }
 
+/* 左边缘滑入 = 返回。⚠️ 不能直接回桌面：设置是多级菜单，
+   在二级页滑一下应该回一级（settings_menu_back 内部按 depth 处理，
+   depth==0 时才回桌面）。swipe_back_act 要 void(*)() 的裸函数指针，
+   settings_menu_back 是 lv_event_cb_t（e 恒为 nullptr），这里包一层。 */
+static void settings_back_action() { settings_menu_back(nullptr); }
+
 void swipe_cb(lv_event_t* e) {
-  swipe_detect(e, g_swipe, nav_launcher, SWIPE_H, false, 40);
+  swipe_back_act_any(e, g_swipe, settings_back_action);
 }
 
 /* 跳到另一屏（系统设置里的诊断入口统一走这里）。
@@ -354,6 +360,27 @@ void brightness_cb(lv_event_t* e) {
   SettingsStore::saveBrightness(val);
 }
 
+/* 动画开关。⚠️ **重启才生效**：只写 NVS，不改运行中的 g_uiAnim ——
+   半路改会让"已经在飞的动画"和"新动画"表现不一致（详见 settings_store.h）。
+   右侧文字给出当前生效值，让用户知道改完还得重启。 */
+const char* animValue() {
+  static char b[24];
+  bool stored = SettingsStore::animEnabled();   // 下次开机会生效的值
+  /* 跟当前生效值(g_uiAnim)不一致才提示重启 —— 不然每次都挂着"重启生效"很吵 */
+  snprintf(b, sizeof(b), "%s%s", stored ? "开" : "关",
+           stored == g_uiAnim ? "" : " · 重启生效");
+  return b;
+}
+void anim_toggle_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  lv_obj_t* sw = (lv_obj_t*)lv_event_get_target(e);
+  bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  SettingsStore::saveAnim(on);
+  Serial.printf("[Settings] anim=%d (重启后生效，当前生效值=%d)\n", (int)on,
+                (int)g_uiAnim);
+  settings_menu_refresh_values();
+}
+
 }  // namespace
 
 lv_obj_t* SettingsScreen_create() {
@@ -386,6 +413,7 @@ lv_obj_t* SettingsScreen_create() {
   static SettingsItem displayItems[] = {
     siSlider("亮度", 5, 100, 100, brightness_cb),
     siSlider("息屏超时", 0, 600, 300, idle_slider_cb, idleValue),
+    siToggle("动画效果", true, anim_toggle_cb, animValue),
     siAction("立即息屏", sleep_event_cb),
     siAction("桌面图标", desktop_event_cb),
     siEnd(),
@@ -447,6 +475,7 @@ lv_obj_t* SettingsScreen_create() {
      不再用 s_brightness 这类局部静态 —— 否则每次进设置页都跳回代码默认值。 */
   displayItems[0].vinit = SettingsStore::brightness();
   displayItems[1].vinit = (int)(SettingsStore::idleMs() / 1000);
+  displayItems[2].checked = SettingsStore::animEnabled();   /* 动画开关 */
   systemItems[1].checked = SettingsStore::autoSync();
 
   refreshStorageBufs();

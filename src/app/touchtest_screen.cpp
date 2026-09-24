@@ -158,7 +158,7 @@ lv_obj_t* mkBtn(lv_obj_t* scr, const char* txt, lv_event_cb_t cb, int x, int y, 
    另外底部那颗「返回」按钮是明路，不依赖手势。 */
 void swipe_cb(lv_event_t* e) {
   static SwipeState st;
-  swipe_detect(e, st, nav_launcher, SWIPE_H, false, 40);
+  swipe_back_to(e, st, nav_launcher);
 }
 
 }  // namespace

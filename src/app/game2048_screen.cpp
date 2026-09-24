@@ -43,6 +43,8 @@ lv_obj_t* g_labs[N][N];
 lv_obj_t* g_scoreLab = nullptr;
 lv_obj_t* g_bestLab = nullptr;
 lv_obj_t* g_msgLab = nullptr;
+SwipeState g_backSwipe;   /* 边缘返回专用（与走棋的 g_startX/Y 分开，互不干扰） */
+bool g_backFired = false; /* 本次手势已被"返回"消费掉 -> RELEASED 不再走棋 */
 int g_startX = 0, g_startY = 0;
 
 /* 值 -> 底色 / 字色。整体压暗，跟整机黑底一套语言（白底亮色块在这个屏上很刺眼） */
@@ -186,6 +188,28 @@ void renderAll() {
     for (int c = 0; c < N; c++) renderCell(r, c);
 }
 
+/* ── 走子动画（master 2026-09-25：2048 太"硬"）─────────────────────────
+ * 值变了的格子（合并出来的 + 新生成的）弹一下：62% -> 100%，带一点点回弹。
+ * 只动 style 的 transform_zoom，不新建对象 —— 这个屏常驻时要省 DRAM。
+ * ⚠️ 关动画时必须把 zoom 复位成 256：上一次动画可能停在中间值，
+ *    不复位的话格子会一直缩着。 */
+static void zoom_exec(void* obj, int32_t v) {
+  lv_obj_set_style_transform_zoom((lv_obj_t*)obj, (lv_coord_t)v, 0);
+}
+static void popCell(int r, int c) {
+  lv_obj_t* box = g_cells[r][c];
+  if (!box || !lv_obj_is_valid(box)) return;
+  if (!ui_anim()) { lv_obj_set_style_transform_zoom(box, 256, 0); return; }
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, box);
+  lv_anim_set_exec_cb(&a, zoom_exec);
+  lv_anim_set_values(&a, 160, 256);
+  lv_anim_set_time(&a, 190);
+  lv_anim_set_path_cb(&a, lv_anim_path_overshoot);
+  lv_anim_start(&a);
+}
+
 /* 中央提示：空串 = 隐藏。不隐藏的话那块半透明底板会一直压在棋盘上 */
 void setMsg(const char* t) {
   if (!g_msgLab) return;
@@ -229,11 +253,18 @@ void resetGame() {
 
 void doMove(int dir) {
   if (g_over) return;
+  int prev[N][N];
+  memcpy(prev, g_board, sizeof(prev));
   if (!moveBoard(dir)) return;      // 没动就不生成新块（否则原地滑也能刷出块）
   spawn();
   updateScoreLab();
   saveBest();
   renderAll();
+
+  /* 弹一下所有"变了"的格子：合并出来的（值变大）和新生成的（原来是 0） */
+  for (int r = 0; r < N; r++)
+    for (int c = 0; c < N; c++)
+      if (g_board[r][c] != 0 && g_board[r][c] != prev[r][c]) popCell(r, c);
 
   if (!g_won && maxTile() >= 2048) {
     g_won = true;
@@ -258,21 +289,25 @@ void back_cb(lv_event_t* e) {
 
 void swipe_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_PRESSED) g_backFired = false;
+  /* ① 左边缘滑入返回 —— 用统一手势（nav.h::swipe_back_detect）。
+     触发后置 g_backFired，RELEASED 时不再把它当成走棋。 */
+  if (swipe_back_detect(e, g_backSwipe)) {
+    g_backFired = true;
+    nav_go_anim(nav_games_or_home(), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300);
+    return;
+  }
   if (code == LV_EVENT_PRESSED) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
     g_startX = p.x;
     g_startY = p.y;
   } else if (code == LV_EVENT_RELEASED) {
+    if (g_backFired) return;      // 这次手势是"返回"，不是走棋
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
     int dx = p.x - g_startX, dy = p.y - g_startY;
 
-    /* 左边缘右滑 = 返回（与贪吃蛇同一套手势） */
-    if (g_startX < 40 && dx > 40) {
-      nav_go_anim(nav_games_or_home(), LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
-      return;
-    }
     if (abs(dx) < 24 && abs(dy) < 24) return;   // 当成点击，不走棋
     if (abs(dx) > abs(dy)) doMove(dx > 0 ? MV_RIGHT : MV_LEFT);
     else                   doMove(dy > 0 ? MV_DOWN : MV_UP);
@@ -310,6 +345,7 @@ lv_obj_t* Game2048Screen_create() {
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSED, NULL);
+  lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);   /* 边缘返回要在移动中判定 */
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
   StatusBar_create(scr, "2048");

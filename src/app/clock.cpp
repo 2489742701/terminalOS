@@ -124,7 +124,7 @@ void clockTimer_cb(lv_timer_t* t) {
 }
 
 void swipe_cb(lv_event_t* e) {
-  swipe_detect(e, g_swipe, nav_launcher);
+  swipe_back_to_any(e, g_swipe, nav_launcher);
 }
 
 }  // namespace

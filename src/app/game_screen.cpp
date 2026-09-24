@@ -47,6 +47,8 @@ lv_obj_t* g_xLine1 = nullptr;
 lv_obj_t* g_xLine2 = nullptr;
 bool g_showX = false;
 SwipeState g_swipe;
+SwipeState g_backSwipe;   /* 边缘返回专用 */
+bool g_backFired = false; /* 本次手势已被"返回"消费掉 */
 int g_tapStartX = 0, g_tapStartY = 0;
 
 void placeFood() {
@@ -216,11 +218,20 @@ void help_cb(lv_event_t* e) {
 
 void swipe_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_PRESSED) g_backFired = false;
+  /* ① 左边缘滑入返回 —— 统一手势。以前这里只看起点 x<40 就返回，
+     没判方向（其实往左滑也会返回），现在跟其它屏一致。 */
+  if (swipe_back_detect(e, g_backSwipe)) {
+    g_backFired = true;
+    nav_go_anim(nav_games_or_home(), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300);
+    return;
+  }
   if (code == LV_EVENT_PRESSED) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
     g_tapStartX = p.x; g_tapStartY = p.y;
   } else if (code == LV_EVENT_RELEASED) {
+    if (g_backFired) return;      // 这次手势是"返回"，不是转向
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
     int dx = p.x - g_tapStartX, dy = p.y - g_tapStartY;
@@ -236,9 +247,6 @@ void swipe_cb(lv_event_t* e) {
       }
       return;
     }
-    if (g_tapStartX < 40) {
-      nav_go_anim(nav_games_or_home(), LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
-    }
   }
 }
 
@@ -253,6 +261,7 @@ lv_obj_t* GameScreen_create() {
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSED, NULL);
+  lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);   /* 边缘返回要在移动中判定 */
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
   StatusBar_create(scr, "贪吃蛇");

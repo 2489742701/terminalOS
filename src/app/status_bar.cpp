@@ -1,6 +1,7 @@
 #include "status_bar.h"
 #include "icons.h"
 #include "nav.h"
+#include "app_registry.h"
 #include "font_zh.h"
 #include "../hal/battery.h"
 #include "../config/pins.h"
@@ -15,6 +16,31 @@ constexpr int BAR_H = 28;
 /* 右上角图标尺寸。22 的 WiFi 放在 28 高的栏里还有 3px 上下留白，正好。 */
 constexpr int WIFI_ICON_SIZE = 22;
 constexpr int BT_ICON_SIZE = 18;
+
+/* ── 后台指示：一排真实应用图标 ───────────────────────────────────────────
+ * 以前是「一个 Tasks 方块 + 一个数字」，看不出到底是谁在后台。
+ * 现在把真在跑的应用图标一字排开（master 2026-09-25），放不下才用 "+N" 收尾。
+ *
+ * ⚠️ 尺寸是被**顶部空间**卡出来的，不是随手定的（实测坐标，不是估算）：
+ *   顶栏 480 宽，中间时间标签实测占 x 211..269。图标行从 x=38 开始
+ *   （电池 22 + padding），所以最多能占到 ~205。
+ *   18px 图标 + 3px 间距 → 7 个 = 144，行尾 x≈182，离时间还有 ~29px 余量。
+ *   再往上加数量/尺寸就会压到时间 —— 想放宽先缩电池或供电文本，
+ *   别直接改 TASK_MAX_ICONS。改完用串口看 `[StatusBar] tasks ... row x a..b`
+ *   确认 b < 205。 */
+constexpr int TASK_MAX_ICONS = 7;
+constexpr int TASK_ICON_SIZE = 18;
+constexpr int TASK_ICON_GAP = 3;
+
+/* Activity 名 → 图标。注册表里没有的（如 touchtest）用通用图标兜底。 */
+Icon taskIconFor(const char* id) {
+  int idx = appreg_find(id);
+  if (idx >= 0) {
+    const AppEntry* e = appreg_at(idx);
+    if (e) return e->icon;
+  }
+  return Icon::Switch;
+}
 
 /* ── 状态栏注册表（不再用单组全局指针）───────────────────────────────────
  * 以前是一组 g_bar/g_fpsLabel/... 全局变量 + 每次 StatusBar_create() 都
@@ -38,8 +64,12 @@ struct Bar {
   lv_obj_t* time;
   lv_obj_t* wifi;
   lv_obj_t* bt;
-  lv_obj_t* tasks;    /* 后台运行指示（只在桌面顶栏有） */
-  lv_obj_t* taskCnt;  /* 后台数量文本 */
+  /* 后台运行指示（只在桌面顶栏有）：一排应用图标，末尾可选 "+N" */
+  lv_obj_t* taskRow;
+  lv_obj_t* taskIcons[TASK_MAX_ICONS];
+  Icon      taskIconType[TASK_MAX_ICONS];
+  lv_obj_t* taskMore;   /* "+N" 溢出标签 */
+  int       taskShown;  /* -1 = 还没画过，强制首帧重画一次 */
   int wifiLevel;      /* -1 = 还没画过，强制首帧画一次 */
 };
 
@@ -52,8 +82,10 @@ Bar* allocBar() {
       s_bars[i].time = nullptr;
       s_bars[i].wifi = nullptr;
       s_bars[i].bt = nullptr;
-      s_bars[i].tasks = nullptr;
-      s_bars[i].taskCnt = nullptr;
+      s_bars[i].taskRow = nullptr;
+      for (int k = 0; k < TASK_MAX_ICONS; k++) s_bars[i].taskIcons[k] = nullptr;
+      s_bars[i].taskMore = nullptr;
+      s_bars[i].taskShown = -1;   /* -1 = 强制首帧画一次 */
       s_bars[i].wifiLevel = -1;   /* -1 = 强制首帧画一次 */
       s_bars[i].backCb = nullptr;
       return &s_bars[i];
@@ -67,16 +99,21 @@ void bar_delete_cb(lv_event_t* e) {
   lv_obj_t* obj = lv_event_get_target(e);
   for (int i = 0; i < MAX_BARS; i++) {
     if (s_bars[i].bar == obj) {
-      /* 聚合初始化只给到 wifiLevel 之前的字段，新增字段（tasks/taskCnt）
-         会值初始化为 nullptr —— 但聚合列表必须跟着字段顺序写全，漏一个就
-         会把 -1 塞进指针里（编译器会报 invalid conversion）。 */
+      /* Bar 里每次加字段，allocBar 和这里都要跟着补，漏一个就留下悬空指针
+         （定时器每秒都会去写它）。槽位是全局零初始化的，但被复用过的槽位
+         不会自动清零，所以两边都得显式写。 */
       s_bars[i].bar = nullptr;
       s_bars[i].power = nullptr;
       s_bars[i].time = nullptr;
       s_bars[i].wifi = nullptr;
       s_bars[i].bt = nullptr;
-      s_bars[i].tasks = nullptr;
-      s_bars[i].taskCnt = nullptr;
+      s_bars[i].taskRow = nullptr;
+      for (int k = 0; k < TASK_MAX_ICONS; k++) {
+        s_bars[i].taskIcons[k] = nullptr;
+        s_bars[i].taskIconType[k] = Icon::Switch;
+      }
+      s_bars[i].taskMore = nullptr;
+      s_bars[i].taskShown = -1;
       s_bars[i].wifiLevel = -1;
       return;
     }
@@ -177,25 +214,64 @@ void update_cb(lv_timer_t* t) {
     }
     if (b.bt && lv_obj_is_valid(b.bt)) lv_obj_set_style_opa(b.bt, btOpa, 0);
 
-    /* 后台指示：只在桌面顶栏（有 tasks 槽位）更新。
-       没有后台应用时整个指示隐藏 —— master 2026-09-24 定的语义。 */
-    if (b.tasks && lv_obj_is_valid(b.tasks)) {
+    /* 后台指示：只在桌面顶栏（有 taskRow 槽位）更新。
+       「能放几个就放几个」，超过槽位才缩一个出来给 "+N" ——
+       所以 7 个后台 = 7 个图标，8 个后台 = 6 个图标 + "+2"。
+       没有后台应用时整行隐藏（master 2026-09-24 定的语义）。 */
+    if (b.taskRow && lv_obj_is_valid(b.taskRow)) {
       NavRunningInfo infos[16];
       int running = nav_running_list(infos, 16);
-      bool show = running > 0;
-      if (show) {
-        char cb[8];
-        snprintf(cb, sizeof(cb), "%d", running);
-        if (b.taskCnt && lv_obj_is_valid(b.taskCnt)) {
-          lv_label_set_text(b.taskCnt, cb);
-          lv_obj_clear_flag(b.taskCnt, LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_obj_clear_flag(b.tasks, LV_OBJ_FLAG_HIDDEN);
-      } else {
-        lv_obj_add_flag(b.tasks, LV_OBJ_FLAG_HIDDEN);
-        if (b.taskCnt && lv_obj_is_valid(b.taskCnt))
-          lv_obj_add_flag(b.taskCnt, LV_OBJ_FLAG_HIDDEN);
+      int shown = running;
+      int more = 0;
+      if (running > TASK_MAX_ICONS) {
+        shown = TASK_MAX_ICONS - 1;         /* 留最后一格给 "+N" */
+        more = running - shown;
       }
+      for (int k = 0; k < TASK_MAX_ICONS; k++) {
+        lv_obj_t* c = b.taskIcons[k];
+        if (!c || !lv_obj_is_valid(c)) continue;
+        if (k < shown) {
+          Icon ic = taskIconFor(infos[k].id);
+          /* 只在图标真的变了 / 首帧时才重画：每秒无脑 set_type 会白白
+             擦写 7 个画布，多出一堆无谓的重绘区。 */
+          if (b.taskShown < 0 || b.taskIconType[k] != ic) {
+            icon_set_type(c, ic, TASK_ICON_SIZE);
+            b.taskIconType[k] = ic;
+          }
+          lv_obj_clear_flag(c, LV_OBJ_FLAG_HIDDEN);
+        } else {
+          lv_obj_add_flag(c, LV_OBJ_FLAG_HIDDEN);
+        }
+      }
+      /* 后台数量变了才打一次日志：串口 `mem` 之外想看"现在后台是谁/排了多宽"
+         就看这行。rowW 是图标行实际占的宽度，用来盯它别把中间时间挤了
+         （顶栏 480、时间居中约 204..276，所以这一行左起 ~38 时 rowW 要 < 158）。 */
+      if (shown != b.taskShown) {
+        /* ⚠️ 必须先 lv_obj_update_layout 再量：flex 是**惰性**重算的，
+           刚改完 HIDDEN 标志立刻读宽度拿到的是上一帧的旧值（实测恒为 16，
+           一眼看去像"行没撑开"，其实是没重算）。 */
+        lv_obj_update_layout(b.taskRow);
+        lv_area_t ra, ta;
+        lv_obj_get_coords(b.taskRow, &ra);
+        lv_obj_get_coords(b.time, &ta);
+        Serial.printf("[StatusBar] tasks running=%d shown=%d more=%d "
+                      "rowW=%d row x %d..%d (time x %d..%d)\n",
+                      running, shown, more, (int)lv_obj_get_width(b.taskRow),
+                      (int)ra.x1, (int)ra.x2, (int)ta.x1, (int)ta.x2);
+      }
+      b.taskShown = shown;
+      if (b.taskMore && lv_obj_is_valid(b.taskMore)) {
+        if (more > 0) {
+          char mb[8];
+          snprintf(mb, sizeof(mb), "+%d", more);
+          lv_label_set_text(b.taskMore, mb);
+          lv_obj_clear_flag(b.taskMore, LV_OBJ_FLAG_HIDDEN);
+        } else {
+          lv_obj_add_flag(b.taskMore, LV_OBJ_FLAG_HIDDEN);
+        }
+      }
+      if (running > 0) lv_obj_clear_flag(b.taskRow, LV_OBJ_FLAG_HIDDEN);
+      else             lv_obj_add_flag(b.taskRow, LV_OBJ_FLAG_HIDDEN);
     }
   }
 }
@@ -251,7 +327,9 @@ static void back_async_cb(lv_timer_t* t) {
     /* 复用同一个签名：设置页的 handler 忽略 e 即可 */
     cb(nullptr);
   } else {
-    nav_back_home();
+    /* 顶栏返回键：走带动画的版本（以前是一步到位的 nav_back_home，
+       master 2026-09-25 反馈"回退有点僵硬"）。关动画时内部自动退化。 */
+    nav_back_home_anim();
   }
 }
 
@@ -360,17 +438,39 @@ lv_obj_t* StatusBar_createEx(lv_obj_t* parent, const char* title, lv_event_cb_t 
     lv_obj_t* batRoot = icon_create(batBox, Icon::Battery, 22);
     lv_obj_add_flag(batRoot, LV_OBJ_FLAG_EVENT_BUBBLE);
 
-    /* 后台运行指示：有 Activity 在内存里才显示（update_cb 每秒更新可见性） */
-    b->tasks = icon_create(batBox, Icon::Tasks, 20);
-    lv_obj_add_flag(b->tasks, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_add_flag(b->tasks, LV_OBJ_FLAG_HIDDEN);
+    /* 后台运行指示：一排应用图标（update_cb 每秒刷新显隐 + 图标类型）。
+       ⚠️ 图标一开始就全部建好（隐藏），不在每秒的刷新里 create/delete：
+          · create 会在 PSRAM 里新开画布缓冲，反复建删 = 碎片 + 每秒抖动；
+          · 隐藏的对象不参与 flex 布局，所以"少几个"时后面的会自然往前靠。
+       整行初始隐藏，等真的有后台才显示。 */
+    lv_obj_t* row = lv_obj_create(batBox);
+    lv_obj_set_size(row, LV_SIZE_CONTENT, BAR_H);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, TASK_ICON_GAP, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    /* 事件冒泡到 batBox：点图标同样打开后台管理 */
+    lv_obj_add_flag(row, LV_OBJ_FLAG_EVENT_BUBBLE);
+    b->taskRow = row;
 
-    b->taskCnt = lv_label_create(batBox);
-    lv_label_set_text(b->taskCnt, "");
-    lv_obj_set_style_text_color(b->taskCnt, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_set_style_text_font(b->taskCnt, &lv_font_montserrat_14, 0);
-    lv_obj_add_flag(b->taskCnt, LV_OBJ_FLAG_EVENT_BUBBLE);
-    lv_obj_add_flag(b->taskCnt, LV_OBJ_FLAG_HIDDEN);
+    for (int k = 0; k < TASK_MAX_ICONS; k++) {
+      lv_obj_t* c = icon_create(row, Icon::Switch, TASK_ICON_SIZE);
+      lv_obj_add_flag(c, LV_OBJ_FLAG_EVENT_BUBBLE);
+      lv_obj_add_flag(c, LV_OBJ_FLAG_HIDDEN);
+      b->taskIcons[k] = c;
+      b->taskIconType[k] = Icon::Switch;
+    }
+
+    b->taskMore = lv_label_create(row);
+    lv_label_set_text(b->taskMore, "");
+    lv_obj_set_style_text_color(b->taskMore, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_font(b->taskMore, &lv_font_montserrat_14, 0);
+    lv_obj_add_flag(b->taskMore, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(b->taskMore, LV_OBJ_FLAG_HIDDEN);
   }
 
   /* 中：时间 */

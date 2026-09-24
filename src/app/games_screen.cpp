@@ -31,7 +31,7 @@ void back_event_cb(lv_event_t* e) {
 
 void swipe_cb(lv_event_t* e) {
   static SwipeState st;
-  swipe_detect(e, st, nav_launcher, SWIPE_H);
+  swipe_back_to_any(e, st, nav_launcher);
 }
 
 /* 点磁贴：按需创建目标 Activity 后切屏。

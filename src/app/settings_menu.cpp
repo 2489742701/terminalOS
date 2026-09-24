@@ -27,6 +27,33 @@ int s_valCount = 0;
 lv_timer_t* s_renderTimer = nullptr;
 const char* s_pendingPage = nullptr;
 
+/* 切页动画的方向：true = 往里进（下级页从右边滑入），false = 往回退（上级页
+   从左边滑入）。master 2026-09-25：设置页和二级菜单切得太"硬"。
+   ⚠️ 用 x 位移而不是 lv_scr_load_anim：二级菜单是**同一个屏**换数据源，
+      没有第二个 screen 可以切。 */
+bool s_animForward = true;
+
+static void slide_exec(void* obj, int32_t v) {
+  lv_obj_set_x((lv_obj_t*)obj, (lv_coord_t)v);
+}
+static void animatePageIn() {
+  if (!g_uiAnim) return;
+  if (!s_container || !lv_obj_is_valid(s_container)) return;
+  /* 容器基准位置 x=12（见 settings_menu_begin 里的 set_pos），
+     所以位移是 12 ± 80 -> 12。写死 0 会把容器甩到屏幕最左边。 */
+  int base = 12;
+  int from = base + (s_animForward ? 80 : -80);
+  lv_obj_set_x(s_container, from);
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, s_container);
+  lv_anim_set_exec_cb(&a, slide_exec);
+  lv_anim_set_values(&a, from, base);
+  lv_anim_set_time(&a, 200);
+  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+  lv_anim_start(&a);
+}
+
 /* 前向声明：renderPage 里要给行挂 row_click_cb / 要调 requestRender */
 void row_click_cb(lv_event_t* e);
 void requestRender(const char* id);
@@ -101,6 +128,19 @@ void renderPage(const char* id) {
       lv_obj_add_event_cb(sw, it->cb, LV_EVENT_VALUE_CHANGED, NULL);
       lv_obj_add_flag(sw, LV_OBJ_FLAG_EVENT_BUBBLE);
       if (it->checked) lv_obj_add_state(sw, LV_STATE_CHECKED);
+      /* 带 valueFn 时在开关左边显示说明文字（比如"重启生效"）——
+         开关自己只能表达开/关，说不清"改完还得重启"。 */
+      if (it->valueFn && s_valCount < MAX_ROWS) {
+        lv_obj_t* valLab = lv_label_create(row);
+        lv_label_set_text(valLab, it->valueFn());
+        lv_obj_set_style_text_color(valLab, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(valLab, &font_zh_16, 0);
+        lv_obj_align(valLab, LV_ALIGN_RIGHT_MID, -(16 + 50 + 12), 0);
+        lv_obj_add_flag(valLab, LV_OBJ_FLAG_EVENT_BUBBLE);
+        s_valLabs[s_valCount] = valLab;
+        s_valFns[s_valCount] = it->valueFn;
+        s_valCount++;
+      }
     } else if (it->type == SetType::Slider) {
       /* 带 valueFn 时给左侧腾出位置放当前值 —— 否则拖滑块看不到数字，
          只有一个条在那儿，用户没法知道现在是多少。 */
@@ -161,6 +201,9 @@ void renderPage(const char* id) {
       lv_obj_add_event_cb(row, row_click_cb, LV_EVENT_CLICKED, (void*)it);
     }
   }
+
+  /* 画完再滑进来：进子页从右、回上级从左。关动画时 animatePageIn 直接返回。 */
+  animatePageIn();
 }
 
 void row_click_cb(lv_event_t* e) {
@@ -175,7 +218,7 @@ void row_click_cb(lv_event_t* e) {
   if (it->type == SetType::Nav && it->pageId) {
     const char* pid = canonPageId(it->pageId);
     if (pid && s_depth < MAX_DEPTH - 1) { s_depth++; s_stack[s_depth] = pid; }
-    if (pid) requestRender(pid);
+    if (pid) { s_animForward = true; requestRender(pid); }   /* 进下级：从右滑入 */
   }
 }
 
@@ -260,9 +303,10 @@ void settings_menu_back(lv_event_t* e) {
   if (s_depth > 0) {
     s_depth--;
     Serial.printf("[Settings] back -> '%s' (depth %d)\n", s_stack[s_depth], s_depth);
+    s_animForward = false;                 /* 回上级：从左滑入 */
     requestRender(s_stack[s_depth]);
   } else {
-    nav_back_home();
+    nav_back_home_anim();   /* 根页 -> 回桌面，带动画（关动画时自动退化） */
   }
 }
 

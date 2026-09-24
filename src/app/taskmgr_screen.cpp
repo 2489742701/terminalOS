@@ -32,7 +32,7 @@ char g_pendingId[16] = {0};
 bool g_pendingKillAll = false;
 bool g_pendingSet = false;
 
-void swipe_cb(lv_event_t* e) { swipe_detect(e, g_swipe, nav_launcher); }
+void swipe_cb(lv_event_t* e) { swipe_back_to_any(e, g_swipe, nav_launcher); }
 
 void rebuild();
 

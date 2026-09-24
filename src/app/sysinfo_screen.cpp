@@ -21,7 +21,7 @@ lv_obj_t* g_wifiLab = nullptr;
 uint32_t g_lastUpdate = 0;
 
 void swipe_cb(lv_event_t* e) {
-  swipe_detect(e, g_swipe, nav_launcher);
+  swipe_back_to_any(e, g_swipe, nav_launcher);
 }
 
 void addRow(lv_obj_t* parent, const char* key, const char* val, int y) {

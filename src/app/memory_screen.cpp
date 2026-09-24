@@ -36,7 +36,7 @@ lv_timer_t* g_flipTimer = nullptr;
 static bool g_alive = false;
 
 void swipe_cb(lv_event_t* e) {
-  swipe_detect(e, g_swipe, nav_games_or_home());
+  swipe_back_to_any(e, g_swipe, nav_games_or_home());
 }
 
 void updateSteps() {

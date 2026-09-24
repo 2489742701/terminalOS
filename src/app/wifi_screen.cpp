@@ -34,7 +34,7 @@ lv_obj_t* g_detailRetryBtn = nullptr;
 uint32_t g_connectStartMs = 0;
 
 void swipe_cb(lv_event_t* e) {
-  swipe_detect(e, g_swipe, nav_launcher, SWIPE_H, false, 40);
+  swipe_back_to_any(e, g_swipe, nav_launcher);
 }
 
 void updateStatus() {

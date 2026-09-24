@@ -288,11 +288,34 @@ static uint32_t url_hash(const String& s) {
 
 /* 提示条：不带定时器（定时器不属于对象树，容易漏删），靠下次导航/回首页时顺手隐藏 */
 static lv_obj_t* g_toast = nullptr;
+/* toast 自动消失的定时器。⚠️ 定时器持有 g_toast 指针 → 退出浏览器时必须
+   注销（BrowserScreen_close 里做），否则屏销毁后回调会碰悬空指针。
+   （master 2026-09-25：「已更新」会卡住不消失 —— 之前 toast() 只负责显示，
+     从来没人负责收起来，只有下一次 startNews 才顺手 toastHide。） */
+static lv_timer_t* s_toastTimer = nullptr;
+
+/* 前向声明：toastHide 定义在下面，而这个回调在它之前（同一个 TU 内
+   必须先声明后使用）。 */
+static void toastHide();
+
+static void toast_hide_cb(lv_timer_t* t) {
+  (void)t;
+  s_toastTimer = nullptr;
+  toastHide();
+}
+
 static void toast(const char* msg) {
   Serial.printf("[Browser] toast: %s\n", msg);
   if (!g_toast || !lv_obj_is_valid(g_toast)) return;
   lv_label_set_text(g_toast, msg);
   lv_obj_clear_flag(g_toast, LV_OBJ_FLAG_HIDDEN);
+  /* 连着弹时重置计时，别让上一条的定时器把新的一条提前收掉 */
+  if (s_toastTimer) {
+    lv_timer_del(s_toastTimer);
+    s_toastTimer = nullptr;
+  }
+  s_toastTimer = lv_timer_create(toast_hide_cb, 1800, nullptr);
+  if (s_toastTimer) lv_timer_set_repeat_count(s_toastTimer, 1);
 }
 static void toastHide() {
   if (g_toast && lv_obj_is_valid(g_toast)) lv_obj_add_flag(g_toast, LV_OBJ_FLAG_HIDDEN);
@@ -360,7 +383,7 @@ void swipe_cb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
     Serial.println("[Browser] swipe_cb PRESSED");
   }
-  swipe_detect(e, g_swipe, nav_launcher, SWIPE_H, false, 40);
+  swipe_back_to_any(e, g_swipe, nav_launcher, false);
 }
 
 void url_focus_cb(lv_event_t* e) {
@@ -712,6 +735,15 @@ static void startNews(const char* platform) {
   if (!g_fetchTask) return;
 
   snprintf(g_newsPlatform, sizeof(g_newsPlatform), "%s", platform);
+  /* ⚠️ 必须清停止标志 —— 这是"换了源却永远显示上一个源"的根因：
+     g_stopRequested 只有 startFetch / tick 会清，而退出浏览器
+     (BrowserScreen_close) 会把它置 true 且不再走那两处。于是下一次
+     startNews 唤醒后台任务时，任务第一句 `if (g_stopRequested)` 直接
+     g_taskDone=true 就返回 —— **什么都没拉**，tick 却照样弹"已更新"，
+     显示的还是 g_news 里的旧数据。 */
+  g_stopRequested = false;
+  g_hasPending = false;
+  g_pendingUrl = "";
   g_fetchKind = FETCH_NEWS;
   g_taskDone = false;
   g_state = BROWSER_LOADING;
@@ -735,6 +767,13 @@ static void news_item_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   int idx = (int)(intptr_t)lv_event_get_user_data(e);
   if (idx < 0 || idx >= g_newsCount) return;
+  /* 点中的那条**当场**高亮：跳转要等下一 tick 才发生，中间还要走网络，
+     不给反馈的话用户不知道自己点中了哪条（master 2026-09-25）。 */
+  lv_obj_t* btn = lv_event_get_target(e);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x2b4a6f), 0);
+  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+  lv_obj_t* lb = lv_obj_get_child(btn, 0);
+  if (lb) lv_obj_set_style_text_color(lb, lv_color_white(), 0);
   g_linkPending = String(g_news[idx].url);
   g_linkPendingSet = true;
 }
@@ -980,6 +1019,16 @@ static void showSearchHome() {
     lv_obj_t* b = makeChipBtn(npRow, kNewsPlatforms[i].name, news_platform_cb,
                               (void*)kNewsPlatforms[i].code);
     lv_obj_set_size(b, 76, 36);
+    /* 当前正在看的源 -> 白底黑字（选中态）。
+       master 2026-09-25：「正在被选中的热点新闻应该有一个高亮」——
+       不然点完根本看不出列表是哪个源的。g_newsCount<=0 表示还没拉过，不高亮。 */
+    if (g_newsCount > 0 && strcmp(g_newsPlatform, kNewsPlatforms[i].code) == 0) {
+      lv_obj_set_style_bg_color(b, lv_color_white(), 0);
+      lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_color(b, lv_color_white(), 0);
+      lv_obj_t* lb = lv_obj_get_child(b, 0);
+      if (lb) lv_obj_set_style_text_color(lb, lv_color_black(), 0);
+    }
   }
 
   lv_obj_t* box = lv_obj_create(g_content);
@@ -1884,6 +1933,14 @@ void BrowserScreen_navigate(const char* url) {
  * 屏壳（顶栏/底栏等少量控件）保留，避免下次进入重建 + 悬空指针风险；
  * 大头是 lv_obj_clean 掉的数十个内容 widget 和 free 掉的布局树。 */
 void BrowserScreen_close() {
+  /* toast 的消失定时器持有 g_toast 指针，屏要拆了必须先注销，
+     否则 1.8s 后回调里 lv_obj_is_valid(悬空指针) —— 这类定时器泄漏在本项目
+     已经崩过好几次（clock 屏那只 lv_timer）。 */
+  if (s_toastTimer) {
+    lv_timer_del(s_toastTimer);
+    s_toastTimer = nullptr;
+  }
+  toastHide();
   /* 若后台任务还在跑，让它尽快退出；常驻任务不会被删除 */
   g_stopRequested = true;
   g_hasPending = false;
@@ -1900,6 +1957,11 @@ void BrowserScreen_close() {
      网络卡死也不会把主线程锁死（超时就打 WARN 按原行为继续）。 */
   int waited = 0;
   while (g_state == BROWSER_LOADING && waited < 300) {
+    /* ⚠️ 以前这里只有 delay(10) —— 那是**自己把自己锁死**：
+       能让 g_state 离开 LOADING 的 BrowserScreen_tick() 就跑在这个线程里，
+       delay 期间它永远得不到执行，所以每次退出必然白等满 3 秒（UI 全程卡着）。
+       跟 startFetch 那条注释里踩的是同一个坑。这里顺手把状态机推一下。 */
+    BrowserScreen_tick();
     delay(10);
     waited++;
   }
@@ -1908,8 +1970,15 @@ void BrowserScreen_close() {
   } else if (waited) {
     Serial.printf("[Browser] fetch task stopped after %d ms\n", waited * 10);
   }
+  /* 丢弃这次加载的残留状态：否则下次进浏览器会先"补处理"上一次的结果，
+     弹出一条莫名其妙的"已更新"（实测：退出时任务刚跑完就会出现）。 */
+  g_taskDone = false;
+  g_fetchKind = FETCH_WEB;
 
   contentReset();
+  /* 内容被清了，下次进来必须重画搜索首页 —— 否则是一块空白
+     （tick 里只有 g_firstLoad 为真时才画，而它一生只为真一次）。 */
+  g_firstLoad = true;
 
   if (g_layoutRoot) {
     tactilebrowser_free_layout(g_layoutRoot);

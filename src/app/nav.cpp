@@ -134,6 +134,21 @@ lv_obj_t* nav_games_or_home() {
   return nav_games ? nav_games : nav_launcher;
 }
 
+static void release_after_anim_cb(lv_timer_t* t) {
+  (void)t;
+  /* 动画已经跑完，此刻旧屏不再参与渲染 —— 可以安全销毁了。 */
+  nav_release_all_except(nav_launcher);
+}
+
+void nav_back_home_anim() {
+  if (!nav_launcher) { nav_back_home(); return; }
+  if (!g_uiAnim) { nav_back_home(); return; }   /* 关动画：一步到位 */
+  lv_scr_load_anim(nav_launcher, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 240, 0, false);
+  nav_lock_until = lv_tick_get() + 240 + 300;
+  lv_timer_t* t = lv_timer_create(release_after_anim_cb, 280, nullptr);
+  if (t) lv_timer_set_repeat_count(t, 1);
+}
+
 void nav_back_home() {
   /* ⚠️ 顺序必须是「先切屏，再销毁」。
      lv_obj_del() 掉当前活动屏幕 = LVGL 还在用这棵对象树就把它释放了，

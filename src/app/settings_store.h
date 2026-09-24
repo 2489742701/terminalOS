@@ -20,6 +20,13 @@ namespace SettingsStore {
 /* 开机调用一次：读 NVS 并应用到各模块。重复调用无副作用（只是重读一遍）。 */
 void loadAll();
 
+/* 动画总开关。⚠️ **重启才生效**（master 2026-09-25 定的）：
+   动画时长/缓动散落在各个屏里，运行中切换要保证"已经排进 lv_anim 的动画"
+   也能马上停掉，那就得在每个动画入口都做一次拦截 —— 不如开机读一次、
+   存进全局 g_uiAnim，各入口只判这个 bool，简单且没有半开状态。
+   要关就关到底：切页/返回/2048 弹跳全部退化成"瞬间到位"。 */
+bool animEnabled();
+
 /* ── 读（设置页用来填初值）── */
 unsigned long idleMs();     // 息屏超时，0 = 常亮
 int brightness();           // 背光 5~100
@@ -31,6 +38,7 @@ void saveIdle(unsigned long ms);
 void saveBrightness(int pct);
 void saveAutoSync(bool on);
 void saveViewport(int w);
+void saveAnim(bool on);
 
 /* 诊断：串口打印当前记住的值 */
 void dump();

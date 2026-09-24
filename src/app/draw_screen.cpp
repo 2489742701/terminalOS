@@ -18,7 +18,7 @@ int g_lastX = -1, g_lastY = -1;
 bool g_drawing = false;
 
 void swipe_cb(lv_event_t* e) {
-  swipe_detect(e, g_swipe, nav_launcher, SWIPE_H);
+  swipe_back_to(e, g_swipe, nav_launcher);
 }
 
 void clear_cb(lv_event_t* e) {

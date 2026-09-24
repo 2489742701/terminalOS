@@ -51,10 +51,12 @@ inline SettingsItem siNav(const char* title, const char* pageId,
   it.pageId = pageId; it.valueFn = valueFn; it.cb = cb;
   return it;
 }
-inline SettingsItem siToggle(const char* title, bool on, lv_event_cb_t cb) {
+/* 带 valueFn 的版本 = "开关 + 左侧说明文字"（如动画开关的"重启生效"）。 */
+inline SettingsItem siToggle(const char* title, bool on, lv_event_cb_t cb,
+                             const char* (*valueFn)() = nullptr) {
   SettingsItem it = {};
   it.title = title; it.type = SetType::Toggle;
-  it.cb = cb; it.checked = on;
+  it.cb = cb; it.checked = on; it.valueFn = valueFn;
   return it;
 }
 /* 带 valueFn 时，滑块左侧会显示当前值（滑块宽度相应缩窄）。
