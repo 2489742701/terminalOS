@@ -1,6 +1,7 @@
 #include "draw_screen.h"
 #include "icons.h"
 #include "nav.h"
+#include "status_bar.h"
 #include "font_zh.h"
 #include <lvgl.h>
 #include <esp_heap_caps.h>
@@ -15,10 +16,6 @@ SwipeState g_swipe;
 lv_obj_t* g_canvas = nullptr;
 int g_lastX = -1, g_lastY = -1;
 bool g_drawing = false;
-
-void back_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
-}
 
 void swipe_cb(lv_event_t* e) {
   swipe_detect(e, g_swipe, nav_launcher, SWIPE_H);
@@ -94,17 +91,7 @@ lv_obj_t* DrawScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
-  lv_obj_t* back = icon_create(scr, Icon::Back, 36);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_EVENT_BUBBLE);
-  lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t* title = lv_label_create(scr);
-  lv_label_set_text(title, "画板");
-  lv_obj_set_style_text_color(title, lv_color_white(), 0);
-  lv_obj_set_style_text_font(title, &font_zh_24, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+  StatusBar_create(scr, "画板");
 
   g_canvas = lv_canvas_create(scr);
   void* buf = heap_caps_malloc(CANVAS_W * CANVAS_H * 2, MALLOC_CAP_SPIRAM);

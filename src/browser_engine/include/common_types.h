@@ -90,6 +90,18 @@ typedef struct {
   void (*set_flex_direction)(Renderer *renderer, void *widget, int direction);
   // Clear container
   void (*clear_container)(Renderer *renderer, void *container);
+  /* 平铺专用：一行可换行的容器（flex row-wrap），放"小胶囊"用。
+     **刻意不接收 x/y 也不 set_pos** —— create_container 里的
+     lv_obj_set_pos(container, x, y) 吃的是 CSS 算出来的坐标（大量为 0 / 离谱值），
+     那正是平铺之前版面互相压盖、零高度、横向溢出的根因。胶囊行只能靠 flex 排。 */
+  void *(*create_row_wrap)(Renderer *renderer, int width);
+  /* 平铺专用：可点击"小胶囊" —— 带边框、宽度自适应、超宽自动折行。
+     用来给链接/小按钮画框框，让"这个能点"在 480x480 小屏上肉眼可见。 */
+  void *(*create_chip)(Renderer *renderer, const char *text, int max_width,
+                       uint32_t color);
+  /* 平铺专用：把一条"搜索结果"打扮成能一眼分辨的一块 —— 底部留白 + 一条分隔线。
+     480 屏上一行就是钱，条目挤在一起根本分不出哪条是哪条。 */
+  void (*style_result_item)(Renderer *renderer, void *widget);
   // Get widget height
   int (*get_height)(Renderer *renderer, void *widget);
   // Platform-specific data

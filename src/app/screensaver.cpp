@@ -36,6 +36,9 @@ unsigned long        ScreenSaver::lastTapMs      = 0;
 int                  ScreenSaver::pressX       = 0;
 int                  ScreenSaver::pressY       = 0;
 bool                 ScreenSaver::unlocked     = false;
+bool                 ScreenSaver::suppressed   = false;
+bool                 ScreenSaver::offArmed     = false;
+unsigned long        ScreenSaver::offEnteredMs = 0;
 
 void ScreenSaver::init(lv_obj_t* mainScreen) {
   mainScr = mainScreen;
@@ -97,6 +100,9 @@ void ScreenSaver::buildDimScreen() {
 
 void ScreenSaver::gesture_event_cb(lv_event_t* e) {
   lv_event_code_t code = lv_event_get_code(e);
+  /* OFF 态的手势一律不处理：这一层的滑动解锁会直接跳回 ACTIVE（跳过锁屏）。
+     息屏后的唤醒统一由 tick() 里的触摸检测负责（先回 DIM，再滑动解锁）。 */
+  if (state == OFF) return;
   if (code == LV_EVENT_PRESSED) {
     lv_point_t p;
     lv_indev_get_point(lv_indev_get_act(), &p);
@@ -137,8 +143,21 @@ void ScreenSaver::enterDim(bool captureReturnScr) {
   lastActivityMs = millis();
 }
 
+/**
+ * enterOff - 关背光进入全黑。
+ *
+ * 两个必须一起做的状态复位，缺一个就会出现"熄了又立刻亮"：
+ *  1) unlocked = true —— 本次手势已经被"双击关屏"消费掉。否则手指还没抬起来，
+ *     后续 PRESSING 事件里位移 >40px 就会命中滑动解锁 → enterActive() → 亮回来。
+ *  2) offArmed = false —— 进入 OFF 时手指多半还按在屏上（就是这次双击），
+ *     tick() 里的"任意触摸唤醒"必须等手真正松开后才允许生效，否则同一次按压
+ *     会立刻把背光点回去。
+ */
 void ScreenSaver::enterOff() {
   state = OFF;
+  unlocked = true;          /* 本次手势已消费，不再触发滑动解锁 */
+  offArmed = false;         /* 等待"松手"边沿 */
+  offEnteredMs = millis();
   Display::setBacklight(false);  // 关背光，屏幕全黑（最省电）
 }
 
@@ -146,26 +165,54 @@ void ScreenSaver::unlock() {
   enterActive();
 }
 
+/**
+ * sleepNow - 应用内「息屏」按钮：真正关背光，不是只跳到锁屏页。
+ *
+ * 先 enterDim(true) 捕获当前屏（解锁后回到这里，而不是跳回主桌面），
+ * 再 enterOff() 关背光。顺序不能反：enterOff 只改背光和状态，不记返回屏。
+ */
 void ScreenSaver::sleepNow() {
-  enterDim(true);
+  if (state != OFF) enterDim(true);   /* 记下返回屏 + 加载锁屏界面 */
+  enterOff();                          /* 真正熄屏 */
 }
 
 void ScreenSaver::notifyActivity() {
   if (state == ACTIVE) lastActivityMs = millis();
 }
 
+void ScreenSaver::setSuppressed(bool on) {
+  suppressed = on;
+  if (on) {
+    lastActivityMs = millis();
+    if (state != ACTIVE) enterActive();  // 已被锁屏则立刻亮回来
+  }
+}
+
 void ScreenSaver::tick() {
   unsigned long now = millis();
+
+  /* 抑制期间：持续刷新活动时间，永不进入 DIM/OFF */
+  if (suppressed) {
+    lastActivityMs = now;
+    if (state != ACTIVE) enterActive();
+    return;
+  }
+
   if (state == ACTIVE) {
     if (now - lastActivityMs > ACTIVE_TIMEOUT_MS) enterDim(true);
   } else if (state == DIM) {
     if (now - lastActivityMs > DIM_TIMEOUT_MS) enterOff();
     if (now - lastClockMs > 1000) { updateClock(); lastClockMs = now; }
   } else if (state == OFF) {
+    /* 唤醒去抖：必须 (a) 熄屏后已过 400ms，(b) 至少检测到过一次"无触摸"
+       （手指已离开），之后的按下才算唤醒手势。否则关屏那一次按压本身
+       就会被当成唤醒，表现为"熄灭后马上又亮"。 */
     int x = 0, y = 0;
-    if (Touch::touched(x, y)) {
+    bool touching = Touch::touched(x, y);
+    if (!touching) {
+      offArmed = true;
+    } else if (offArmed && (now - offEnteredMs > 400)) {
       enterDim(false);
-
     }
   }
 }

@@ -40,6 +40,14 @@ RenderResult tactilebrowser_download_and_parse(const char *url, int max_width,
                                                int max_height,
                                                volatile bool *stop_flag,
                                                LayoutNode **out_layout);
+/* Phase 1 变体：HTML 已在内存（页面缓存命中），跳过下载直接建布局树。
+   html 由调用方持有，内部自拷一份。 */
+RenderResult tactilebrowser_parse_html_buffer(const char *url, const char *html,
+                                              size_t length, int max_width,
+                                              int max_height,
+                                              volatile bool *stop_flag,
+                                              LayoutNode **out_layout);
+
 RenderResult tactilebrowser_render_layout(LayoutNode *layout_root,
                                           void *container, int max_width,
                                           int max_height);
@@ -54,6 +62,9 @@ RenderResult tactilebrowser_render_html_string(const char *url,
 // Utility functions
 void memory_buffer_init(MemoryBuffer *buffer);
 void memory_buffer_free(MemoryBuffer *buffer);
+/* 引擎短期分配（PSRAM 优先），详见 tactilebrowser_core.cpp */
+void *tb_alloc(size_t n);
+void *tb_calloc(size_t count, size_t size);
 char *safe_strdup(const char *str);
 char *safe_strndup(const char *str, size_t n);
 

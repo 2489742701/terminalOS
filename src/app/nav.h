@@ -12,6 +12,9 @@ extern lv_obj_t* nav_draw;
 extern lv_obj_t* nav_memory;
 extern lv_obj_t* nav_sysinfo;
 extern lv_obj_t* nav_weather;
+extern lv_obj_t* nav_games;    // 游戏栏目：贪吃蛇 / 记忆卡牌
+extern lv_obj_t* nav_desktop;  // 桌面图标管理（设置里进入）
+extern lv_obj_t* nav_taskmgr;  // 后台管理（任务管理器）
 
 /* ══ Activity 注册表（阶段 1）══
  * ESP32 没有 MMU/换页，lv_obj_create(NULL) 建的对象树会一直常驻，
@@ -28,6 +31,28 @@ void nav_release_all_except(lv_obj_t* keep1, lv_obj_t* keep2 = nullptr);
 
 // 回到 Launcher：先销毁其他所有 Activity，再切屏（唯一的"退出应用"入口）
 void nav_back_home();
+
+/* ── 后台管理（任务管理器）接口 ──────────────────────────────────────────────
+   应用本来就是按需创建的，但切屏过程中仍会有几棵对象树留在内存里。
+   后台页要把它们列出来让用户能关掉 —— 所以 nav 得能回答"谁还在"。 */
+struct NavRunningInfo {
+  const char* id;      // Activity 名（"browser"），静态字符串
+  uint32_t bytes;      // 创建时吃掉的内部 DRAM（0 = 未计量）
+  bool current;        // 是否当前前台（前台不可关：删当前屏必崩）
+};
+
+// 列出所有仍在内存里的 Activity（Launcher 不算），返回条数
+int nav_running_list(NavRunningInfo* out, int max);
+
+// 关掉指定 Activity。前台 / Launcher / 释放守卫不通过 -> 返回 false
+bool nav_close(const char* id);
+
+// 关掉除 Launcher 和前台之外的所有 Activity，返回实际关掉的个数
+int nav_close_all();
+
+/* 游戏栏目里的子游戏返回时用：优先回游戏栏目（不存在就现开一个），
+   万一开不出来再退回桌面 —— 避免从游戏栏目进贪吃蛇、退出却掉到桌面。 */
+lv_obj_t* nav_games_or_home();
 
 inline uint32_t nav_lock_until = 0;
 

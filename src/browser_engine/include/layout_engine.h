@@ -119,6 +119,28 @@ void layout_position_node(LayoutNode *node, int parent_x, int parent_y);
 // Render layout tree to screen
 void layout_render_tree(LayoutNode *root, RenderContext *render_ctx);
 
+// 记录本次排版使用的视口宽度。渲染阶段据此算缩放系数（屏幕宽/视口宽）。
+// 必须在排版（layout_calculate_dimensions）之前调用，否则缩放退化为 1.0（整页露不全）。
+void layout_set_viewport_width(int width);
+
+// 屏幕内容区宽度（464）。<meta viewport width=device-width> 用它作为排版宽度。
+void layout_set_screen_width(int width);
+int layout_get_screen_width(void);
+
+/* 平铺模式开关（默认开）。
+   关 = 还原 CSS 版面（等比缩放 + 横向钳制）；
+   开 = 放弃还原版面：不创建任何容器，所有文本/链接/输入框直接挂进根容器
+        （flex column），全宽、居左、自上而下平铺。串口 `flat on|off` 可切。 */
+void layout_set_flat_mode(bool on);
+void layout_set_flat_dump_limit(int n);
+/* 平铺模式查询。dom_renderer 用它决定要不要下载外部 CSS —— 平铺不还原版面，
+   CSS 里的坐标/尺寸一条都用不上，下载纯属浪费（cn.bing.com 一次要串行拉 30+ 个
+   外部 CSS，每个一次 TLS 握手，总共约 1 分钟）。 */
+/* 平铺模式查询。dom_renderer 用它决定要不要下载外部 CSS —— 平铺不还原版面，
+   CSS 里的坐标/尺寸一条都用不上，下载纯属浪费（cn.bing.com 一次要串行拉 30+ 个
+   外部 CSS，每个一次 TLS 握手，总共约 1 分钟）。 */
+bool layout_get_flat_mode(void);
+
 // Apply CSS properties to layout box
 void layout_apply_css_property(LayoutBox *box, const char *property,
                                const char *value);

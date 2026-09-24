@@ -1,0 +1,52 @@
+# PlatformIO 构建目录
+.pio/
+.wb_build/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 构建产物
+*.elf
+*.bin
+*.hex
+*.map
+*.dump
+
+# 运行/调试日志（构建、串口抓包等，一律不入库）
+*.log
+
+# 抓包与调试中间产物（脚本本身入库，脚本跑出来的东西不入库）
+tools/*.txt
+tools/*.html
+tools/html/
+tools/minimal_test/
+tools/_bak_font_compressed/
+/*.txt
+
+# 但字体字符集表是资产，需要保留
+!tools/font_symbols*.txt
+
+# 本地下载的工具与驱动
+tools/arduino-cli.exe
+tools/ch340-driver/
+
+# lexbor 只保留 source/，其余（test/utils/examples/wasm/benchmarks/packaging）
+# 在 platformio.ini 的 build_src_filter 里本来就排除了
+src/browser_engine/lexbor/test/
+src/browser_engine/lexbor/utils/
+src/browser_engine/lexbor/examples/
+src/browser_engine/lexbor/wasm/
+src/browser_engine/lexbor/benchmarks/
+src/browser_engine/lexbor/packaging/
+
+# 文档备份
+docs_backup_*
+
+# IDE / 编辑器
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

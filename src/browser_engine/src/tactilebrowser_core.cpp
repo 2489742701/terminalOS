@@ -163,6 +163,53 @@ RenderResult tactilebrowser_download_and_parse(const char *url, int max_width,
   return build_result;
 }
 
+/* Phase 1 变体：HTML 已在内存里（页面缓存命中），跳过下载直接建布局树。
+   与 tactilebrowser_download_and_parse 同构，同样不触碰 LVGL，可在后台任务跑。
+   ⚠️ 入参 html 由调用方持有，这里**自己拷一份**，所以调用方返回后立刻释放也没事。 */
+RenderResult tactilebrowser_parse_html_buffer(const char *url, const char *html,
+                                              size_t length, int max_width,
+                                              int max_height,
+                                              volatile bool *stop_flag,
+                                              LayoutNode **out_layout) {
+  if (!url || !html || length == 0 || !out_layout || !global_renderer)
+    return RENDER_ERROR_UNKNOWN;
+  *out_layout = NULL;
+
+  dom_renderer_set_stop_flag(stop_flag);
+
+  char *copy = (char *)tb_alloc(length);
+  if (!copy) {
+    dom_renderer_set_stop_flag(nullptr);
+    return RENDER_ERROR_MEMORY;
+  }
+  memcpy(copy, html, length);
+
+  lxb_html_document_t *document = html_parser.parse_html(copy, length);
+  free(copy);  /* DOM 已解析，这份拷贝可以释放 */
+  if (!document) {
+    arduino_set_stop_flag(nullptr);
+    dom_renderer_set_stop_flag(nullptr);
+    return RENDER_ERROR_PARSE;
+  }
+
+  global_renderer_struct.platform_data = NULL;  /* Phase 1 不触碰 LVGL */
+  RenderContext context = {.renderer = &global_renderer_struct,
+                           .root_container = NULL,
+                           .current_y = 0,
+                           .max_width = max_width,
+                           .max_height = max_height,
+                           .document_url = url};
+
+  RenderResult build_result =
+      dom_renderer_build_layout_only(document, &context, out_layout);
+
+  lxb_html_document_destroy(document);
+
+  arduino_set_stop_flag(nullptr);
+  dom_renderer_set_stop_flag(nullptr);
+  return build_result;
+}
+
 /* Phase 2: 渲染布局树到 LVGL 控件（快速，在 UI 任务中调用） */
 RenderResult tactilebrowser_render_layout(LayoutNode *layout_root,
                                           void *container, int max_width,
@@ -234,11 +281,30 @@ void memory_buffer_free(MemoryBuffer *buffer) {
   }
 }
 
+/* ── 引擎短期分配的"去 DRAM 化" ──
+ * 这些分配全都 <=4KB，而 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 会把
+ * <=4KB 的 malloc 一律塞进内部 DRAM。结果：解析一页 DRAM 掉 ~40KB，
+ * 而 PSRAM 7.29MB 完全空闲 —— 稀有资源被挤，充裕资源睡着。
+ * 布局树/文本/href 都是"渲染完就扔"的短命对象，放 PSRAM 正合适。
+ * ⚠️ ESP-IDF 的 free() 等价于 heap_caps_free()，所以调用方 free() 不用改。 */
+void *tb_alloc(size_t n) {
+  void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!p) p = malloc(n);            /* PSRAM 用尽时退回 DRAM，宁可慢也别崩 */
+  return p;
+}
+
+void *tb_calloc(size_t count, size_t size) {
+  size_t n = count * size;
+  void *p = tb_alloc(n);
+  if (p) memset(p, 0, n);
+  return p;
+}
+
 char *safe_strdup(const char *str) {
   if (!str)
     return NULL;
   size_t len = strlen(str) + 1;
-  char *result = (char *)malloc(len);
+  char *result = (char *)tb_alloc(len);
   if (result)
     memcpy(result, str, len);
   return result;
@@ -247,7 +313,7 @@ char *safe_strdup(const char *str) {
 char *safe_strndup(const char *str, size_t n) {
   if (!str)
     return NULL;
-  char *result = (char *)malloc(n + 1);
+  char *result = (char *)tb_alloc(n + 1);
   if (result) {
     memcpy(result, str, n);
     result[n] = '\0';

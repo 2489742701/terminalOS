@@ -1,6 +1,7 @@
 #include "memory_screen.h"
 #include "icons.h"
 #include "nav.h"
+#include "status_bar.h"
 #include "font_zh.h"
 #include <lvgl.h>
 #include <stdlib.h>
@@ -30,13 +31,12 @@ int g_steps = 0;
 int g_matchedCount = 0;
 bool g_busy = false;
 lv_timer_t* g_flipTimer = nullptr;
-
-void back_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
-}
+/* 屏是否还活着。翻牌定时器（800ms 后回调）会在屏被销毁后触发，
+   那时 g_cards[] 全是悬空指针 —— 与 clock 同一个坑。 */
+static bool g_alive = false;
 
 void swipe_cb(lv_event_t* e) {
-  swipe_detect(e, g_swipe, nav_launcher);
+  swipe_detect(e, g_swipe, nav_games_or_home());
 }
 
 void updateSteps() {
@@ -61,8 +61,17 @@ void hideCard(int idx) {
   lv_obj_set_style_bg_color(g_cards[idx], lv_color_hex(0x111111), 0);
 }
 
+static void mem_delete_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
+  g_alive = false;
+  g_flipTimer = nullptr;
+  g_msgLab = nullptr;
+  for (int i = 0; i < ROWS * COLS; i++) g_cards[i] = nullptr;
+}
+
 void flipTimer_cb(lv_timer_t* t) {
   (void)t;
+  if (!g_alive) return;          /* 屏已销毁，g_cards[] 不可再碰 */
   if (g_flipTimer) { lv_timer_del(g_flipTimer); g_flipTimer = nullptr; }
   if (g_firstIdx >= 0 && g_secondIdx >= 0) {
     if (g_patterns[g_firstIdx] == g_patterns[g_secondIdx]) {
@@ -148,18 +157,10 @@ lv_obj_t* MemoryScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSED, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
+  lv_obj_add_event_cb(scr, mem_delete_cb, LV_EVENT_DELETE, NULL);
+  g_alive = true;
 
-  lv_obj_t* back = icon_create(scr, Icon::Back, 36);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_EVENT_BUBBLE);
-  lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t* title = lv_label_create(scr);
-  lv_label_set_text(title, "记忆");
-  lv_obj_set_style_text_color(title, lv_color_white(), 0);
-  lv_obj_set_style_text_font(title, &font_zh_24, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+  StatusBar_create(scr, "记忆卡牌");
 
   g_stepLab = lv_label_create(scr);
   lv_label_set_text(g_stepLab, "步数 0");

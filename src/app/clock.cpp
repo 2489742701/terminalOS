@@ -1,6 +1,7 @@
 #include "clock.h"
 #include "icons.h"
 #include "nav.h"
+#include "status_bar.h"
 #include "font_zh.h"
 #include <lvgl.h>
 #include <esp_heap_caps.h>
@@ -100,13 +101,26 @@ void drawAnalogClock() {
   lv_canvas_draw_arc(g_clockCanvas, cx, cy, (lv_coord_t)(S * 0.03f), 0, 360, &ad);
 }
 
-void clockTimer_cb(lv_timer_t* t) {
-  (void)t;
-  drawAnalogClock();
+/* 屏销毁后 g_clockCanvas 被 DELETE 回调置空 —— 定时器靠它判活。
+   ⚠️ lv_timer 不属于对象树：屏被 lv_obj_del 之后它照跑，不判空就会往
+   已释放的 canvas 里画 → LoadProhibited。实测 nav clock → nav launcher 必崩，
+   addr2line 实锤 clock.cpp:35 drawAnalogClock。
+   这里不在 DELETE 回调里 lv_timer_del（LVGL 正在分发事件，不稳妥），
+   而是让定时器自己发现失活后设 repeat_count=1，由 LVGL 在本拍结束后删除。 */
+static void clock_delete_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_DELETE) return;
+  g_clockCanvas = nullptr;
+  g_timeLab = nullptr;
+  g_dateLab = nullptr;
 }
 
-void back_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
+void clockTimer_cb(lv_timer_t* t) {
+  if (!g_clockCanvas) {
+    lv_timer_set_repeat_count(t, 1);
+    g_clockTimer = nullptr;
+    return;
+  }
+  drawAnalogClock();
 }
 
 void swipe_cb(lv_event_t* e) {
@@ -142,12 +156,9 @@ lv_obj_t* ClockScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSED, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
+  lv_obj_add_event_cb(scr, clock_delete_cb, LV_EVENT_DELETE, NULL);
 
-  lv_obj_t* back = icon_create(scr, Icon::Back, 36);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_EVENT_BUBBLE);
-  lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
+  StatusBar_create(scr, "时钟");
 
   g_clockCanvas = lv_canvas_create(scr);
   void* buf = heap_caps_malloc(kClockSize * kClockSize * 2, MALLOC_CAP_SPIRAM);

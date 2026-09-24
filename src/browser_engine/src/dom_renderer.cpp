@@ -62,6 +62,316 @@ static bool rel_contains_stylesheet(const char *rel, size_t length) {
   return is_stylesheet;
 }
 
+/**
+ * strip_icon_glyphs - 就地删除「图标字体」字符和不可见控制字符。
+ *
+ * 为什么必须做：百度/淘宝等站点用私有区码位（U+E000–U+F8FF）承载图标字体，
+ * 例如百度搜索框外层 <span> 的文本就是一个 \ue610。我们的字体里没有这些字形，
+ * 渲染出来是一堆豆腐块；更糟的是它让外层元素"有文本"从而吞掉整棵子树
+ * （见 subtree_has_form_control 的注释）。
+ *
+ * 只处理 UTF-8 字节序列，不需要解码整个码点：
+ *   U+E000..U+EFFF -> EE 80..BF ..
+ *   U+F000..U+F8FF -> EF 80..A3 ..
+ *   U+FFFD         -> EF BF BD
+ *   U+200B..U+200F -> E2 80 8B..8F（零宽/方向控制）
+ *   U+FEFF         -> EF BB BF（BOM）
+ * NBSP(U+00A0 = C2 A0) 换成普通空格，避免被当成可见文本。
+ */
+static void strip_icon_glyphs(char *s) {
+  if (!s)
+    return;
+  const unsigned char *p = (const unsigned char *)s;
+  char *dst = s;
+  while (*p) {
+    unsigned char c = p[0];
+    unsigned char c1 = p[1];
+    unsigned char c2 = p[2];
+    if (c == 0xEE && c1 >= 0x80) {           /* U+E000–U+EFFF */
+      p += 3;
+      continue;
+    }
+    if (c == 0xEF && c1 >= 0x80 && c1 <= 0xA3) {  /* U+F000–U+F8FF */
+      p += 3;
+      continue;
+    }
+    if (c == 0xEF && c1 == 0xBF && c2 == 0xBD) {  /* U+FFFD 替换字符 */
+      p += 3;
+      continue;
+    }
+    if (c == 0xEF && c1 == 0xBB && c2 == 0xBF) {  /* U+FEFF BOM */
+      p += 3;
+      continue;
+    }
+    if (c == 0xE2 && c1 == 0x80 && c2 >= 0x8B && c2 <= 0x8F) { /* 零宽/方向 */
+      p += 3;
+      continue;
+    }
+    if (c == 0xC2 && c1 == 0xA0) {           /* NBSP -> 空格 */
+      *dst++ = ' ';
+      p += 2;
+      continue;
+    }
+    if (c < 0x20 && c != '\n' && c != '\t') { /* C0 控制符（保留换行/制表）*/
+      p++;
+      continue;
+    }
+    *dst++ = (char)c;
+    p++;
+  }
+  *dst = '\0';
+}
+
+/**
+ * subtree_has_form_control - 子树里是否含「可交互控件」。
+ *
+ * 为什么必须做：现代站点普遍写成
+ *     <span class="ipt_wr">\ue610<input id="kw"></span>
+ * 外层 span 的文本只是图标字符，但 build_layout_tree_from_dom 一旦判定
+ * "该元素有文本"，就把它当纯文本叶子，**不再递归子节点** —— 输入框被整棵丢掉。
+ * 百度首页搜不到搜索框就是这个原因（m.baidu.com 的 input 外层是 div，所以能活）。
+ *
+ * 判定命中则不抽取文本、继续递归子节点。
+ */
+static bool subtree_has_form_control(lxb_dom_node_t *node, int depth) {
+  if (!node || depth > 12)
+    return false;
+
+  if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+    lxb_dom_element_t *element = (lxb_dom_element_t *)node;
+    size_t tag_len = 0;
+    const char *tag = html_parser.get_element_tag(element, &tag_len);
+    if (tag) {
+      if (tag_len == 5 && strncmp(tag, "input", 5) == 0) {
+        /* hidden 不是给人看的，不算 */
+        size_t type_len = 0;
+        const char *type_attr =
+            html_parser.get_element_attr(element, "type", &type_len);
+        bool hidden = false;
+        if (type_attr && type_len == 6) {
+          char buf[8];
+          memcpy(buf, type_attr, 6);
+          buf[6] = '\0';
+          for (size_t i = 0; i < 6; ++i)
+            buf[i] = (char)tolower((unsigned char)buf[i]);
+          hidden = (strcmp(buf, "hidden") == 0);
+        }
+        if (!hidden)
+          return true;
+      }
+      if ((tag_len == 8 && strncmp(tag, "textarea", 8) == 0) ||
+          (tag_len == 6 && strncmp(tag, "select", 6) == 0) ||
+          (tag_len == 6 && strncmp(tag, "button", 6) == 0))
+        return true;
+    }
+  }
+
+  lxb_dom_node_t *child = html_parser.get_first_child(node);
+  while (child) {
+    if (subtree_has_form_control(child, depth + 1))
+      return true;
+    child = html_parser.get_next_sibling(child);
+  }
+  return false;
+}
+
+/**
+ * li_is_link_wrapper - 这个 <li> 是否只是 <a> 的一层包装。
+ *
+ * 现代站点的导航条几乎都写成 <li><a href="...">我的关注</a></li>。
+ * 这种情况下 li 自己没有独立文本，真正的可点目标在里面的 <a>。
+ * 判定命中就让 li 放弃抽文本（继续递归），<a> 才能拿到 href、变蓝、将来可点。
+ *
+ * 判定：直接子元素中恰好有一个 <a>（忽略空白文本节点）。
+ */
+/**
+ * subtree_first_href - 子树里第一个"值得点"的链接（返回绝对地址，需 free）。
+ *
+ * 为什么必须做：搜索结果 <li class="b_algo"> 会被判定"有文本"而抽成纯文本叶子，
+ * 里面那个 <a href> 标题链接**根本不会进布局树** —— 整条结果就点不动。
+ * 这里把子树里第一个真链接的绝对地址记到 <li> 上，渲染时挂到整条 label。
+ * 跳过 # / javascript: / mailto: / tel:（点它们没有意义，还会被 app 层判为不可解析）。
+ */
+static char *subtree_first_href(lxb_dom_node_t *node, RenderContext *context,
+                                int depth) {
+  if (!node || depth > 8)
+    return NULL;
+
+  if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+    lxb_dom_element_t *element = (lxb_dom_element_t *)node;
+    size_t tag_len = 0;
+    const char *tag = html_parser.get_element_tag(element, &tag_len);
+    if (tag && tag_len == 1 && (tag[0] == 'a' || tag[0] == 'A')) {
+      size_t href_len = 0;
+      const char *href_attr =
+          html_parser.get_element_attr(element, "href", &href_len);
+      if (href_attr && href_len > 0) {
+        char *raw = safe_strndup(href_attr, href_len);
+        if (raw) {
+          bool bad = (raw[0] == '#') || (strncmp(raw, "javascript:", 11) == 0) ||
+                     (strncmp(raw, "mailto:", 7) == 0) ||
+                     (strncmp(raw, "tel:", 4) == 0);
+          char *abs =
+              bad ? NULL : tactilebrowser_resolve_url(context->document_url, raw);
+          free(raw);
+          if (abs)
+            return abs;
+        }
+      }
+    }
+  }
+
+  for (lxb_dom_node_t *c = html_parser.get_first_child(node); c;
+       c = html_parser.get_next_sibling(c)) {
+    char *r = subtree_first_href(c, context, depth + 1);
+    if (r)
+      return r;
+  }
+  return NULL;
+}
+
+/* li 里有没有 >=2 个"能各自成块"的子元素（搜索结果条目的判据）。
+   只数元素节点；跳过 <link>/<script>/<style>/<meta>/<br>/<hr> —— 必应在
+   b_algo 里塞了一长串 <link rel="stylesheet">，不跳过的话任意 li 都会被误判。 */
+static bool li_has_block_children(lxb_dom_node_t *node) {
+  int n = 0;
+  for (lxb_dom_node_t *c = html_parser.get_first_child(node); c;
+       c = html_parser.get_next_sibling(c)) {
+    if (c->type != LXB_DOM_NODE_TYPE_ELEMENT)
+      continue;
+    lxb_dom_element_t *el = (lxb_dom_element_t *)c;
+    size_t tl = 0;
+    const char *tag = html_parser.get_element_tag(el, &tl);
+    if (!tag || tl == 0)
+      continue;
+    /* 手写下划线比较，不依赖 strncasecmp（各平台头文件不一致） */
+    bool skip = false;
+    static const char *kNop[] = {"link", "script", "style", "meta", "br", "hr",
+                                 NULL};
+    for (int k = 0; kNop[k]; k++) {
+      const char *p = kNop[k];
+      size_t pl = strlen(p);
+      if (pl != tl)
+        continue;
+      bool eq = true;
+      for (size_t i = 0; i < tl; i++) {
+        if (tolower((unsigned char)tag[i]) != p[i]) {
+          eq = false;
+          break;
+        }
+      }
+      if (eq) {
+        skip = true;
+        break;
+      }
+    }
+    if (skip)
+      continue;
+    /* nav/ul/ol/table 是结构性容器：出现一个就说明「里面还有一层」，
+       不能把整块文本压成一行。必应的分页 <li class=b_pag> 就只有
+       一个 <nav> 子元素，靠 n>=2 永远判不出来（2026-09-23 实测）。 */
+    static const char *kContainers[] = {"nav", "ul", "ol", "table", NULL};
+    for (int k = 0; kContainers[k]; k++) {
+      size_t pl = strlen(kContainers[k]);
+      if (pl != tl)
+        continue;
+      bool eq = true;
+      for (size_t i = 0; i < tl; i++) {
+        if (tolower((unsigned char)tag[i]) != kContainers[k][i]) {
+          eq = false;
+          break;
+        }
+      }
+      if (eq)
+        return true;
+    }
+    n++;
+    if (n >= 2)
+      return true;
+  }
+  return false;
+}
+
+static bool li_is_link_wrapper(lxb_dom_node_t *node) {
+  int anchor_count = 0;
+  int other_element_count = 0;
+
+  for (lxb_dom_node_t *child = html_parser.get_first_child(node); child;
+       child = html_parser.get_next_sibling(child)) {
+    if (child->type != LXB_DOM_NODE_TYPE_ELEMENT)
+      continue;
+    lxb_dom_element_t *el = (lxb_dom_element_t *)child;
+    size_t tag_len = 0;
+    const char *tag = html_parser.get_element_tag(el, &tag_len);
+    if (tag && tag_len == 1 && (tag[0] == 'a' || tag[0] == 'A'))
+      anchor_count++;
+    else
+      other_element_count++;
+  }
+
+  return (anchor_count == 1 && other_element_count == 0);
+}
+
+/**
+ * detect_meta_viewport - 读 <meta name="viewport" content="width=...">。
+ *
+ * 排版视口一直是写死的 1024（桌面设计宽）。移动端页面（m.baidu.com）按 ~375 设计，
+ * 用 1024 排版再压缩到 464，等于把手机版面强行摊开又缩小，横向溢出、内容变矮。
+ * 页面自己声明了视口宽度就听它的：
+ *   width=<数字>   -> 用该数字
+ *   width=device-width -> 用屏幕内容宽度（传入的 screen_w）
+ * 没有声明（桌面站）-> 返回 0，调用方回退到桌面默认。
+ */
+static int detect_meta_viewport(lxb_html_document_t *document, int screen_w) {
+  lxb_dom_element_t *root_el =
+      lxb_dom_document_element(lxb_dom_interface_document(document));
+  if (!root_el)
+    return 0;
+
+  lxb_dom_collection_t *collection =
+      lxb_dom_collection_make(lxb_dom_interface_document(document), 8);
+  if (!collection)
+    return 0;
+
+  int width = 0;
+  if (lxb_dom_elements_by_tag_name(root_el, collection,
+                                   (const lxb_char_t *)"meta", 4) ==
+      LXB_STATUS_OK) {
+    for (size_t i = 0; i < lxb_dom_collection_length(collection); ++i) {
+      lxb_dom_element_t *el = lxb_dom_collection_element(collection, i);
+      size_t name_len = 0;
+      const char *name = html_parser.get_element_attr(el, "name", &name_len);
+      if (!name || name_len != 8 || strncmp(name, "viewport", 8) != 0)
+        continue;
+
+      size_t content_len = 0;
+      const char *content =
+          html_parser.get_element_attr(el, "content", &content_len);
+      if (!content || content_len == 0 || content_len > 255)
+        continue;
+
+      char buf[256];
+      memcpy(buf, content, content_len);
+      buf[content_len] = '\0';
+      for (size_t k = 0; k < content_len; ++k)
+        buf[k] = (char)tolower((unsigned char)buf[k]);
+
+      char *w = strstr(buf, "width=");
+      if (!w)
+        continue;
+      w += 6;
+      if (strncmp(w, "device-width", 12) == 0) {
+        width = screen_w;
+      } else {
+        width = atoi(w);
+      }
+      break;
+    }
+  }
+  lxb_dom_collection_destroy(collection, true);
+  return width;
+}
+
 static void parse_and_apply_css_block(LayoutBox *target_box,
                                       char *declarations) {
   if (!target_box || !declarations)
@@ -119,6 +429,16 @@ static void import_external_stylesheet(const char *href, size_t href_len,
      且解析大 CSS 会长时间阻塞主循环，饿死 Core1 WiFi 任务导致看门狗崩溃。 */
   if (arduino_html_was_truncated()) {
     Serial.println("[Browser] HTML truncated, skipping external CSS");
+    return;
+  }
+
+  /* 平铺模式压根不下载外部 CSS：平铺不还原版面，CSS 算出来的 x/y/width 一条都不用，
+     下载它们只是白白串行做几十次 TLS 握手（cn.bing.com 实测 30+ 个 → 约 1 分钟）。
+     内嵌 <style> 仍然解析，因为字体/颜色这类值还是会用到。 */
+  if (layout_get_flat_mode()) {
+    static int skipped = 0;
+    if (skipped++ == 0)
+      Serial.println("[Browser] flat mode: external CSS download skipped");
     return;
   }
 
@@ -209,6 +529,7 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
     char *txt = copy_node_text(dom_node, &len);
 
     if (txt && len > 0) {
+      strip_icon_glyphs(txt);  /* 去掉图标字体字符，别让它们变成豆腐块 */
       // Trim whitespace
       char *start = txt;
       char *end = txt + len - 1;
@@ -307,7 +628,17 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
   case ELEMENT_ITALIC:
   case ELEMENT_UNDERLINE:
   case ELEMENT_LIST_ITEM:
-    should_extract_text = true;
+    /* 2026-09-23：导航条 <li><a href>我的关注</a></li> 被当成纯文本叶子，
+       里面的 <a> 连同 href 一起被丢掉 —— 平铺出来是四行白字，既没并成一行、
+       也不是链接、将来还点不动。li 只是个 <a> 的包装时，不抽文本，让 <a> 自己活。 */
+    /* 2026-09-23（二）：搜索结果 <li class="b_algo"> 同理，但它更复杂 ——
+       里面是「来源行 / <a><h2>标题 / <p>摘要」三块，抽成纯文本叶子会把三块的
+       innerText 首尾相接拼成一坨（espressif.comhttps://www.espressif.com...），
+       480 屏上根本读不了，标题那个 <a> 还被一起丢掉（点不动）。
+       li 里有 >=2 个块级子元素时不抽文本，递归下去让各块各自成行；
+       标题 <a> 因此活下来，渲染成可点胶囊 —— 只有标题可点，不会误触。 */
+    should_extract_text = !li_is_link_wrapper(dom_node) &&
+                          !li_has_block_children(dom_node);
     break;
   case ELEMENT_INPUT_TEXT:
   case ELEMENT_TEXTAREA:
@@ -317,10 +648,19 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
     break;
   }
 
+  /* 若子树里有可交互控件（input/textarea/select/button），就不能把本元素当纯文本
+     叶子 —— 否则整棵子树连同输入框一起被丢弃。改为不抽文本、继续递归。 */
+  if (should_extract_text && elem_type != ELEMENT_INPUT_TEXT &&
+      elem_type != ELEMENT_TEXTAREA &&
+      subtree_has_form_control(dom_node, 0)) {
+    should_extract_text = false;
+  }
+
   if (should_extract_text) {
     size_t text_len = 0;
     char *text = html_parser.get_element_text(element, &text_len);
     if (text && text_len > 0) {
+      strip_icon_glyphs(text);  /* 去掉图标字体字符（百度 \ue610 之类） */
       // Trim whitespace
       char *start = text;
       char *end = text + text_len - 1;
@@ -331,7 +671,7 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
 
       if (start <= end) {
         size_t trimmed_len = end - start + 1;
-        layout_node->text_content = (char *)malloc(trimmed_len + 1);
+        layout_node->text_content = (char *)tb_alloc(trimmed_len + 1);
         memcpy(layout_node->text_content, start, trimmed_len);
         layout_node->text_content[trimmed_len] = '\0';
       }
@@ -362,6 +702,14 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
     } else {
       free(textarea_text);
     }
+  }
+
+  /* 搜索结果整条可点：<li> 被抽成文本叶子后，里面的 <a> 就不在树里了。
+     把子树里第一个链接的绝对地址记到 li 上，渲染时挂到整条 label 上。
+     只对 li 做（不做 div）：div 动辄包裹半个页面，整块可点会变成误触制造机。 */
+  if (elem_type == ELEMENT_LIST_ITEM && !layout_node->href_resolved &&
+      !li_is_link_wrapper(dom_node)) {
+    layout_node->href_resolved = subtree_first_href(dom_node, context, 0);
   }
 
   // Extract href for links
@@ -639,7 +987,30 @@ RenderResult dom_renderer_build_layout_only(lxb_html_document_t *document,
 
   if (!layout_root) return RENDER_ERROR_PARSE;
 
-  layout_calculate_dimensions(layout_root, context->max_width);
+  /* 视口宽度：max_width <= 0 表示"自动"，交给 <meta viewport> 决定；
+     桌面站没有该 meta，回退 1024。自动模式下移动端页面能按设计宽度排版，
+     不再被 1024 摊开又整体缩到 0.45。 */
+  int screen_w = layout_get_screen_width();
+  if (screen_w <= 0)
+    screen_w = 464;
+  int vp = context->max_width;
+  const bool vp_manual = (vp > 0);
+  if (!vp_manual) {
+    vp = detect_meta_viewport(document, screen_w);
+    if (vp <= 0)
+      vp = 1024;            /* 桌面站：无 viewport meta */
+    if (vp < 320)
+      vp = 320;
+    if (vp > 2048)
+      vp = 2048;
+  }
+  Serial.printf("[Browser] viewport=%d (%s) screen=%d\n", vp,
+                vp_manual ? "manual" : "auto", screen_w);
+
+  /* 记录本次排版所用视口宽度：渲染阶段要用它把整页等比压进屏幕。
+     本函数路径不经过 layout_context_create()，必须显式记录，否则缩放恒为 1.0。 */
+  layout_set_viewport_width(vp);
+  layout_calculate_dimensions(layout_root, vp);
   layout_position_node(layout_root, 0, 10);
 
   *out_root = layout_root;

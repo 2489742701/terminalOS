@@ -1,5 +1,6 @@
 #include "display.h"
 #include "../config/pins.h"
+#include <Arduino_DataBus.h>   /* Cache_WriteBack_Addr */
 
 static const uint8_t BL_LEDC_CH = 0;  // 背光 LEDC 通道
 static bool blPwmReady = false;
@@ -41,6 +42,16 @@ bool Display::begin() {
 }
 
 Arduino_GFX* Display::getGfx() { return gfx; }
+
+uint16_t* Display::getFramebuffer() {
+  /* getFramebuffer() 是 Arduino_ST7701_RGBPanel 的方法，Arduino_GFX 基类没有。
+     这里 panel 就是那个具体类型，直接调即可。 */
+  return panel ? panel->getFramebuffer() : nullptr;
+}
+
+void Display::flushCache(uint32_t addr, uint32_t size) {
+  Cache_WriteBack_Addr(addr, size);
+}
 
 void Display::initBacklightPWM() {
   if (blPwmReady) return;

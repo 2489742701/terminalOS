@@ -14,6 +14,18 @@ typedef struct {
 LvglRenderer *lvgl_renderer_create(void);
 void lvgl_renderer_destroy(LvglRenderer *renderer);
 
+/* 链接点击回传：引擎只负责"把 URL 挂到 widget 上"，真正跳不跳、怎么进历史栈
+   由 app 层决定（引擎不认识当前页/历史栈/是否正在加载）。
+   ⚠️ 回调里**不要**直接 lv_obj_clean() 当前内容 —— 那个 widget 此刻正处在自己的
+   事件回调里，删自己等于在事件派发循环中把 dsc 链表 free 掉（LoadProhibited）。
+   正确做法：只记下 URL，等下一个 UI tick 再真正导航。 */
+typedef void (*LvglLinkCallback)(const char *url);
+void lvgl_renderer_set_link_callback(LvglLinkCallback cb);
+
+/* 诊断计数：本次渲染挂上了多少个可点链接（每次渲染前 reset，渲染后读）。 */
+void lvgl_renderer_reset_link_count(void);
+int lvgl_renderer_link_count(void);
+
 RenderResult arduino_download_html(const char *url, MemoryBuffer *buffer);
 
 /* HTML 下载是否被截断（Content-Length 超过缓冲区上限）。

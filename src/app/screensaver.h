@@ -18,10 +18,15 @@ class ScreenSaver {
   // 任意触摸按下时调用，重置空闲计时
   static void notifyActivity();
 
+  // 抑制息屏：加载网页等长耗时操作期间调用，避免中途被锁屏抢走屏幕
+  // （切走后浏览器 tick 停摆，渲染永远执行不到，表现为"卡住加载不出来"）
+  static void setSuppressed(bool on);
+
   // 任意方向滑动后调用，回到 ACTIVE
   static void unlock();
 
-  // 立即进入锁屏（DIM），用于应用内息屏按钮
+  // 立即熄屏（关背光），用于应用内息屏按钮。
+  // 会先记下当前屏，唤醒后回锁屏页，滑动解锁再回到原来那屏。
   static void sleepNow();
 
  private:
@@ -40,6 +45,9 @@ class ScreenSaver {
   static int pressX;
   static int pressY;
   static bool unlocked;
+  static bool suppressed;  // true = 加载等长耗时操作期间不息屏
+  static bool offArmed;         // OFF 态：已检测到"松手"，之后的按下才允许唤醒
+  static unsigned long offEnteredMs;  // 进入 OFF 的时刻，用于唤醒去抖
 
   static void enterActive();
   static void enterDim(bool captureReturnScr);

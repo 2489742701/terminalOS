@@ -1,11 +1,14 @@
 #include "weather_screen.h"
+#include "../hal/geoip.h"
 #include "icons.h"
 #include "nav.h"
+#include "status_bar.h"
 #include "font_zh.h"
 #include <lvgl.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Arduino.h>
 #include <stdio.h>
 
@@ -18,10 +21,37 @@ lv_obj_t* g_detailLab = nullptr;
 lv_obj_t* g_statusLab = nullptr;
 lv_obj_t* g_refreshBtn = nullptr;
 bool g_fetching = false;
+bool g_forceLocate = false;
 uint32_t g_lastFetch = 0;
 
+/* WMO weather_code -> 中文。open-meteo 给的是 WMO 4677 代码，
+   没有这个表就只能显示数字，看不懂。 */
 const char* wmoDesc(int code) {
-  return "";
+  switch (code) {
+    case 0:  return "晴";
+    case 1:  return "大部晴朗";
+    case 2:  return "局部多云";
+    case 3:  return "阴";
+    case 45: return "雾";
+    case 48: return "冻雾";
+    case 51: case 53: case 55: return "毛毛雨";
+    case 56: case 57: return "冻毛毛雨";
+    case 61: return "小雨";
+    case 63: return "中雨";
+    case 65: return "大雨";
+    case 66: case 67: return "冻雨";
+    case 71: return "小雪";
+    case 73: return "中雪";
+    case 75: return "大雪";
+    case 77: return "米雪";
+    case 80: return "阵雨";
+    case 81: return "强阵雨";
+    case 82: return "暴雨";
+    case 85: case 86: return "阵雪";
+    case 95: return "雷阵雨";
+    case 96: case 99: return "雷暴伴冰雹";
+    default: return "";
+  }
 }
 
 String extractStr(const String& json, const char* key) {
@@ -46,10 +76,6 @@ int extractInt(const String& json, const char* key) {
   return (int)extractFloat(json, key);
 }
 
-void back_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
-}
-
 void swipe_cb(lv_event_t* e) {
   swipe_detect(e, g_swipe, nav_launcher, SWIPE_H);
 }
@@ -57,53 +83,109 @@ void swipe_cb(lv_event_t* e) {
 void refresh_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   g_fetching = true;
+  g_forceLocate = true;      /* 刷新 = 顺便重新定位（IP 变了也能跟上） */
   lv_label_set_text(g_statusLab, "加载中...");
 }
 
+/* 从 from 位置之后找 key（JSON 里 current_units 和 current 有同名字段，
+   不跳过单位块会把 "°C" 当温度解析成 0）。 */
+float extractFloatFrom(const String& json, const char* key, int from) {
+  String pat = String("\"") + key + "\":";
+  int idx = json.indexOf(pat, from);
+  if (idx < 0) return -999;
+  idx += pat.length();
+  return json.substring(idx).toFloat();
+}
+
+/* ══ 数据源 ══
+   2026-09-24：原来用的 uapis.cn 在**设备侧 DNS 解析失败**
+   （串口实锤：hostByName(): DNS Failed for uapis.cn；同一 URL 在 PC 上 200）。
+   换 open-meteo：HTTPS、免 key、响应只有 ~500 B，且在本机一次就连上了。
+   ⚠️ 走 WiFiClientSecure + setInsecure()：HTTPClient 默认会验证书，
+      不 setInsecure 会握手失败（跟浏览器那边的做法一致）。 */
+static String makeWeatherUrl() {
+  /* 坐标来自 IP 定位（GeoIP），定位不到就退回北京。
+     2026-09-24 之前是把北京写死在 URL 里的，所以 master 在南京也看到北京天气。 */
+  double la = GeoIP::lat(), lo = GeoIP::lon();
+  char buf[192];
+  snprintf(buf, sizeof(buf),
+           "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
+           "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code"
+           "&timezone=auto", la, lo);
+  return String(buf);
+}
+
+bool fetchOnce() {
+  WiFiClientSecure cli;
+  cli.setInsecure();
+  cli.setTimeout(12);
+  HTTPClient http;
+  http.setTimeout(12000);
+  http.setUserAgent("Mozilla/5.0");
+  String url = makeWeatherUrl();
+  Serial.printf("[Weather] url %s\n", url.c_str());
+  if (!http.begin(cli, url)) {
+    Serial.println("[Weather] begin failed");
+    return false;
+  }
+  int code = http.GET();
+  Serial.printf("[Weather] HTTP %d\n", code);
+  if (code != 200) { http.end(); return false; }
+  String body = http.getString();
+  http.end();
+  Serial.printf("[Weather] %u B: %.140s\n", (unsigned)body.length(), body.c_str());
+
+  /* ⚠️ 必须从 "current":{ 之后开始找：前面 current_units 里也有
+     temperature_2m（值是 "°C"），不跳过会解析成 0°C。 */
+  int cur = body.indexOf("\"current\":{");
+  if (cur < 0) { Serial.println("[Weather] no current block"); return false; }
+
+  float temp = extractFloatFrom(body, "temperature_2m", cur);
+  if (temp <= -900) { Serial.println("[Weather] no temperature"); return false; }
+  float humidity = extractFloatFrom(body, "relative_humidity_2m", cur);
+  float feels = extractFloatFrom(body, "apparent_temperature", cur);
+  float wcode = extractFloatFrom(body, "weather_code", cur);
+
+  char buf[80];
+  snprintf(buf, sizeof(buf), "%.0f°C", temp);
+  lv_label_set_text(g_tempLab, buf);
+  lv_label_set_text(g_descLab, wmoDesc((int)wcode));
+  snprintf(buf, sizeof(buf), "湿度%.0f%% 体感%.0f°", humidity, feels);
+  lv_label_set_text(g_detailLab, buf);
+  snprintf(buf, sizeof(buf), "WMO %d · %s", (int)wcode, GeoIP::city());
+  lv_label_set_text(g_statusLab, buf);
+  return true;
+}
+
 void fetchWeather() {
+  g_fetching = false;   /* 先落闸：fetchOnce 是阻塞的，别让下一帧重入 */
   if (WiFi.status() != WL_CONNECTED) {
     lv_label_set_text(g_statusLab, "未连接WiFi");
     g_fetching = false;
     return;
   }
-  HTTPClient http;
-  http.setTimeout(8000);
-  http.setUserAgent("Mozilla/5.0");
-
-  if (http.begin("http://uapis.cn/api/v1/misc/weather?adcode=110000&extended=true")) {
-    int code = http.GET();
-    if (code == 200) {
-      String body = http.getString();
-      http.end();
-      float temp = extractFloat(body, "temperature");
-      if (temp > -900) {
-        String weather = extractStr(body, "weather");
-        String windDir = extractStr(body, "wind_direction");
-        String windPower = extractStr(body, "wind_power");
-        float humidity = extractFloat(body, "humidity");
-        float feelsLike = extractFloat(body, "feels_like");
-        int aqi = extractInt(body, "aqi");
-        String aqiCat = extractStr(body, "aqi_category");
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%.0f°C", temp);
-        lv_label_set_text(g_tempLab, buf);
-        lv_label_set_text(g_descLab, weather.c_str());
-        snprintf(buf, sizeof(buf), "湿度%.0f%% %s%s 体感%.0f°",
-                 humidity, windDir.c_str(), windPower.c_str(), feelsLike);
-        lv_label_set_text(g_detailLab, buf);
-        snprintf(buf, sizeof(buf), "AQI %d %s", aqi, aqiCat.c_str());
-        lv_label_set_text(g_statusLab, buf);
-        g_fetching = false;
-        g_lastFetch = millis();
-        return;
-      }
-    }
-    http.end();
+  /* 先定位（有缓存就直接用，不会联网）。放在这里而不是建屏时：
+     定位是阻塞 HTTP，建屏时做会卡住首帧。 */
+  if (g_forceLocate || !GeoIP::valid()) {
+    GeoIP::locate(g_forceLocate);
+    g_forceLocate = false;
   }
 
-  lv_label_set_text(g_statusLab, "天气获取失败");
+  /* DNS 在这个网络里会偶发失败（news.orz.ai 也遇到过一次），
+     所以失败重试一轮，第二次基本都能成。 */
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (fetchOnce()) {
+      g_lastFetch = millis();
+      return;
+    }
+    delay(300);
+  }
+lv_label_set_text(g_statusLab, "天气获取失败");
+  Serial.println("[Weather] FAILED (see lines above for HTTP code / body)");
   g_fetching = false;
 }
+
+
 
 }  // namespace
 
@@ -119,20 +201,10 @@ lv_obj_t* WeatherScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
-  lv_obj_t* back = icon_create(scr, Icon::Back, 36);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_EVENT_BUBBLE);
-  lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t* title = lv_label_create(scr);
-  lv_label_set_text(title, "天气");
-  lv_obj_set_style_text_color(title, lv_color_white(), 0);
-  lv_obj_set_style_text_font(title, &font_zh_24, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+  StatusBar_create(scr, "天气");
 
   lv_obj_t* locLab = lv_label_create(scr);
-  lv_label_set_text(locLab, "北京");
+  lv_label_set_text(locLab, GeoIP::city());
   lv_obj_set_style_text_color(locLab, lv_color_hex(0x888888), 0);
   lv_obj_set_style_text_font(locLab, &font_zh_16, 0);
   lv_obj_align(locLab, LV_ALIGN_TOP_MID, 0, 52);
@@ -183,4 +255,18 @@ lv_obj_t* WeatherScreen_create() {
 
 void WeatherScreen_tick() {
   if (g_fetching) fetchWeather();
+}
+
+/* 串口入口：weather —— 直接拉一次并打印诊断，不用点屏幕。
+   ⚠️ 必须在匿名 namespace 之外：namespace 里的函数是内部链接，
+      serial_console.cpp 那边链接不到（踩过：undefined reference）。 */
+bool WeatherScreen_fetchNow(const char* adcode) {
+  if (!g_statusLab) {
+    Serial.println("[Weather] screen not created yet");
+    return false;
+  }
+  (void)adcode;   /* adcode 目前固定北京 110000，见 fetchWeather 里的 s_url */
+  g_fetching = true;
+  fetchWeather();
+  return true;
 }

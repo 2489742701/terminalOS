@@ -1,6 +1,7 @@
 #include "layout_engine.h"
 #include "css_parser.h"
 #include "tactilebrowser_core.h"
+#include "lvgl_renderer.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,19 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+
+/* ── 递归深度上限（防御性）──────────────────────────────────────────────
+ * 2026-09-23 崩溃复盘：原实现把 next_sibling 也做成递归，导致遍历一棵树的
+ * 递归深度 = **节点总数**（几百到上千）。而 loopTask 的栈默认只有 8192 B ——
+ * 必应搜索页 356 个节点侥幸过关，乐鑫官网那种更多节点的页面直接
+ * "A stack overflow in task loopTask has been detected" 重启，且因为 RGB
+ * 并行屏由 DMA 自行刷新，画面还在、触摸全失效，极具迷惑性。
+ *
+ * 修复：兄弟节点改用迭代（已改），递归深度 = 树的真实嵌套层数；
+ * 再给剩下的父子递归加一道上限，畸形页面（如无限嵌套的 JS 生成 DOM）
+ * 剪断子树而不是继续压栈。正常网页嵌套层数一般 < 30，这里给充分余量。
+ */
+#define MAX_LAYOUT_DEPTH 64
 // Default box model values
 static const LayoutBox DEFAULT_BOX = {
     .margin = {0, 0, 0, 0},
@@ -216,7 +230,7 @@ void layout_engine_cleanup(void) {
 
 // Create a new layout node
 LayoutNode *layout_node_create(ElementType type) {
-  LayoutNode *node = (LayoutNode *)calloc(1, sizeof(LayoutNode));
+  LayoutNode *node = (LayoutNode *)tb_calloc(1, sizeof(LayoutNode));
   if (!node)
     return NULL;
 
@@ -380,6 +394,20 @@ void layout_node_add_child(LayoutNode *parent, LayoutNode *child) {
   }
 }
 
+/* 排版视口宽度：渲染阶段据此计算缩放系数 */
+static int s_layoutWidth = 0;
+
+/* 排版入口必须调用它记录视口宽度。
+   注意：dom_renderer 的 build_layout_only 路径不经过 layout_context_create()，
+   若不显式调用本函数，s_layoutWidth 恒为 0 → 缩放系数恒为 1.0 → 整页只能露出左上角。 */
+void layout_set_viewport_width(int width) { s_layoutWidth = width; }
+
+/* 屏幕内容区宽度（本项目 464）。由 UI 侧在进入浏览器时告知，
+   dom_renderer 处理 <meta viewport width=device-width> 时用它作为目标宽度。 */
+static int s_screenWidth = 0;
+void layout_set_screen_width(int width) { s_screenWidth = width; }
+int layout_get_screen_width(void) { return s_screenWidth; }
+
 // Initialize layout context
 LayoutContext *layout_context_create(RenderContext *render_ctx) {
   LayoutContext *ctx = (LayoutContext *)calloc(1, sizeof(LayoutContext));
@@ -391,6 +419,11 @@ LayoutContext *layout_context_create(RenderContext *render_ctx) {
   ctx->current_x = 0;
   ctx->current_y = 0;
   ctx->max_line_height = 0;
+
+  /* 记住本次排版使用的视口宽度：渲染阶段要用它算缩放系数。
+     排版用宽视口（如 1024，桌面页面的设计宽度），渲染时再等比压到屏幕宽度，
+     这样整页能"挤"进 480px 的屏幕，而不是只露出左上角一小块。 */
+  s_layoutWidth = render_ctx->max_width;
 
   return ctx;
 }
@@ -718,7 +751,12 @@ void layout_calculate_dimensions(LayoutNode *node, int available_width) {
   }
 }
 
-// Position node and children
+/* ── 定位 + 行内换行 ──────────────────────────────────────────────────
+ * 旧逻辑：行内兄弟一路 child_x += 总宽，从不回头 —— 一行能排到几千 px 宽，
+ * 屏幕上只剩左上角一小块；加上 label 是 lv_pct(100) 宽（见 lvgl_renderer），
+ * 只要 x>0 就必然戳出右边界。这就是"排版混乱 / 左右越界"的根因。
+ * 现在：行内元素放不下就回到行首（居左）往下换行。
+ * 只在左右方向限制；上下方向不做任何限制，该多长就多长，靠滚动看。 */
 void layout_position_node(LayoutNode *node, int parent_x, int parent_y) {
   if (!node)
     return;
@@ -727,25 +765,45 @@ void layout_position_node(LayoutNode *node, int parent_x, int parent_y) {
   node->box.x = parent_x + node->box.margin.left;
   node->box.y = parent_y + node->box.margin.top;
 
-  // Position children
-  if (node->first_child) {
-    int child_x = node->box.x + node->box.padding.left + node->box.border.left;
-    int child_y = node->box.y + node->box.padding.top + node->box.border.top;
+  if (!node->first_child)
+    return;
 
-    LayoutNode *child = node->first_child;
-    while (child) {
-      layout_position_node(child, child_x, child_y);
+  const int content_left =
+      node->box.x + node->box.padding.left + node->box.border.left;
+  int child_x = content_left;
+  int child_y = node->box.y + node->box.padding.top + node->box.border.top;
 
-      // Move down for next block-level child
-      if (child->box.is_block) {
-        child_y += layout_get_total_height(&child->box);
-      } else {
-        // Inline elements flow horizontally
-        child_x += layout_get_total_width(&child->box);
-      }
+  /* 右边界：容器没显式宽时退回屏幕内容宽 */
+  const int content_w = (node->box.width > 0)
+                            ? node->box.width
+                            : (s_screenWidth > 0 ? s_screenWidth : 0);
+  const int right_limit = node->box.x + content_w;
+  int line_h = 0;
 
-      child = child->next_sibling;
+  LayoutNode *child = node->first_child;
+  while (child) {
+    const int cw = layout_get_total_width(&child->box);
+    const int ch = layout_get_total_height(&child->box);
+
+    /* 行内元素塞不进本行 → 回到行首、往下挪一行 */
+    if (!child->box.is_block && content_w > 0 && cw > 0 &&
+        child_x > content_left && child_x + cw > right_limit) {
+      child_x = content_left;
+      child_y += (line_h > 0) ? line_h : node->box.line_height;
+      line_h = 0;
     }
+
+    layout_position_node(child, child_x, child_y);
+
+    if (child->box.is_block) {
+      child_y += ch;
+      line_h = 0;
+    } else {
+      child_x += cw;
+      if (ch > line_h) line_h = ch;
+    }
+
+    child = child->next_sibling;
   }
 }
 
@@ -829,12 +887,53 @@ static char *layout_trim_text(const char *text) {
      推算 150 个    ~57 KB → used 约 61%，池仍有 ~51KB 余量
    所以 150 是安全的。原值 80 是当初 DRAM 紧张时的保守闸门，
    但它并非内存保护 —— 它只是把第 81 个及以后的内容**直接丢弃**，
-   这才是页面"破碎"的真正原因。详见 docs/06。 */
-#define MAX_WIDGETS 150
+   这才是页面"破碎"的真正原因。详见 docs/06。
+   2026-09-23 二修：修掉"外层元素有文本就吞掉整棵子树"的 bug 后，
+   节点能真正走到底，150 会在长页面上撞顶。按上面同一套推算，
+   200 个 ≈ 76KB → used 约 78%，池仍有 ~28KB 余量。 */
+#define MAX_WIDGETS 200
 static int s_widgetCount = 0;
+/* 平铺诊断 dump 的行上限（串口 `flatdump <n>` 可调）。
+   默认 60：再多就刷屏，且会拖慢渲染。查「下一页」这类排在
+   后面的行时把它调大（实测必应分页在第 60 行之后）。 */
+static int s_flatDumpLimit = 60;
+
+/* 平铺：胶囊最多画多长的文字（字节）。超过就不当"小按钮"了，退回普通整行文本，
+   免得一整句话被塞进一个框里。24 个汉字 / 72 个字母以内算小按钮。 */
+#define FLAT_CHIP_MAX_BYTES 72
+
+/* 平铺：当前正在往里塞胶囊的那个 flex row-wrap 行容器。
+   遇到任何非胶囊控件（普通文本/输入框）就置空 —— 那是区块边界，要另起一行。
+   渲染跑在 UI 任务里、单线程，用文件静态量即可。 */
+static void *s_rowContainer = NULL;
+
+static bool flat_wants_chip(LayoutNode *n) {
+  if (n->type != ELEMENT_LINK && n->type != ELEMENT_BUTTON)
+    return false;
+  if (!n->text_content || !n->text_content[0])
+    return false;
+  return (strlen(n->text_content) <= FLAT_CHIP_MAX_BYTES);
+}
+
+/* 点击后要跳的目标 URL。
+   ⚠️ **必须优先绝对 URL**：href_path 是 tactilebrowser_extract_path() 去掉
+   scheme+host 后的纯路径（"/s?word=x"），拿去重新 fetch 连主机都没有，必然失败。
+   href_resolved 才是 dom_renderer 用 document_url 解析过的完整地址。
+   只有它缺失时才退到原始 href（可能是相对路径，app 层再做一次兜底解析）。 */
+static const char *flat_link_target(LayoutNode *n) {
+  if (n->href_resolved && n->href_resolved[0]) return n->href_resolved;
+  if (n->href && n->href[0])                   return n->href;
+  if (n->href_path && n->href_path[0])         return n->href_path;
+  return NULL;
+}
+
+/* 平铺模式开关。完整说明见文件后段 layout_flatten_tree() 上方的注释块；
+   这里提前定义，因为 layout_render_node() 要读它。 */
+static bool s_flatMode = true;
 
 static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
-                               void *parent_widget) {
+                               void *parent_widget, int depth) {
+  if (depth > MAX_LAYOUT_DEPTH) return;
   if (!node || !render_ctx || !render_ctx->renderer)
     return;
 
@@ -858,36 +957,115 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     renderer->platform_data = parent;
   }
 
-  if (node->type == ELEMENT_INPUT_TEXT && iface->create_text_input && !widget_limit_reached) {
-
+  /* 输入框 **和 textarea** 都渲染成单行输入框。
+     ⚠️ 2026-09-23：搜索框并不一定是 <input> —— 必应的是
+        <textarea id="sb_form_q" type="search" rows="1">，当年为了省 DRAM
+        把 textarea 整个跳过，结果必应里**根本看不见搜索框**。
+        现在 LVGL 池已在 PSRAM、DRAM 有 250KB，这个限制不成立。 */
+  if ((node->type == ELEMENT_INPUT_TEXT || node->type == ELEMENT_TEXTAREA) &&
+      iface->create_text_input && !widget_limit_reached) {
+    /* textarea 的 form_value 是它的**整段 innerText**（可能几十 KB），
+       原样塞给单行输入框会拖慢渲染，截到 256 B 足够看。 */
+    char *capped = NULL;
+    const char *shown_value = form_value;
+    if (shown_value && strlen(shown_value) > 256) {
+      capped = (char *)malloc(257);
+      if (capped) {
+        memcpy(capped, shown_value, 256);
+        capped[256] = '\0';
+        shown_value = capped;
+      }
+    }
     node->widget = iface->create_text_input(
-        render_ctx->renderer, form_value, placeholder, node->box.x, node->box.y,
+        render_ctx->renderer, shown_value, placeholder, node->box.x, node->box.y,
         node->box.width, node->box.height);
+    free(capped);
     widget = node->widget;
     if (widget) s_widgetCount++;
+    s_rowContainer = NULL;            /* 输入框是区块，胶囊行到此为止 */
     layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
                                  widget);
-  } else if (node->type == ELEMENT_TEXTAREA) {
-    /* 跳过 textarea：lv_textarea_create 创建大量 LVGL 对象导致 DRAM 不足崩溃。
-       后续可用 label 或自定义容器替代。仍递归渲染子节点（textarea 内文本）。 */
-
+  } else if (s_flatMode && flat_wants_chip(node) && !widget_limit_reached &&
+             iface->create_chip && iface->create_row_wrap) {
+    /* 平铺：链接/小按钮 → 带框胶囊，排进一个 flex row-wrap 行里。
+       这样"能点"看得出来，导航条也还是横的一排（放不下自动换行）。 */
+    char *trimmed_text = layout_trim_text(node->text_content);
+    if (trimmed_text && trimmed_text[0]) {
+      if (!s_rowContainer) {
+        void *saved = renderer->platform_data;
+        renderer->platform_data = parent;
+        s_rowContainer = iface->create_row_wrap(renderer, render_ctx->max_width);
+        renderer->platform_data = saved;
+        if (s_rowContainer) s_widgetCount++;
+      }
+      if (s_rowContainer) {
+        void *saved = renderer->platform_data;
+        renderer->platform_data = s_rowContainer;
+        node->widget = iface->create_chip(renderer, trimmed_text,
+                                          render_ctx->max_width - 8,
+                                          node->box.color);
+        renderer->platform_data = saved;
+        widget = node->widget;
+        if (widget) {
+          s_widgetCount++;
+          if (s_widgetCount <= s_flatDumpLimit) {
+            Serial.printf("[Flat] %3d [%s]\n", s_widgetCount - 1, trimmed_text);
+          }
+          if (iface->set_text_color)
+            iface->set_text_color(renderer, widget, node->box.color);
+          if (node->type == ELEMENT_LINK && iface->register_link_handler) {
+            const char *link_target = flat_link_target(node);
+            if (link_target && link_target[0] != '\0')
+              iface->register_link_handler(renderer, widget, link_target);
+          }
+        }
+      }
+    }
+    free(trimmed_text);
   } else if (node->text_content && strlen(node->text_content) > 0 && !widget_limit_reached) {
     /* 布局意图：trim 前导/尾部空格，避免开头空格太多 */
     char *trimmed_text = layout_trim_text(node->text_content);
     if (trimmed_text) {
+      /* 平铺装饰：列表项加 "- " 前缀。平铺后没有缩进也没有项目符号，
+         不加标记就和普通段落完全一样，看不出这是列表。 */
+      char *shown = trimmed_text;
+      char *decorated = NULL;
+      if (s_flatMode && node->type == ELEMENT_LIST_ITEM) {
+        size_t n = strlen(trimmed_text) + 3;
+        decorated = (char *)malloc(n);
+        if (decorated) {
+          snprintf(decorated, n, "- %s", trimmed_text);
+          shown = decorated;
+        }
+      }
 
-      if (node->type == ELEMENT_BUTTON && iface->create_button) {
+      /* 平铺下按钮也走 label：create_button 造的是固定 70x35 的 lv_btn，
+         中文两三个字就被切掉，还不如一行满宽文本 */
+      if (node->type == ELEMENT_BUTTON && iface->create_button && !s_flatMode) {
         node->widget = iface->create_button(
-            render_ctx->renderer, trimmed_text, node->box.x, node->box.y);
+            render_ctx->renderer, shown, node->box.x, node->box.y);
       } else if (iface->create_label) {
         node->widget = iface->create_label(
-            render_ctx->renderer, trimmed_text, node->box.x, node->box.y);
+            render_ctx->renderer, shown, node->box.x, node->box.y);
+        /* 搜索结果：条目之间空一格 + 一条分隔线，一眼分得出哪条是哪条 */
+        if (s_flatMode && node->type == ELEMENT_LIST_ITEM && node->widget &&
+            iface->style_result_item)
+          iface->style_result_item(render_ctx->renderer, node->widget);
+        /* 诊断：平铺模式下把实际渲染出来的每一行打到串口（只打前 60 行）。
+           没有它就没法确认"行内合并"到底有没有把导航条并成一行。 */
+        if (s_flatMode && s_widgetCount <= s_flatDumpLimit) {
+          Serial.printf("[Flat] %3d %c %s\n", s_widgetCount,
+                        (node->type == ELEMENT_LINK) ? 'L' : ' ', shown);
+        }
       }
+      free(decorated);
       free(trimmed_text);
     }
 
     widget = node->widget;
     if (widget) s_widgetCount++;
+    if (widget)
+      s_rowContainer = NULL;        /* 普通整行文本是区块，胶囊行到此为止 */
 
     if (widget && iface->set_text_color) {
       iface->set_text_color(render_ctx->renderer, widget, node->box.color);
@@ -899,11 +1077,8 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
     layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
                                  widget);
 
-    if (widget && node->type == ELEMENT_LINK && iface->register_link_handler) {
-      const char *link_target =
-          node->href_path
-              ? node->href_path
-              : (node->href_resolved ? node->href_resolved : node->href);
+    if (widget && iface->register_link_handler) {
+      const char *link_target = flat_link_target(node);
       if (link_target && link_target[0] != '\0') {
         iface->register_link_handler(render_ctx->renderer, widget, link_target);
       }
@@ -912,37 +1087,46 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
 
     bool reuse_parent =
         (node->parent == NULL && parent == render_ctx->root_container);
-    /* 布局意图：有 bg_color 或 text_align 或显式宽高 → 创建容器；
-       行布局（多个子 div/link）→ 创建容器；
-       无样式 div → 透明传递，子节点直接平铺到 parent */
-    bool has_layout_intent = node->box.has_explicit_bg_color ||
-                             node->box.text_align != 0 ||
-                             (node->box.width > 0 && !node->box.width_auto);
-    bool should_be_row = layout_should_be_row(node);
-    if (reuse_parent) {
-      node->widget = parent;
-      /* 根容器若是行布局，切换 flex 方向 */
-      if (should_be_row && iface->set_flex_direction) {
-        iface->set_flex_direction(render_ctx->renderer, parent, 2);
-      }
-    } else if ((has_layout_intent || should_be_row) && iface->create_container && !widget_limit_reached) {
-      node->widget = iface->create_container(render_ctx->renderer, node->box.x,
-                                             node->box.y, node->box.width,
-                                             node->box.height);
-      if (node->widget) s_widgetCount++;
-    }
 
-    widget = node->widget;
-    if (widget && widget != parent) {
-      layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
-                                   widget);
-      /* 容器也应用 text_align */
-      if (iface->set_text_align && node->box.text_align != 0) {
-        iface->set_text_align(render_ctx->renderer, widget, node->box.text_align);
+    if (s_flatMode) {
+      /* 平铺：div 不产生任何盒子，子节点直接挂到最近的真实容器。
+         只有根节点复用 root_container，其余一律 widget = NULL。 */
+      if (reuse_parent)
+        node->widget = parent;
+      widget = node->widget;
+    } else {
+      /* 布局意图：有 bg_color 或 text_align 或显式宽高 → 创建容器；
+         行布局（多个子 div/link）→ 创建容器；
+         无样式 div → 透明传递，子节点直接平铺到 parent */
+      bool has_layout_intent = node->box.has_explicit_bg_color ||
+                               node->box.text_align != 0 ||
+                               (node->box.width > 0 && !node->box.width_auto);
+      bool should_be_row = layout_should_be_row(node);
+      if (reuse_parent) {
+        node->widget = parent;
+        /* 根容器若是行布局，切换 flex 方向 */
+        if (should_be_row && iface->set_flex_direction) {
+          iface->set_flex_direction(render_ctx->renderer, parent, 2);
+        }
+      } else if ((has_layout_intent || should_be_row) && iface->create_container && !widget_limit_reached) {
+        node->widget = iface->create_container(render_ctx->renderer, node->box.x,
+                                               node->box.y, node->box.width,
+                                               node->box.height);
+        if (node->widget) s_widgetCount++;
       }
-      /* 行布局：切换为 flex row */
-      if (should_be_row && iface->set_flex_direction) {
-        iface->set_flex_direction(render_ctx->renderer, widget, 2);
+
+      widget = node->widget;
+      if (widget && widget != parent) {
+        layout_apply_background_fill(iface, render_ctx->renderer, &node->box,
+                                     widget);
+        /* 容器也应用 text_align */
+        if (iface->set_text_align && node->box.text_align != 0) {
+          iface->set_text_align(render_ctx->renderer, widget, node->box.text_align);
+        }
+        /* 行布局：切换为 flex row */
+        if (should_be_row && iface->set_flex_direction) {
+          iface->set_flex_direction(render_ctx->renderer, widget, 2);
+        }
       }
     }
   }
@@ -955,10 +1139,511 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
   LayoutNode *child = node->first_child;
   static int s_renderCount = 0;  /* 渲染节点计数器，定期让 CPU 喘气 */
   while (child) {
-    layout_render_node(child, render_ctx, next_parent);
+    layout_render_node(child, render_ctx, next_parent,
+                     depth + 1);
     child = child->next_sibling;
     /* 每 30 个节点让 Core1 WiFi 任务喘 1ms */
     if (++s_renderCount % 30 == 0) vTaskDelay(1);
+  }
+}
+
+/* ── 整页缩放 ──
+   排版按宽视口（如 1024 = 桌面页面的设计宽度）进行，屏幕只有 ~460px 宽。
+   不缩放的话，宽视口排出来的内容会横向溢出，屏幕上只剩左上角一小块。
+   这里在渲染前把整棵布局树的几何量等比压缩到屏幕宽度，让整页"挤"进屏幕。
+   注意：LVGL 字体是离散点阵（本项目中文只有 16px），文字无法跟着连续缩放，
+   所以缩放只作用于几何（位置/尺寸/间距），文字仍走最小可读字号。 */
+static void layout_scale_spacing(BoxSpacing *s, float f) {
+  s->top = (int)(s->top * f);
+  s->right = (int)(s->right * f);
+  s->bottom = (int)(s->bottom * f);
+  s->left = (int)(s->left * f);
+}
+
+static void layout_scale_tree(LayoutNode *node, float f) {
+  if (!node) return;
+  while (node) {
+    LayoutBox *b = &node->box;
+    b->x = (int)(b->x * f);
+    b->y = (int)(b->y * f);
+    if (b->width > 0) {
+      b->width = (int)(b->width * f);
+      if (b->width < 1) b->width = 1;
+    }
+    if (b->height > 0) {
+      b->height = (int)(b->height * f);
+      if (b->height < 1) b->height = 1;
+    }
+    if (b->font_size > 0) {
+      b->font_size = (int)(b->font_size * f);
+      if (b->font_size < 6) b->font_size = 6;
+    }
+    if (b->line_height > 0) {
+      b->line_height = (int)(b->line_height * f);
+      if (b->line_height < 6) b->line_height = 6;
+    }
+    layout_scale_spacing(&b->margin, f);
+    layout_scale_spacing(&b->padding, f);
+    layout_scale_spacing(&b->border, f);
+
+    layout_scale_tree(node->first_child, f);
+    node = node->next_sibling;
+  }
+}
+
+/* ── 横向钳制（兜底）────────────────────────────────────────────────────
+ * 换行只能处理"行内兄弟排得太长"，挡不住显式宽高超大、负 margin、以及
+ * 缩放后残留的越界。这里在缩放之后统一把每个盒子夹进 [0, maxW]：
+ *   · 比屏幕还宽的盒子 → 砍到屏幕宽（标签是 lv_pct(100)，光挪 x 没用）
+ *   · 左边越界 → 拉回 0
+ *   · 右边越界 → 整体左移到贴住右边界
+ * 例外：x < -maxW 的认为是站点刻意藏到屏外（skip-link 之类），不去动它。
+ * 上下方向完全不碰。 */
+static void layout_clamp_horizontal(LayoutNode *node, int maxW) {
+  if (!node || maxW <= 0) return;
+  while (node) {
+    LayoutBox *b = &node->box;
+
+    if (b->width > maxW) b->width = maxW;
+    if (b->x >= -maxW && b->x < 0) b->x = 0;
+    if (b->width > 0 && b->x + b->width > maxW) {
+      int nx = maxW - b->width;
+      b->x = (nx > 0) ? nx : 0;
+    }
+
+    layout_clamp_horizontal(node->first_child, maxW);
+    node = node->next_sibling;
+  }
+}
+
+/* ── 平铺模式 ────────────────────────────────────────────────────────────
+ * 2026-09-23：放弃"还原 CSS 版面"这条路，改为手工平铺。
+ *
+ * 为什么 CSS 版面救不回来：www.baidu.com 有 400 个节点，但排出来 contentH 只有
+ * 187px —— 因为 PC 站大量用 float / absolute / flex，本引擎一个都不支持，
+ * 绝大多数块被算成 0 高，页面直接塌掉。横向钳制救不了"高度为 0"。
+ *
+ * 平铺为什么能根治"排版混乱"（代码层面三件事同时消失）：
+ *   1) create_label 根本不用 x/y —— lvgl_renderer 里是 (void)x; (void)y;，
+ *      位置交给父容器的 flex 排。所以几何量算错对 label 没影响。
+ *   2) 唯一吃绝对坐标的是 create_container（lv_obj_set_pos(x, y)）。
+ *      CSS 算出来的 x/y/height 在本引擎里大量是 0 或离谱值 → 容器互相压盖、
+ *      零高度、子元素整体不可见。这就是"搜索框不见了""整块内容空白"的真凶。
+ *   3) should_be_row 还会把容器切成 LV_FLEX_FLOW_ROW → 内容一路往右溢出，
+ *      配合 label 的 lv_pct(100) 必然戳出右边界。
+ *   不建容器 → 1/2/3 一起消失，且左右方向天然不可能越界（label 恒为满宽）。
+ *
+ * 结果：每个文本/链接/输入框都是满宽、居左、自上而下的一块，靠滚动看。
+ * 这就是 master 要的"按 div 换行 / 平铺"。 */
+void layout_set_flat_mode(bool on) { s_flatMode = on; }
+void layout_set_flat_dump_limit(int n) {
+  s_flatDumpLimit = (n < 0) ? 0 : (n > 2000 ? 2000 : n);
+}
+bool layout_get_flat_mode(void) { return s_flatMode; }
+
+/* 平铺模式的几何规范化：只改造渲染器真正会用的那几个字段。 */
+static void layout_flatten_tree(LayoutNode *node, int maxW) {
+  if (!node) return;
+  while (node) {
+    LayoutBox *b = &node->box;
+
+    b->x = 0;                 /* 一律居左 */
+    b->text_align = 0;
+    b->is_block = true;       /* 不再有"行内并排"，全部各占一行 */
+    b->is_inline_block = false;
+    if (maxW > 0)
+      b->width = maxW;
+
+    /* 字号/行高给可读下限：CSS 里常见的 12px 会把行高压没 */
+    if (b->font_size < 12)
+      b->font_size = 14;
+    if (b->line_height < b->font_size + 4)
+      b->line_height = b->font_size + 6;
+
+    /* 配色：链接蓝、标题白、正文灰 —— 平铺下没有版面，只能靠颜色分层 */
+    if (!b->has_explicit_color) {
+      if (node->type == ELEMENT_LINK)
+        b->color = 0x6AB7FF;
+      else if (node->type >= ELEMENT_HEADING1 && node->type <= ELEMENT_HEADING6)
+        b->color = 0xFFFFFF;
+      else
+        b->color = 0xCCCCCC;
+    }
+
+    /* 输入框：平铺里给满宽单行，别再用 CSS 的 240x32（也别用多行 textarea） */
+    if (node->type == ELEMENT_INPUT_TEXT || node->type == ELEMENT_TEXTAREA) {
+      b->width = (maxW > 24) ? (maxW - 24) : maxW;
+      b->height = 40;
+      b->height_auto = false;
+      b->width_auto = false;
+    }
+
+    layout_flatten_tree(node->first_child, maxW);
+    node = node->next_sibling;
+  }
+}
+
+/* ── 垃圾过滤（平铺模式下的"少渲染"规则集）──────────────────────────────
+ * 480x480 的屏上一行就是钱。这些文本对"看内容"毫无贡献：
+ *   - 加载/刷新状态占位（"正在加载"、"正在刷新"、"上滑加载更多"…）
+ *   - 纯分隔符（"|" "·" ">" 这类导航条里用来分隔的零碎节点）
+ * 命中就把它 text_content 清掉 → 渲染时自然不产控件，子树不受影响。
+ */
+static const char *kFlatJunkPhrases[] = {
+    "正在刷新",   "正在加载",   "正在编译",   "正在解析",   "正在渲染",
+    "正在获取",   "正在提交",   "正在请求",   "正在打开",   "正在跳转",
+    "加载中",     "刷新中",     "上滑加载更多", "下拉加载更多", "上拉加载更多",
+    "下拉刷新",   "上拉刷新",   "下拉加载",   "上拉加载",   "加载更多",
+    /* 必应 SERP 的壳子文本（有些是 span 不是链接，只能按文本杀） */
+    "切换到国际版", "时间不限", "搜索工具", "分页",
+    NULL,
+};
+
+/* ASCII 垃圾短语（大小写不敏感） */
+static const char *kFlatJunkPhrasesAscii[] = {"loading", "please wait",
+                                              "just a moment", NULL};
+
+static bool flat_is_separator_only(const char *s) {
+  const unsigned char *p = (const unsigned char *)s;
+  while (*p) {
+    if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '|' ||
+        *p == '>' || *p == '/' || *p == '\\' || *p == '-' || *p == '_') {
+      p++;
+      continue;
+    }
+    if (*p < 0x80)
+      return false;                     /* 其它 ASCII 实字 */
+    /* 非 ASCII：把 UTF-8 整字跳过去。· — » 这类全角分隔符单独判 */
+    int nb = 2;
+    if ((*p & 0xF0) == 0xE0)
+      nb = 3;
+    else if ((*p & 0xF8) == 0xF0)
+      nb = 4;
+    if (nb == 3 && p[1] == 0xC2 && p[2] == 0xB7)
+      ;                                 /* "·" 中点，算分隔符 */
+    else
+      return false;
+    p += nb;
+  }
+  return true;                          /* 全是分隔符/空白 */
+}
+
+static bool flat_is_junk_text(const char *s) {
+  if (!s || !s[0])
+    return true;
+  if (flat_is_separator_only(s))
+    return true;
+  for (int i = 0; kFlatJunkPhrases[i]; i++) {
+    if (strstr(s, kFlatJunkPhrases[i]))
+      return true;
+  }
+  /* ASCII 短语：临时转小写再比（文本短，栈上够用） */
+  size_t n = strlen(s);
+  if (n < 256) {
+    char low[256];
+    for (size_t i = 0; i <= n; i++) {
+      char c = s[i];
+      low[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    for (int i = 0; kFlatJunkPhrasesAscii[i]; i++) {
+      if (strstr(low, kFlatJunkPhrasesAscii[i]))
+        return true;
+    }
+  }
+  return false;
+}
+
+/* 必应的时间筛选链接（filters=ex1...）：本机上点了没效果（必应对我们的 UA
+   直接忽略 filters 参数，实测结果与不带筛选完全相同），只会挤掉真结果。 */
+static bool flat_is_serp_chrome_link(LayoutNode *n) {
+  if (!n) return false;
+  const char *h = n->href_resolved ? n->href_resolved
+                                   : (n->href ? n->href : n->href_path);
+  if (!h) return false;
+  /* 「下一页」是必应唯一的真翻页入口，必须留（FORM=PORE）。
+     ⚠️ 实测提醒：必应对我们这种无 JS、无历史 cookie 的客户端只给一份固定
+     ~10 条的语料，即使带 FPIG token + first=11 结果也 90% 重叠。留着它是
+     因为这是官方入口，删了用户就彻底没得翻；但别指望它能翻出新东西。 */
+  if (strstr(h, "FORM=PORE") != NULL) return false;
+  if (strstr(h, "filters=ex1") != NULL) return true;   /* 24小时/一周/一个月/去年 */
+  if (strstr(h, "qpvt=") != NULL) return true;         /* 「全部」「时间不限」「网页」 */
+  if (strstr(h, "FORM=HDRSC") != NULL) return true;    /* 顶部导航：图片/视频/学术/词典/航班 */
+  if (strstr(h, "first=") != NULL) {
+    /* 数字页码「2」「3」：只在**文本是纯数字**时才删。
+       ⚠️ 不能无条件删：<li class="b_pag"> 这个分页容器会从子树继承
+       href_resolved（dom_renderer.cpp 的 subtree_first_href 只对 li 做），
+       它的 href 同样带 first=，无条件删会把整块分页连坐掉，「下一页」
+       也就跟着没了（2026-09-23 实测踩到）。容器文本是「分页123下一页」
+       这种长的，纯数字判断正好把它排除。 */
+    const char *t = n->text_content;
+    if (!t || !t[0]) return true;                 /* 无文本：纯壳子，删 */
+    size_t len = strlen(t);
+    if (len > 3) return false;                    /* 太长 = 容器，放过 */
+    for (size_t i = 0; i < len; i++) {
+      if (t[i] < '0' || t[i] > '9') return false;
+    }
+    return true;                                  /* 1~3 位纯数字 = 页码 */
+  }
+  static const char *kSerpVerticals[] = {
+      "/images/search", "/videos/search", "/academic/search",
+      "/dict/search",   "/travel/search", "/maps/", NULL};
+  for (int i = 0; kSerpVerticals[i]; i++) {
+    if (strstr(h, kSerpVerticals[i]) != NULL) return true;
+  }
+  return false;
+}
+/* ── 伪链接判定：这些 href 点了本就不该有反应 ──────────────────────────────
+ * 现代站点的导航里塞满了 javascript: void(0);（纯 JS 下拉菜单占位按钮）、
+ * mailto:/tel:（唤起别的应用）、#anchor（页内锚点）。
+ *
+ * 2026-09-23 实测（乐鑫官网）：一页 197 个"可点链接"里大半是这类东西，
+ * 而 widget 配额只有 MAX_WIDGETS=200 —— 菜单把配额吃光，正文
+ * （id="main" 落在 54.9% 处）永远排不到号，表现就是"页面加载了但什么都看不到"。
+ *
+ * ⚠️ 难点：这些 href 常被拼上域名前缀，变成
+ *    https://host/path/javascript: void(0);
+ * 所以除了看前缀，还得看**子串**。
+ */
+static bool flat_is_pseudo_href(const char* h) {
+  if (!h || !h[0]) return true;
+  if (h[0] == '#') return true;                 /* 页内锚点 */
+  static const char* kSchemes[] = {
+      "javascript:", "mailto:", "tel:", "data:", "about:", "blob:",
+      "sms:", "intent:", "weixin:", "alipays:", nullptr};
+  for (int i = 0; kSchemes[i]; i++) {
+    size_t n = strlen(kSchemes[i]);
+    if (strncasecmp(h, kSchemes[i], n) == 0) return true;
+  }
+  if (strstr(h, "javascript:") != NULL) return true;
+  if (strstr(h, "void(0)") != NULL) return true;
+  return false;
+}
+
+static int layout_drop_junk(LayoutNode *node, int depth) {
+  if (depth > MAX_LAYOUT_DEPTH) return 0;
+  if (!node)
+    return 0;
+  int n = 0;
+  for (LayoutNode *c = node->first_child; c; c = c->next_sibling)
+    n += layout_drop_junk(c, depth + 1);
+  if (node->text_content && flat_is_junk_text(node->text_content)) {
+    free(node->text_content);
+    node->text_content = NULL;
+    n++;
+  }
+  if (flat_is_serp_chrome_link(node)) {
+    if (node->text_content) { free(node->text_content); node->text_content = NULL; }
+    if (node->href)          { free(node->href);         node->href = NULL; }
+    if (node->href_resolved) { free(node->href_resolved); node->href_resolved = NULL; }
+    if (node->href_path)     { free(node->href_path);     node->href_path = NULL; }
+    n++;
+  }
+  /* 伪链接（JS 菜单占位 / 锚点 / mailto:）整块不渲染：
+     点了也不会有反应，却占着 MAX_WIDGETS 的配额。清掉 text_content
+     渲染时就不再产控件 —— 省下的配额留给正文。 */
+  if (node->href && flat_is_pseudo_href(node->href)) {
+    if (node->text_content) { free(node->text_content); node->text_content = NULL; }
+    if (node->href)          { free(node->href);         node->href = NULL; }
+    if (node->href_resolved) { free(node->href_resolved); node->href_resolved = NULL; }
+    if (node->href_path)     { free(node->href_path);     node->href_path = NULL; }
+    n++;
+  }
+  return n;
+}
+
+/* ── 行内合并（平铺模式下的"行"规则集）──────────────────────────────────
+ * 纯平铺会把「我的关注」「我的收藏」「皮肤中心」「用户反馈」这种导航条拆成四行，
+ * 一屏就废了。规则：
+ *   1. 参与合并的只有行内元素（a/span/strong/em/b/i/u），块级元素各占一行；
+ *   2. 同一"种类"才合并：链接只跟链接并，普通文本只跟普通文本并
+ *      —— 否则整行会因为其中一个是链接而全染成蓝色，语义就糊了；
+ *   3. 按估算宽度折行：累计超过容器宽就另起一行（估算按全角=字号、半角=0.5字号）；
+ *   4. 分隔符：链接行用 " · "（导航条观感），普通文本行用空格；
+ *   5. 合并是把后续兄弟的文本**并进第一个兄弟**，后者 text_content 置空 →
+ *      渲染时它自然不再产生 label。不需要动渲染器。
+ *   6. **无文字的纯结构壳子对行透明**：<ul><li><a>…</a></li>…</ul> 里每个 <a>
+ *      都是各自 <li> 的独子，只看"同一层兄弟"永远并不起来（导航条拆四行的真正
+ *      原因）。所以合并遇到"自己不写字、只包子节点"的壳子时钻进去继续同一行。
+ *   7. **跨壳只有链接能并**：判断依据是节点的**直接父节点**是否相同
+ *      （`FlatRow::ownerParent`）。同父 → 按规则 2 正常并；不同父 → 只有链接
+ *      （kind=1）能继续并。因为普通文本跨壳会把「设置」和「©2026 Baidu…」这种
+ *      两个区块的东西串成一行（实测过，一屏从 14 行并到 7 行，串味明显）。
+ *   8. 一行最多 FLAT_ROW_MAX_ITEMS 项，防止整页链接被 " · " 串成一坨。
+ */
+static int flat_text_width(const char *s, int fs) {
+  if (!s)
+    return 0;
+  int w = 0;
+  const unsigned char *p = (const unsigned char *)s;
+  while (*p) {
+    if (*p < 0x80) {          /* ASCII / 半角 */
+      w += (int)(fs * 0.5f);
+      p += 1;
+    } else {                  /* 全角（中文/日文/全角标点） */
+      int nb = 2;
+      if ((*p & 0xF0) == 0xE0)
+        nb = 3;
+      else if ((*p & 0xF8) == 0xF0)
+        nb = 4;
+      w += fs;
+      p += nb;
+    }
+  }
+  return w;
+}
+
+/* 0 = 普通文本，1 = 链接，-1 = 不参与合并（块级） */
+static int flat_inline_kind(LayoutNode *n) {
+  if (!n->text_content || !n->text_content[0])
+    return -1;
+  switch (n->type) {
+  case ELEMENT_LINK:
+    /* 链接**不参与合并**了：平铺下链接会被画成带框的小胶囊（chip），
+       一个个排进 flex row-wrap 行里。并成 " · " 一串就画不了框，也点不了。 */
+    return -1;
+  case ELEMENT_LIST_ITEM:
+    /* 导航条 <li> 也参与合并。li 本身不是链接，但如果 dom 层把它当纯文本抽了，
+       里面那个 <a> 就没了（见 dom_renderer 的 li_is_link_wrapper）——
+       那种情况按普通文本并，至少能横排。 */
+    return 0;
+  case ELEMENT_SPAN:
+  case ELEMENT_STRONG:
+  case ELEMENT_EM:
+  case ELEMENT_BOLD:
+  case ELEMENT_ITALIC:
+  case ELEMENT_UNDERLINE:
+    return 0;
+  default:
+    return -1;
+  }
+}
+
+/* 自己没有可见文字（NULL 或纯空白） */
+static bool flat_is_textless(LayoutNode *n) {
+  const char *t = n ? n->text_content : NULL;
+  if (!t)
+    return true;
+  for (const unsigned char *p = (const unsigned char *)t; *p; p++) {
+    if (*p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+      return false;               /* 有实字 → 它是正文，不是壳子 */
+  }
+  return true;
+}
+
+/* 纯结构壳子：自己没有可见文字、但包着子节点。
+ * <ul><li><a>我的关注</a></li><li><a>我的收藏</a></li>…</ul> 里的 <li>、
+ * 包着一堆 <span> 的页脚 <div>，都是这种壳子。
+ * 叶子节点（输入框/图片/按钮）不算壳子 —— 它是内容本身。 */
+static bool flat_is_transparent(LayoutNode *n) {
+  if (!n || !n->first_child)
+    return false;
+  return flat_is_textless(n);
+}
+
+/* 一行最多并多少个。不设上限的话，整页的链接会被 " · " 串成一坨糊。 */
+#define FLAT_ROW_MAX_ITEMS 8
+
+typedef struct {
+  LayoutNode *leader;       /* 当前行的"组长"，后续兄弟的文本并进它 */
+  LayoutNode *ownerParent;  /* 组长的直接父节点 —— 用来判断这次合并是不是"跨壳" */
+  int kind;                 /* 组长种类：0 普通文本 / 1 链接 */
+  int width;                /* 当前行已用宽度（估算） */
+  int items;                /* 当前行已并进来的条数 */
+} FlatRow;
+
+static void merge_row(LayoutNode *parent, int maxW, FlatRow *row);
+
+static void merge_child(LayoutNode *parent, LayoutNode *c, int maxW, FlatRow *row) {
+  int kind = flat_inline_kind(c);
+
+  if (kind < 0 && flat_is_transparent(c)) {
+    /* 壳子：不打断当前行，钻进去按同一行继续 */
+    merge_row(c, maxW, row);
+    return;
+  }
+
+  if (kind >= 0 && maxW > 0) {
+    int w = flat_text_width(c->text_content, c->box.font_size);
+
+    bool sameRow = (row->leader != NULL);
+    /* 跨壳（父节点不同）：只有链接能继续并。
+       导航条 <ul><li><a>…</a></li>…</ul> 里每个 <a> 的爹是各自的 <li>，
+       不跨壳合并就永远并不到一起；而普通文本跨壳会把「设置」和
+       「©2026 Baidu…」这种两个区块的东西串成一行，所以只放行链接。 */
+    if (sameRow && row->ownerParent != parent && kind != 1)
+      sameRow = false;
+    if (sameRow &&
+        (row->width + (int)(row->leader->box.font_size * 0.8f) + w > maxW))
+      sameRow = false;                                  /* 超宽 → 换行 */
+    if (sameRow && row->items >= FLAT_ROW_MAX_ITEMS)
+      sameRow = false;                                  /* 一行并够了 */
+    if (sameRow && kind != row->kind)
+      sameRow = false;                                  /* 种类不同 → 换行 */
+
+    if (sameRow) {
+      const char *sep = (kind == 1) ? " · " : " ";
+      size_t need = strlen(row->leader->text_content) + strlen(sep) +
+                    strlen(c->text_content) + 1;
+      char *merged = (char *)realloc(row->leader->text_content, need);
+      if (merged) {
+        strcat(merged, sep);
+        strcat(merged, c->text_content);
+        row->leader->text_content = merged;
+        row->width += (int)(row->leader->box.font_size * 0.8f) + w;
+        row->items++;
+        /* 被吞并的节点不再单独成行 */
+        free(c->text_content);
+        c->text_content = NULL;
+        /* 并成了行的 li 不再是列表项：降级成 span，渲染时就不会加 "- " 前缀
+           （横排导航条前面挂个 "- " 很怪）。 */
+        if (row->leader->type == ELEMENT_LIST_ITEM)
+          row->leader->type = ELEMENT_SPAN;
+      }
+    } else {
+      row->leader = c;
+      row->ownerParent = parent;
+      row->kind = kind;
+      row->width = w;
+      row->items = 1;
+    }
+    /* 它自己的子节点另起一套行状态，不跟父层混 */
+    FlatRow sub = {NULL, NULL, -1, 0, 0};
+    merge_row(c, maxW, &sub);
+  } else {
+    row->leader = NULL;           /* 块级元素打断当前行 */
+    row->ownerParent = NULL;
+    row->kind = -1;
+    row->width = 0;
+    row->items = 0;
+    FlatRow sub = {NULL, NULL, -1, 0, 0};
+    merge_row(c, maxW, &sub);
+  }
+}
+
+static void merge_row(LayoutNode *parent, int maxW, FlatRow *row) {
+  if (!parent)
+    return;
+  for (LayoutNode *c = parent->first_child; c; c = c->next_sibling)
+    merge_child(parent, c, maxW, row);
+}
+
+static void layout_merge_inline_rows(LayoutNode *node, int maxW) {
+  if (!node)
+    return;
+  FlatRow row = {NULL, NULL, -1, 0, 0};
+  merge_row(node, maxW, &row);
+}
+
+/* 布局树统计：节点数 + 内容总高（用于诊断"页面到底有多大"） */
+static void layout_tree_stats(LayoutNode *node, int *count, int *maxBottom) {
+  if (!node) return;
+  while (node) {
+    (*count)++;
+    int bottom = node->box.y + node->box.height;
+    if (bottom > *maxBottom)
+      *maxBottom = bottom;
+    layout_tree_stats(node->first_child, count, maxBottom);
+    node = node->next_sibling;
   }
 }
 
@@ -966,7 +1651,46 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
 void layout_render_tree(LayoutNode *root, RenderContext *render_ctx) {
   if (!root || !render_ctx)
     return;
-  s_widgetCount = 0;  /* 重置 widget 计数器 */
-  layout_render_node(root, render_ctx, render_ctx->root_container);
-  Serial.printf("[Browser] widgets created: %d (limit %d)\n", s_widgetCount, MAX_WIDGETS);
+  s_widgetCount = 0;     /* 重置 widget 计数器 */
+  s_rowContainer = NULL; /* 重置"当前胶囊行"，每次渲染从头开始 */
+  lvgl_renderer_reset_link_count();
+
+  int nodes = 0, heightBefore = 0;
+
+  if (s_flatMode) {
+    /* 平铺：不缩放、不钳制、不还原版面 */
+    layout_tree_stats(root, &nodes, &heightBefore);
+    layout_flatten_tree(root, render_ctx->max_width);
+    int dropped = layout_drop_junk(root, 0);
+    layout_merge_inline_rows(root, render_ctx->max_width);
+    Serial.printf("[Browser] layout: FLAT tiles, nodes=%d width=%d junkDropped=%d\n",
+                  nodes, render_ctx->max_width, dropped);
+  } else {
+    /* 缩放系数 = 屏幕可用宽 / 排版视口宽。只缩不放。 */
+    float f = 1.0f;
+    if (s_layoutWidth > 0 && render_ctx->max_width > 0) {
+      f = (float)render_ctx->max_width / (float)s_layoutWidth;
+    }
+    if (f > 1.0f) f = 1.0f;    /* 视口比屏幕窄时无需放大 */
+    if (f < 0.15f) f = 0.15f;  /* 下限，避免缩到不可见 */
+
+    int heightAfter = 0;
+    layout_tree_stats(root, &nodes, &heightBefore);
+    if (f < 0.999f)
+      layout_scale_tree(root, f);
+    /* 兜底：钳进屏幕宽度（左右不越界，上下不管） */
+    layout_clamp_horizontal(root, render_ctx->max_width);
+    if (f < 0.999f)
+      layout_tree_stats(root, &nodes, &heightAfter);
+    else
+      heightAfter = heightBefore;
+
+    Serial.printf("[Browser] layout: viewport=%d screen=%d scale=%.2f nodes=%d contentH=%d->%d\n",
+                  s_layoutWidth, render_ctx->max_width, (double)f, nodes,
+                  heightBefore, heightAfter);
+  }
+
+  layout_render_node(root, render_ctx, render_ctx->root_container, 0);
+  Serial.printf("[Browser] widgets created: %d (limit %d), clickable links=%d\n",
+                s_widgetCount, MAX_WIDGETS, lvgl_renderer_link_count());
 }

@@ -1,17 +1,13 @@
 #include "launcher.h"
 #include <Arduino.h>
+#include "app_registry.h"
 #include "icons.h"
 #include "nav.h"
+#include "status_bar.h"
 #include "font_zh.h"
 #include <lvgl.h>
 
 namespace {
-
-struct AppEntry {
-  Icon icon;
-  const char* label;
-  lv_obj_t** target;
-};
 
 struct TileData {
   lv_obj_t** target;
@@ -20,6 +16,9 @@ struct TileData {
 };
 
 TileData g_tileData[12];
+
+/* 磁贴容器：桌面开关变化只清这一层的子对象，屏幕对象本身不动。 */
+lv_obj_t* g_grid = nullptr;
 
 void anim_opa_cb(void* var, int32_t v) {
   lv_obj_set_style_opa((lv_obj_t*)var, (lv_opa_t)v, 0);
@@ -75,21 +74,20 @@ void tile_event_cb(lv_event_t* e) {
   lv_timer_set_repeat_count(timer, 1);
 }
 
-void addTile(lv_obj_t* scr, const AppEntry& entry, int idx) {
+void addTile(lv_obj_t* grid, const AppEntry& entry, int idx) {
   const int tileW = 100, tileH = 110, gap = 12;
   const int cols = 4;
   const int startX = (480 - (cols * tileW + (cols - 1) * gap)) / 2;
-  const int startY = 100;
   int col = idx % cols;
   int row = idx / cols;
   int x = startX + col * (tileW + gap);
-  int y = startY + row * (tileH + gap);
+  int y = row * (tileH + gap);
 
   g_tileData[idx].target = entry.target;
   g_tileData[idx].icon = entry.icon;
   g_tileData[idx].label = entry.label;
 
-  lv_obj_t* tile = lv_obj_create(scr);
+  lv_obj_t* tile = lv_obj_create(grid);
   lv_obj_set_size(tile, tileW, tileH);
   lv_obj_set_pos(tile, x, y);
   lv_obj_set_style_bg_opa(tile, LV_OPA_TRANSP, 0);
@@ -133,25 +131,40 @@ lv_obj_t* LauncherScreen_create() {
   lv_obj_set_style_border_width(scr, 0, 0);
   lv_obj_set_style_pad_all(scr, 0, 0);
 
+  /* 顶部状态栏：电池+FPS / 时间 / WiFi+蓝牙 */
+  StatusBar_create(scr, nullptr);
+
   lv_obj_t* title = lv_label_create(scr);
   lv_label_set_text(title, "GEEK TERMINAL");
   lv_obj_set_style_text_color(title, lv_color_hex(0x888888), 0);
   lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 56);
 
-  AppEntry entries[] = {
-      {Icon::Clock,    "时钟",   &nav_clock},
-      {Icon::Settings, "设置",   &nav_settings},
-      {Icon::Wifi,     "无线",   &nav_wifi},
-      {Icon::Game,     "游戏",   &nav_game},
-      {Icon::Browser,  "浏览器", &nav_browser},
-      {Icon::Terminal, "画板",   &nav_draw},
-      {Icon::Music,    "记忆",   &nav_memory},
-      {Icon::Power,    "系统",   &nav_sysinfo},
-      {Icon::Weather,  "天气",   &nav_weather},
-  };
-  for (int i = 0; i < (int)(sizeof(entries) / sizeof(entries[0])); i++) {
-    addTile(scr, entries[i], i);
-  }
+  /* 磁贴容器：top=100，高度容纳 3 行；容器本身不滚动，
+     桌面项最多 8 个 = 2 行，隐藏到只剩 1 个也不会塌。 */
+  g_grid = lv_obj_create(scr);
+  lv_obj_set_size(g_grid, 480, 370);
+  lv_obj_set_pos(g_grid, 0, 100);
+  lv_obj_set_style_bg_opa(g_grid, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(g_grid, 0, 0);
+  lv_obj_set_style_pad_all(g_grid, 0, 0);
+  lv_obj_clear_flag(g_grid, LV_OBJ_FLAG_SCROLLABLE);
+
+  LauncherScreen_refresh(scr);
   return scr;
+}
+
+void LauncherScreen_refresh(lv_obj_t* scr) {
+  if (!scr || !g_grid) return;
+  lv_obj_clean(g_grid);
+
+  int idx = 0;
+  const int maxTiles = (int)(sizeof(g_tileData) / sizeof(g_tileData[0]));
+  for (int i = 0; i < appreg_count() && idx < maxTiles; i++) {
+    const AppEntry* e = appreg_at(i);
+    if (!e || e->group != AppGroup::Desktop) continue;
+    if (!appreg_visible(i)) continue;   // 用户在设置里关掉了
+    addTile(g_grid, *e, idx);
+    idx++;
+  }
 }

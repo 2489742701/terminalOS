@@ -1,6 +1,7 @@
 #include "wifi_screen.h"
 #include "icons.h"
 #include "nav.h"
+#include "status_bar.h"
 #include "font_zh.h"
 #include <lvgl.h>
 #include <WiFi.h>
@@ -31,10 +32,6 @@ lv_obj_t* g_detailConnectBtn = nullptr;
 lv_obj_t* g_detailExitBtn = nullptr;
 lv_obj_t* g_detailRetryBtn = nullptr;
 uint32_t g_connectStartMs = 0;
-
-void back_event_cb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) nav_go_anim(nav_launcher, LV_SCR_LOAD_ANIM_OVER_LEFT, 300);
-}
 
 void swipe_cb(lv_event_t* e) {
   swipe_detect(e, g_swipe, nav_launcher, SWIPE_H, false, 40);
@@ -110,16 +107,7 @@ void showDetail(const char* ssid, bool encrypted, int rssi) {
   lv_obj_set_style_pad_all(scr, 0, 0);
   lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-  lv_obj_t* back = icon_create(scr, Icon::Back, 36);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(back, detail_back_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t* title = lv_label_create(scr);
-  lv_label_set_text(title, ssid);
-  lv_obj_set_style_text_color(title, lv_color_white(), 0);
-  lv_obj_set_style_text_font(title, &font_zh_16, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+  StatusBar_create(scr, "连接网络");
 
   int bars = (rssi > -50) ? 4 : (rssi > -65) ? 3 : (rssi > -75) ? 2 : 1;
   char infoBuf[64];
@@ -306,17 +294,7 @@ lv_obj_t* WifiScreen_create() {
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(scr, swipe_cb, LV_EVENT_RELEASED, NULL);
 
-  lv_obj_t* back = icon_create(scr, Icon::Back, 36);
-  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 14, 14);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_flag(back, LV_OBJ_FLAG_EVENT_BUBBLE);
-  lv_obj_add_event_cb(back, back_event_cb, LV_EVENT_CLICKED, NULL);
-
-  lv_obj_t* title = lv_label_create(scr);
-  lv_label_set_text(title, "无线网络");
-  lv_obj_set_style_text_color(title, lv_color_white(), 0);
-  lv_obj_set_style_text_font(title, &font_zh_24, 0);
-  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+  StatusBar_create(scr, "无线网络");
 
   g_list = lv_obj_create(scr);
   lv_obj_set_size(g_list, 460, 340);
