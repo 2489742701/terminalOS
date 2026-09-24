@@ -79,6 +79,15 @@ void draw_cb(lv_event_t* e) {
 
 }  // namespace
 
+/* 跳触摸测试屏。走 nav_open 按需创建 —— 它不是常用屏，不该常驻占 DRAM。 */
+void touchtest_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (nav_is_locked()) return;
+  if (!nav_touchtest) nav_open(&nav_touchtest);
+  if (!nav_touchtest) return;
+  nav_go_anim(nav_touchtest, LV_SCR_LOAD_ANIM_OVER_RIGHT, 300);
+}
+
 lv_obj_t* DrawScreen_create() {
   lv_obj_t* scr = lv_obj_create(NULL);
   lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -105,9 +114,11 @@ lv_obj_t* DrawScreen_create() {
   lv_obj_add_event_cb(g_canvas, draw_cb, LV_EVENT_PRESSING, NULL);
   lv_obj_add_event_cb(g_canvas, draw_cb, LV_EVENT_RELEASED, NULL);
 
+  /* 「清除」挪到左边，右边给「触摸」留出位置 —— 画板上手感正常，
+     所以把触摸测试入口放在这里最顺手（master 提的）。 */
   lv_obj_t* clrBtn = lv_btn_create(scr);
   lv_obj_set_size(clrBtn, 100, 36);
-  lv_obj_align(clrBtn, LV_ALIGN_BOTTOM_MID, 0, -12);
+  lv_obj_align(clrBtn, LV_ALIGN_BOTTOM_LEFT, 40, -12);
   lv_obj_set_style_bg_opa(clrBtn, LV_OPA_TRANSP, 0);
   lv_obj_set_style_bg_opa(clrBtn, LV_OPA_COVER, LV_STATE_PRESSED);
   lv_obj_set_style_bg_color(clrBtn, lv_color_hex(0x161616), LV_STATE_PRESSED);
@@ -121,6 +132,23 @@ lv_obj_t* DrawScreen_create() {
   lv_obj_set_style_text_color(clab, lv_color_white(), 0);
   lv_obj_set_style_text_font(clab, &font_zh_16, 0);
   lv_obj_center(clab);
+
+  lv_obj_t* ttBtn = lv_btn_create(scr);
+  lv_obj_set_size(ttBtn, 100, 36);
+  lv_obj_align(ttBtn, LV_ALIGN_BOTTOM_RIGHT, -40, -12);
+  lv_obj_set_style_bg_opa(ttBtn, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_bg_opa(ttBtn, LV_OPA_COVER, LV_STATE_PRESSED);
+  lv_obj_set_style_bg_color(ttBtn, lv_color_hex(0x161616), LV_STATE_PRESSED);
+  lv_obj_set_style_border_color(ttBtn, lv_color_white(), 0);
+  lv_obj_set_style_border_width(ttBtn, 1, 0);
+  lv_obj_set_style_radius(ttBtn, 8, 0);
+  lv_obj_add_event_cb(ttBtn, touchtest_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_add_flag(ttBtn, LV_OBJ_FLAG_EVENT_BUBBLE);
+  lv_obj_t* tlab = lv_label_create(ttBtn);
+  lv_label_set_text(tlab, "触摸");
+  lv_obj_set_style_text_color(tlab, lv_color_white(), 0);
+  lv_obj_set_style_text_font(tlab, &font_zh_16, 0);
+  lv_obj_center(tlab);
 
   return scr;
 }

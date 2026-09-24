@@ -16,6 +16,7 @@ extern lv_obj_t* nav_weather;
 extern lv_obj_t* nav_games;    // 游戏栏目：贪吃蛇 / 记忆卡牌 / 2048
 extern lv_obj_t* nav_desktop;  // 桌面图标管理（设置里进入）
 extern lv_obj_t* nav_taskmgr;  // 后台管理（任务管理器）
+extern lv_obj_t* nav_touchtest; // 触摸测试（诊断坐标偏移，串口 `nav touchtest`）
 
 /* ══ Activity 注册表（阶段 1）══
  * ESP32 没有 MMU/换页，lv_obj_create(NULL) 建的对象树会一直常驻，

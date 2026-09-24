@@ -27,6 +27,16 @@ class Touch {
      配合 tcal 的端点顺序可以把翻转/交换/偏移三种情况全试一遍。 */
   static void setSwap(bool on);
 
+  /* 触摸测试屏用的现场开关 —— 点了立即生效，不落盘、不用重烧。
+     flipX/flipY 就是交换该轴的两个端点（等价于把轴翻转过来）。 */
+  static void flipX();
+  static void flipY();
+  static void swapXY();
+  static void resetCal();
+
+  /* 读回当前校准参数，给 UI 显示用 */
+  static void getCal(int& x0, int& x1, int& y0, int& y1, bool& swap);
+
   /* 当前按下的**面板裸坐标**（未做屏幕映射）。ts->read() 之后调用。 */
   static bool rawXY(int& rx, int& ry);
 

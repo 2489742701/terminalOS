@@ -51,6 +51,7 @@ static ScreenEntry s_screens[] = {
   {"games",     &nav_games},
   {"desktop",   &nav_desktop},
 {"taskmgr",   &nav_taskmgr},
+  {"touchtest", &nav_touchtest},
 };
 static const int s_screenCount = sizeof(s_screens) / sizeof(s_screens[0]);
 
@@ -58,7 +59,7 @@ static void printHelp() {
   Serial.println("=== Serial Console Commands ===");
   Serial.println("help              - show this help");
   Serial.println("nav <screen>      - navigate to screen");
-  Serial.println("  screens: launcher clock settings wifi game 2048 browser draw memory sysinfo weather games desktop taskmgr");
+  Serial.println("  screens: launcher clock settings wifi game 2048 browser draw memory sysinfo weather games desktop taskmgr touchtest");
   Serial.println("browser <url>     - open browser and load URL");
   Serial.println("vp <width>|vp 0   - browser layout viewport (0=auto, read <meta viewport>)");
   Serial.println("flat on|off       - browser 平铺排版 on=不建容器全部平铺 off=还原CSS版面");

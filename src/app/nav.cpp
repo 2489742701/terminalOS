@@ -15,6 +15,7 @@
 #include "games_screen.h"
 #include "desktop_screen.h"
 #include "taskmgr_screen.h"
+#include "touchtest_screen.h"
 
 #include <esp_heap_caps.h>
 
@@ -73,7 +74,9 @@ ActivityEntry s_table[] = {
        所以它必须能按需创建（见 nav_games_or_home）。 */
     {"games",    &nav_games,    GamesScreen_create,    nullptr,         nullptr},
     {"desktop",  &nav_desktop,  DesktopScreen_create,  nullptr,         nullptr},
-    {"taskmgr",  &nav_taskmgr,  TaskMgrScreen_create,  nullptr,         nullptr,         0},
+    {"taskmgr",  &nav_taskmgr,   TaskMgrScreen_create,   nullptr,         nullptr,         0},
+    /* 触摸测试：诊断用，不进 Launcher，只走串口 `nav touchtest` 和画板底部入口 */
+    {"touchtest", &nav_touchtest, TouchTestScreen_create, nullptr,        nullptr},
 };
 
 const int s_count = (int)(sizeof(s_table) / sizeof(s_table[0]));

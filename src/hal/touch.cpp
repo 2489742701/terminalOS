@@ -61,6 +61,38 @@ void Touch::setSwap(bool on) {
   Serial.printf("[Touch] swapXY = %d\n", (int)on);
 }
 
+void Touch::flipX() {
+  int t0 = s_rawX0;
+  s_rawX0 = s_rawX1;
+  s_rawX1 = t0;
+  Serial.printf("[Touch] flipX -> X %d..%d\n", s_rawX0, s_rawX1);
+}
+
+void Touch::flipY() {
+  int t0 = s_rawY0;
+  s_rawY0 = s_rawY1;
+  s_rawY1 = t0;
+  Serial.printf("[Touch] flipY -> Y %d..%d\n", s_rawY0, s_rawY1);
+}
+
+void Touch::swapXY() {
+  s_swapXY = !s_swapXY;
+  Serial.printf("[Touch] swapXY -> %d\n", (int)s_swapXY);
+}
+
+void Touch::resetCal() {
+  s_rawX0 = 0;   s_rawX1 = 480;
+  s_rawY0 = 0;   s_rawY1 = 480;
+  s_swapXY = false;
+  Serial.println("[Touch] cal reset to default 0..480 / 0..480");
+}
+
+void Touch::getCal(int& x0, int& x1, int& y0, int& y1, bool& swap) {
+  x0 = s_rawX0; x1 = s_rawX1;
+  y0 = s_rawY0; y1 = s_rawY1;
+  swap = s_swapXY;
+}
+
 void Touch::setCal(int x0, int x1, int y0, int y1) {
   s_rawX0 = x0; s_rawX1 = x1;
   s_rawY0 = y0; s_rawY1 = y1;

@@ -61,6 +61,7 @@ lv_obj_t* nav_weather = nullptr;
 lv_obj_t* nav_games = nullptr;
 lv_obj_t* nav_desktop = nullptr;
 lv_obj_t* nav_taskmgr = nullptr;
+lv_obj_t* nav_touchtest = nullptr;
 
 void App::dispFlush(lv_disp_drv_t* disp, const lv_area_t* area,
                     lv_color_t* colorP) {
