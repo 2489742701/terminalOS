@@ -62,6 +62,8 @@ static void printHelp() {
   Serial.println("=== Serial Console Commands ===");
   Serial.println("help              - show this help");
   Serial.println("nav <screen>      - navigate to screen");
+  Serial.println("back              - 走真实返回桌面路径(诊断后台是否被清)");
+  Serial.println("navlist           - 列出仍在内存里的 Activity(后台列表)");
   Serial.println("  screens: launcher clock settings wifi game 2048 browser draw memory sysinfo weather games desktop taskmgr touchtest");
   Serial.println("reboot              - 重启设备（验证 NVS 持久化用）");
   Serial.println("sstore            - 打印 NVS 里记住的设置（息屏/亮度/自动校时/视口）");
@@ -737,6 +739,19 @@ static void executeLine(char* line) {
     printHelp();
   } else if (strcmp(cmd, "nav") == 0) {
     cmdNav(arg);
+  } else if (strcmp(cmd, "back") == 0) {
+    /* 走真实的「返回桌面」路径（带动画版）—— 就是左滑退出 / 顶栏返回走的那条，
+       用来复现"应用切到后台后是不是被自动结束了"。 */
+    nav_back_home_anim();
+    Serial.println("[Console] nav_back_home_anim() returned");
+  } else if (strcmp(cmd, "navlist") == 0) {
+    NavRunningInfo list[16];
+    int n = nav_running_list(list, 16);
+    Serial.printf("[Nav] running = %d\n", n);
+    for (int i = 0; i < n; i++)
+      Serial.printf("   %-12s %6u B %s\n", list[i].id, (unsigned)list[i].bytes,
+                    list[i].current ? "<- foreground" : "");
+    if (n == 0) Serial.println("   (empty: launcher only)");
   } else if (strcmp(cmd, "sstore") == 0) {
     /* 打印 NVS 里记住的设置（息屏 / 亮度 / 自动校时 / 排版视口） */
     SettingsStore::dump();

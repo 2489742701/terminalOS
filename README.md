@@ -107,7 +107,11 @@ python tools\verify_flow.py COM7 "https://m.baidu.com"
   键盘上方候选条，监听 textarea 尾部 ASCII 拼音，上屏延迟一拍
 - **热点新闻**（`src/app/news.cpp`）：news.orz.ai 拉取，复用浏览器常驻 fetch 任务
 - **应用后台管理**（`src/app/taskmgr_screen.cpp`）：应用不常驻、按需启动，可逐个 / 全部关闭；
-  顶栏电池区可点进入
+  顶栏电池区可点进入。
+  ⚠️ **回桌面 = 切后台，不是退出**（2026-09-25 修）：`nav_back_home()` 早期会
+  `nav_release_all_except(launcher)` 把**所有**后台一起清掉，于是"点不点结束都会被结束"。
+  现在回桌面只切屏不销毁，内存由 `nav_open()` 前的 `trimBackground()` 按 LRU 兜底
+  （后台 > 4 个或 DRAM < 48KB 时回收最久未用的那个）。Launcher 进浏览器仍独占（它太重）
 - **顶栏后台指示**：桌面顶栏左侧（电池右边）把真在跑的应用**图标一字排开**，
   最多 7 个；放不下时留一格显示 `+N`（如 8 个后台 = 6 图标 + `+2`）。
   点任意一个图标 = 进后台管理。没有后台时整行不显示
