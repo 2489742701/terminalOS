@@ -24,15 +24,15 @@ struct NewsItem {
   char url[NEWS_URL_LEN];
 };
 
-/* 平台代码 + 中文名 + 是否已验证。
-   UI 按这个顺序画 chip —— **能正常打开看内容的排前面**（master 2026-09-25）。
-   verified=true 的源，名字旁边画一颗金色小星星：
-     选中态（白底黑字）时星星**仍然是金色**，只有文字变黑。
-   ⚠️ verified 不是"猜"的，是逐条点开前 4 条链接实测出来的，改之前先测。 */
+/* 平台代码 + 中文名 + 星标档位。UI 按这个顺序画 chip。
+   ⚠️ 星标的资格是「**能打开详情页看到内容**」，不是"能加载出列表"
+      （master 2026-09-25 纠正）—— 很多源列表拉得到，点进去却是白屏。
+   star: 2 = 金星（完全能看）  1 = 白星（部分内容 / 网络问题看不全）  0 = 不标
+   ⚠️ 档位是 master 手动定的，不是脚本测出来的 —— 改之前先问他。 */
 struct NewsPlatform {
   const char* code;
   const char* name;
-  bool verified;
+  int star;
 };
 extern const NewsPlatform kNewsPlatforms[];
 extern const int kNewsPlatformCount;

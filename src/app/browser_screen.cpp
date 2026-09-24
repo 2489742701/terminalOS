@@ -1186,7 +1186,12 @@ static void showSearchHome() {
   for (int i = 0; i < kNewsPlatformCount; i++) {
     const NewsPlatform& np = kNewsPlatforms[i];
     lv_obj_t* b = lv_btn_create(npRow);
-    lv_obj_set_size(b, 76, 36);
+    /* 宽度按名字长度自适应："稀土掘金"这种 4 字名固定 76 会被挤扁 */
+    int cw = 0;
+    for (const char* p = np.name; *p; ++p)
+      cw += (*(unsigned char*)p < 0x80) ? 8 : 17;
+    if (np.star) cw += 14;
+    lv_obj_set_size(b, cw + 24, 36);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x1a1a1a), 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x333333), LV_STATE_PRESSED);
     lv_obj_set_style_radius(b, 8, 0);
@@ -1204,13 +1209,14 @@ static void showSearchHome() {
     lv_obj_set_style_text_color(lb, lv_color_white(), 0);
     lv_obj_set_style_text_font(lb, &font_zh_16, 0);
 
-    /* 已验证能打开看的源 -> 名字后跟一颗金色小星星（master 2026-09-25）。
+    /* 星标：2=金星（详情页完全能看） 1=白星（部分内容/网络问题） 0=不标。
        ⚠️ 星星单独一个 label：选中态要把**文字**刷成黑色，
           而星星"选中的时候也是金色"，不能跟着变。 */
-    if (np.verified) {
+    if (np.star) {
       lv_obj_t* st = lv_label_create(b);
       lv_label_set_text(st, "*");
-      lv_obj_set_style_text_color(st, lv_color_hex(0xFFD700), 0);
+      lv_obj_set_style_text_color(st,
+          lv_color_hex(np.star == 2 ? 0xFFD700 : 0xDDDDDD), 0);
       lv_obj_set_style_text_font(st, &font_zh_16, 0);
     }
 

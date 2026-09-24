@@ -24,19 +24,22 @@
 #define NEWS_HOST "news.orz.ai"
 #define NEWS_BUF_BYTES 65536
 
-/* 顺序 = 已验证可打开的在前，打不开的垫底。
-   2026-09-25 实测：豆瓣 / 36氪 / 掘金 / GitHub / HN / 百度 / B站 的前 4 条
-   链接全部 200 能打开；知乎全部 403（反爬），排最后且不给星。 */
+/* 顺序：有星的在前（金星 -> 白星），没星的垫底。
+   星标档位由 master 手动定，标准是「点进详情页能不能看到内容」：
+     金星 豆瓣 / 36氪 / 稀土掘金 —— 完全能看
+     白星 B站 / GitHub          —— 能显示部分内容，或因网络问题看不全
+     无星 其余                  —— 打不开 / 没验证
+   ⚠️ 注意「氪」字：字库里原本没有，显示为方框，已补进 font_symbols_16.txt。 */
 const NewsPlatform kNewsPlatforms[] = {
-    {"douban",     "豆瓣",    true},
-    {"36kr",       "36氪",    true},
-    {"juejin",     "掘金",    true},
-    {"github",     "GitHub",  true},
-    {"hackernews", "HN",      true},
-    {"baidu",      "百度",    true},
-    {"bilibili",   "B站",     true},
-    {"weibo",      "微博",    false},
-    {"zhihu",      "知乎",    false},
+    {"douban",     "豆瓣",    2},
+    {"36kr",       "36氪",    2},
+    {"juejin",     "稀土掘金", 2},
+    {"bilibili",   "B站",     1},
+    {"github",     "GitHub",  1},
+    {"baidu",      "百度",    0},
+    {"hackernews", "HN",      0},
+    {"weibo",      "微博",    0},
+    {"zhihu",      "知乎",    0},
 };
 const int kNewsPlatformCount =
     (int)(sizeof(kNewsPlatforms) / sizeof(kNewsPlatforms[0]));
