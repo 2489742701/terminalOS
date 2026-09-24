@@ -63,9 +63,13 @@ static char s_upBuf[28];
 static char s_calBuf[40];
 
 /* ── 循环切换型选项（点一次换下一个）─────────────────────────────────── */
-static const unsigned long kIdleOpts[] = {30000, 60000, 300000, 0};  // 0 = 永不
-static const char* const kIdleNames[] = {"30 秒", "1 分钟", "5 分钟", "永不"};
-static const int kIdleCount = 4;
+/* ⚠️ 故意不给「永不 / 常亮」档。
+   历史事故：默认档是 5 分钟（index 2），而「永不」放在它后面 —— 用户点一下
+   设备就再也不息屏了，看着像坏了。息屏是省电与烧屏保护，不该一次点击就关掉。
+   真要常亮就单独做一项并明确提示，别混在循环里。 */
+static const unsigned long kIdleOpts[] = {30000, 60000, 300000};
+static const char* const kIdleNames[] = {"30 秒", "1 分钟", "5 分钟"};
+static const int kIdleCount = 3;
 
 static const int kVpOpts[] = {0, 720, 1024, 1280};  // 0 = 自动（读 meta viewport）
 static const char* const kVpNames[] = {"自动", "720 px", "1024 px", "1280 px"};
@@ -144,8 +148,13 @@ const char* vpValue() {
   return s_vpBuf;
 }
 const char* idleValue() {
-  int i = indexOf(ScreenSaver::idleTimeout(), kIdleOpts, kIdleCount, 2);
-  snprintf(s_idleBuf, sizeof(s_idleBuf), "%s", kIdleNames[i]);
+  unsigned long ms = ScreenSaver::idleTimeout();
+  int i = indexOf(ms, kIdleOpts, kIdleCount, -1);
+  /* 值不在档位表里要**如实显示**，别假装在某个档 ——
+     否则会出现"显示 5 分钟、实际永不"这种看不出来的不一致。 */
+  if (ms == 0) snprintf(s_idleBuf, sizeof(s_idleBuf), "永不");
+  else if (i < 0) snprintf(s_idleBuf, sizeof(s_idleBuf), "%lu 秒", (unsigned long)(ms / 1000));
+  else snprintf(s_idleBuf, sizeof(s_idleBuf), "%s", kIdleNames[i]);
   return s_idleBuf;
 }
 const char* memValue() {
@@ -213,7 +222,8 @@ static void touchtest_event_cb(lv_event_t* e) {
 /* 循环切换：点一次走到下一个选项。改完立刻刷新右侧文字 + 底部提示 */
 static void idle_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  int i = indexOf(ScreenSaver::idleTimeout(), kIdleOpts, kIdleCount, 2);
+  /* -1 = 当前值不在档位表里（例如旧固件留下的 0=永不）→ 回到第一档 */
+  int i = indexOf(ScreenSaver::idleTimeout(), kIdleOpts, kIdleCount, -1);
   i = (i + 1) % kIdleCount;
   ScreenSaver::setIdleTimeout(kIdleOpts[i]);
   settings_menu_refresh_values();
@@ -383,7 +393,7 @@ lv_obj_t* SettingsScreen_create() {
   };
   static SettingsItem displayItems[] = {
     siSlider("亮度", 5, 100, 100, brightness_cb),
-    siAction("自动息屏", idle_cb, idleValue),
+    siAction("息屏超时", idle_cb, idleValue),
     siAction("立即息屏", sleep_event_cb),
     siAction("桌面图标", desktop_event_cb),
     siEnd(),
