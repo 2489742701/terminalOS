@@ -48,6 +48,11 @@ const char* typeName();
 void bench(uint32_t kb);
 uint32_t spiHz();
 
+/* 读写自检：写一段可预测的字节模式再原样读回比对。
+   用来隔离"SD 读写本身会不会改字节" —— 页面缓存读回来内容对不上时先跑它。
+   kb = 测试数据量（默认 128）。串口 `sdtest [kb]`。 */
+bool selfTest(uint32_t kb);
+
 // 列目录到串口，depth 是递归层数（默认 1）
 void listDir(const char* path, int depth);
 

@@ -783,6 +783,10 @@ static void executeLine(char* line) {
       else Serial.printf("[Console] viewport = %d%s\n", BrowserScreen_getViewport(),
                          BrowserScreen_getViewport() == 0 ? " (auto)" : "");
     }
+  } else if (strcmp(cmd, "sdtest") == 0) {
+    /* SD 读写自检：写一段已知字节模式再读回比对。
+       页面缓存读回来内容对不上时先跑它，分清是 SD 层还是 HTML 层。 */
+    SDCard::selfTest((arg && *arg) ? (uint32_t)atoi(arg) : 128);
   } else if (strcmp(cmd, "seg") == 0) {
     /* 分段渲染诊断：seg = 看状态；seg 2 = 跳到第 2 段；seg next / seg prev */
     if (!arg || !*arg) {

@@ -4,6 +4,7 @@
 #include <FS.h>
 #include <SD.h>
 #include <SPI.h>
+#include <esp_heap_caps.h>
 #include <stdio.h>
 
 namespace {
@@ -228,16 +229,154 @@ bool readFile(const char* path, String& out) {
   if (!g_mounted || !path) return false;
   File f = SD.open(path, FILE_READ);
   if (!f) return false;
+
+  /* ⚠️ 2026-09-25：以前这里写的是 `out += buf`。
+     `String::operator+=(const char*)` 走 strlen —— **遇到 0x00 就停**，
+     于是文件里每出现一个 NUL，它所在的那一块剩下的字节全被丢掉。
+     实测：131072 B 的测试文件（含 NUL）只读回 71892 B，且内容从头就错位。
+     网页 HTML（必应/360）的内联 JS 里就带 0x00，缓存读回来是错位的，
+     lexbor 于是把 JS 当成标签解析 —— 表现就是页面上冒出一坨脚本源码。
+     → 改用 concat(ptr, len) 按长度拷，不再依赖 NUL 结尾。 */
   out = "";
+  size_t total = (size_t)f.size();
+  if (total) out.reserve(total + 1);   /* 免得每块都重新分配（O(n^2)） */
+
+  uint8_t buf[512];
   while (f.available()) {
-    char buf[256];
-    int n = f.read((uint8_t*)buf, sizeof(buf) - 1);
+    int n = f.read(buf, sizeof(buf));
     if (n <= 0) break;
-    buf[n] = '\0';
-    out += buf;
+    out.concat((const char*)buf, (unsigned int)n);
   }
   f.close();
   return out.length() > 0;
+}
+
+/* 读写自检（2026-09-25）
+   页面缓存写到 SD 再读回来，96KB 的文件**长度一模一样但字节从 182 开始就不对**，
+   而且换一页还是同一个偏移 —— 说明不是 HTML 的问题，是这一层。
+   这里写一段"第 i 字节 = i 的函数"再原样读回，逐字节比对，
+   就能分清是写坏了、还是读坏了、还是只在超过某个大小后才坏。 */
+bool selfTest(uint32_t kb) {
+  if (!g_mounted) { Serial.println("[SDTest] not mounted"); return false; }
+  if (kb == 0) kb = 128;
+  if (kb > 1024) kb = 1024;
+  size_t n = (size_t)kb * 1024;
+
+  uint8_t* pat = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!pat) { Serial.println("[SDTest] alloc failed"); return false; }
+  for (size_t i = 0; i < n; i++) pat[i] = (uint8_t)(i * 31u + (i >> 8));
+
+  const char* path = "/gt/_selftest.bin";
+  bool okAll = true;
+
+  /* ── 1) 一次大 write（writeFile 就是这么写的）── */
+  {
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { Serial.println("[SDTest] open for write failed"); heap_caps_free(pat); return false; }
+    size_t w = f.write(pat, n);
+    f.close();
+    Serial.printf("[SDTest] big-write: want=%u wrote=%u\n", (unsigned)n, (unsigned)w);
+
+    File g = SD.open(path, FILE_READ);
+    if (!g) { Serial.println("[SDTest] open for read failed"); heap_caps_free(pat); return false; }
+    size_t bad = 0, firstBad = 0;
+    uint8_t rb[512];
+    size_t pos = 0;
+    while (pos < n) {
+      int r = g.read(rb, sizeof(rb));
+      if (r <= 0) break;
+      for (int k = 0; k < r && pos + (size_t)k < n; k++) {
+        if (rb[k] != pat[pos + (size_t)k]) {
+          if (bad == 0) firstBad = pos + (size_t)k;
+          bad++;
+        }
+      }
+      pos += (size_t)r;
+    }
+    g.close();
+    Serial.printf("[SDTest] big-write readback: got=%u bad=%u firstBad=%u %s\n",
+                  (unsigned)pos, (unsigned)bad, (unsigned)firstBad,
+                  bad ? "MISMATCH" : "MATCH");
+    if (bad) okAll = false;
+  }
+
+  /* ── 2) 分块写（4KB 一块）── */
+  {
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { heap_caps_free(pat); return false; }
+    size_t off = 0;
+    while (off < n) {
+      size_t chunk = n - off > 4096 ? 4096 : n - off;
+      if (f.write(pat + off, chunk) != chunk) break;
+      off += chunk;
+    }
+    f.flush();
+    f.close();
+    Serial.printf("[SDTest] chunk-write: wrote=%u\n", (unsigned)off);
+
+    File g = SD.open(path, FILE_READ);
+    if (!g) { heap_caps_free(pat); return false; }
+    size_t bad = 0, firstBad = 0, pos = 0;
+    uint8_t rb[512];
+    while (pos < n) {
+      int r = g.read(rb, sizeof(rb));
+      if (r <= 0) break;
+      for (int k = 0; k < r && pos + (size_t)k < n; k++) {
+        if (rb[k] != pat[pos + (size_t)k]) {
+          if (bad == 0) firstBad = pos + (size_t)k;
+          bad++;
+        }
+      }
+      pos += (size_t)r;
+    }
+    g.close();
+    Serial.printf("[SDTest] chunk-write readback: got=%u bad=%u firstBad=%u %s\n",
+                  (unsigned)pos, (unsigned)bad, (unsigned)firstBad,
+                  bad ? "MISMATCH" : "MATCH");
+    if (bad) okAll = false;
+  }
+
+  /* ── 3) 走 writeFile/readFile（页面缓存真正用的那条路）──
+        模式里**不掺 0x00**，先排除 NUL 截断这个已知嫌疑。 */
+  {
+    String sdata;
+    sdata.reserve(n + 16);
+    for (size_t i = 0; i < n; i++) sdata += (char)(uint8_t)(i * 31u + (i >> 8));
+    bool wok = SDCard::writeFile(path, sdata);
+    String back;
+    bool rok = SDCard::readFile(path, back);
+    size_t bad = 0, firstBad = 0;
+    size_t m = back.length() < n ? back.length() : n;
+    for (size_t i = 0; i < m; i++)
+      if ((uint8_t)back[i] != (uint8_t)sdata[i]) { if (!bad) firstBad = i; bad++; }
+    Serial.printf("[SDTest] writeFile/readFile: w=%d r=%d len=%u/%u bad=%u firstBad=%u %s\n",
+                  (int)wok, (int)rok, (unsigned)back.length(), (unsigned)n,
+                  (unsigned)bad, (unsigned)firstBad, (bad || !wok || !rok) ? "MISMATCH" : "MATCH");
+    if (bad || !wok || !rok) okAll = false;
+  }
+
+  /* ── 4) 同上，但模式里掺入 0x00（验证 String 累加遇到 NUL 会怎样）── */
+  {
+    String sdata;
+    sdata.reserve(n + 16);
+    for (size_t i = 0; i < n; i++) {
+      uint8_t v = (uint8_t)(i * 31u + (i >> 8));
+      if ((i % 997) == 0) v = 0;      /* 每 997 字节塞一个 NUL */
+      sdata += (char)v;
+    }
+    bool wok = SDCard::writeFile(path, sdata);
+    String back;
+    bool rok = SDCard::readFile(path, back);
+    Serial.printf("[SDTest] with-NUL: len=%u want=%u %s\n",
+                  (unsigned)back.length(), (unsigned)n,
+                  (back.length() == n) ? "LEN-OK" : "LEN-SHORT");
+    if (back.length() != n) okAll = false;
+  }
+
+  SD.remove(path);
+  heap_caps_free(pat);
+  Serial.printf("[SDTest] %s\n", okAll ? "ALL OK" : "FAILED");
+  return okAll;
 }
 
 }  // namespace SDCard
