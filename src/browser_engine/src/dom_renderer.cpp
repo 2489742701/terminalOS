@@ -514,6 +514,22 @@ static void collect_stylesheets(lxb_dom_node_t *node, const char *base_url) {
 /* DOM 节点计数（诊断用，不限制数量：Lexbor 内存已重定向到 PSRAM） */
 static int g_layoutNodeCount = 0;
 
+/* <img> 的 width/height 属性是**不带结尾 0** 的一段字符，且常常写成 "120px"。
+   只吃开头的数字，吃不到就当没写。 */
+static int attr_int(const char *s, size_t n) {
+  int v = 0;
+  bool any = false;
+  for (size_t i = 0; i < n && i < 8; i++) {
+    if (s[i] >= '0' && s[i] <= '9') {
+      v = v * 10 + (s[i] - '0');
+      any = true;
+    } else {
+      break;
+    }
+  }
+  return any ? v : 0;
+}
+
 static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
                                               RenderContext *context) {
   if (!dom_node)
@@ -542,7 +558,18 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
         LayoutNode *text_node = layout_node_create(ELEMENT_SPAN);
         if (text_node) {
           size_t trimmed_len = end - start + 1;
-          text_node->text_content = (char *)malloc(trimmed_len + 1);
+          /* ⚠️ 这里以前是裸 malloc。文本节点是布局树里数量最多的东西
+             （一页几百个），而 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096 会把
+             <=4KB 的 malloc 全塞进**内部 DRAM** —— 解析一页 DRAM 掉几十 KB，
+             掉到几百字节时 lwIP 连 DNS 都发不出去、随便一个分配失败就空指针崩。
+             tb_alloc 走 PSRAM（满了才退回 DRAM）。 */
+          text_node->text_content = (char *)tb_alloc(trimmed_len + 1);
+          if (!text_node->text_content) {
+            /* 原代码不判空就 memcpy —— 往 NULL 写，DRAM 见底时就是崩溃 */
+            layout_node_destroy(text_node);
+            free(txt);
+            return NULL;
+          }
           memcpy(text_node->text_content, start, trimmed_len);
           text_node->text_content[trimmed_len] = '\0';
         }
@@ -733,6 +760,40 @@ static LayoutNode *build_layout_tree_from_dom(lxb_dom_node_t *dom_node,
         }
       }
     }
+  }
+
+  /* ── <img>（缩略图）2026-09-25 ────────────────────────────────────────
+     这里**只**记绝对地址和尺寸属性，绝不联网 —— DOM 阶段联网会把一次页面
+     加载拖成分钟级（一个页面几十张图，每张一次 TLS 握手）。
+     真正的下载在后台 fetch 任务里、按"最多几张 + 各自字节上限"来做。
+     内联 data: URI 直接跳过（那玩意儿是 base64，解析它纯属浪费）。 */
+  if (elem_type == ELEMENT_IMAGE) {
+    size_t src_len = 0;
+    const char *src_attr = html_parser.get_element_attr(element, "src", &src_len);
+    if (!src_attr || src_len == 0) {
+      src_attr = html_parser.get_element_attr(element, "data-src", &src_len);
+    }
+    /* 懒加载站点（知乎/微博）常把真地址放在 data-original / data-actual 里 */
+    if (!src_attr || src_len == 0) {
+      src_attr = html_parser.get_element_attr(element, "data-original", &src_len);
+    }
+    if (src_attr && src_len > 0 &&
+        !(src_len >= 5 && strncmp(src_attr, "data:", 5) == 0)) {
+      char *raw = safe_strndup(src_attr, src_len);
+      if (raw) {
+        char *abs_url = tactilebrowser_resolve_url(context->document_url, raw);
+        free(raw);
+        if (abs_url) layout_node->img_src = abs_url;
+      }
+    }
+    size_t w_len = 0;
+    const char *w_attr =
+        html_parser.get_element_attr(element, "width", &w_len);
+    if (w_attr && w_len > 0) layout_node->img_w = attr_int(w_attr, w_len);
+    size_t h_len = 0;
+    const char *h_attr =
+        html_parser.get_element_attr(element, "height", &h_len);
+    if (h_attr && h_len > 0) layout_node->img_h = attr_int(h_attr, h_len);
   }
 
   // Apply tag-level selectors

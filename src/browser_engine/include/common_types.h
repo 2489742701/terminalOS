@@ -99,6 +99,12 @@ typedef struct {
      用来给链接/小按钮画框框，让"这个能点"在 480x480 小屏上肉眼可见。 */
   void *(*create_chip)(Renderer *renderer, const char *text, int max_width,
                        uint32_t color);
+  /* 图片缩略图：img_dsc 是平台侧的图片描述符（LVGL 里是 lv_img_dsc_t*），
+     内容是**已经重采样好的小图**。渲染时变成一块瓦片。 */
+  void *(*create_image)(Renderer *renderer, void *img_dsc, int max_w);
+  /* 缩略图被点了 → 回调里带着布局节点指针回去（app 层拿它开全屏大图 /
+     另存文件）。参数是 void* 而不是具体类型：引擎不该知道 app 怎么处理。 */
+  void (*register_image_handler)(Renderer *renderer, void *widget, void *node);
   /* 平铺专用：把一条"搜索结果"打扮成能一眼分辨的一块 —— 底部留白 + 一条分隔线。
      480 屏上一行就是钱，条目挤在一起根本分不出哪条是哪条。 */
   void (*style_result_item)(Renderer *renderer, void *widget);

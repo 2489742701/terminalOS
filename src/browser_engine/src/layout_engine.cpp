@@ -373,6 +373,9 @@ void layout_node_destroy(LayoutNode *node) {
   free(node->href_path);
   free(node->form_value);
   free(node->placeholder);
+  free(node->img_src);
+  if (node->img_dsc) tb_image_dsc_free(node->img_dsc);
+  if (node->img_thumb) tb_image_dsc_free(node->img_thumb);
   free(node);
 }
 
@@ -920,6 +923,98 @@ int layout_tile_total(void) { return s_tileTotal; }
 int layout_tile_rendered(void) { return s_tileIdx; }
 void layout_forget_prepare(void) { s_preparedRoot = NULL; s_tileTotal = 0; }
 
+/* ── 图片候选收集 ──────────────────────────────────────────────────────────
+ * 铁律照旧：兄弟用迭代、父子才递归。
+ * 只挑"值得下载"的：有 img_src、还没下载过、而且不是 1x1 那种追踪像素
+ * （HTML 里写了 width/height 且都 <= 4 的基本都是埋点/占位图）。 */
+static void collect_images_rec(LayoutNode *node, LayoutNode **out, int max,
+                               int *n, int depth) {
+  if (!node || depth > MAX_LAYOUT_DEPTH) return;
+  for (LayoutNode *c = node; c && *n < max; c = c->next_sibling) {
+    if (c->type == ELEMENT_IMAGE && c->img_src && !c->img_dsc) {
+      bool tracking_pixel = (c->img_w > 0 && c->img_w <= 4 &&
+                             c->img_h > 0 && c->img_h <= 4);
+      if (!tracking_pixel) out[(*n)++] = c;
+    }
+    if (c->first_child)
+      collect_images_rec(c->first_child, out, max, n, depth + 1);
+  }
+}
+
+int layout_collect_images(LayoutNode *root, LayoutNode **out, int max) {
+  int n = 0;
+  if (!root || !out || max <= 0) return 0;
+  collect_images_rec(root, out, max, &n, 0);
+  return n;
+}
+
+/* 已经拿到原始字节的图片（等做缩略图）。判定只看 img_dsc。 */
+static void collect_ready_rec(LayoutNode *node, LayoutNode **out, int max,
+                              int *n, int depth) {
+  if (!node || depth > MAX_LAYOUT_DEPTH) return;
+  for (LayoutNode *c = node; c && *n < max; c = c->next_sibling) {
+    if (c->type == ELEMENT_IMAGE && c->img_dsc) out[(*n)++] = c;
+    if (c->first_child)
+      collect_ready_rec(c->first_child, out, max, n, depth + 1);
+  }
+}
+
+int layout_collect_ready_images(LayoutNode *root, LayoutNode **out, int max) {
+  int n = 0;
+  if (!root || !out || max <= 0) return 0;
+  collect_ready_rec(root, out, max, &n, 0);
+  return n;
+}
+
+static void dump_images_rec(LayoutNode *node, int *total, int *with_src,
+                            int *with_pic, int depth) {
+  if (!node || depth > MAX_LAYOUT_DEPTH) return;
+  for (LayoutNode *c = node; c; c = c->next_sibling) {
+    if (c->type == ELEMENT_IMAGE) {
+      (*total)++;
+      if (c->img_src) (*with_src)++;
+      if (c->img_dsc) (*with_pic)++;
+      if (*total <= 15) {
+        Serial.printf("[Imgs] #%d src=%s attr=%dx%d bytes=%s\n", *total,
+                      c->img_src ? c->img_src : "(没取到)",
+                      c->img_w, c->img_h, c->img_dsc ? "Y" : "N");
+      }
+    }
+    if (c->first_child)
+      dump_images_rec(c->first_child, total, with_src, with_pic, depth + 1);
+  }
+}
+
+static void assign_images_rec(LayoutNode *node, LayoutImageMatcher m, void *ctx,
+                              int *n, int depth) {
+  if (!node || depth > MAX_LAYOUT_DEPTH) return;
+  for (LayoutNode *c = node; c; c = c->next_sibling) {
+    if (c->type == ELEMENT_IMAGE && c->img_src && !c->img_dsc) {
+      void *d = m(c->img_src, ctx);
+      if (d) {
+        c->img_dsc = d;
+        (*n)++;
+      }
+    }
+    if (c->first_child)
+      assign_images_rec(c->first_child, m, ctx, n, depth + 1);
+  }
+}
+
+int layout_assign_images(LayoutNode *root, LayoutImageMatcher m, void *ctx) {
+  int n = 0;
+  if (!root || !m) return 0;
+  assign_images_rec(root, m, ctx, &n, 0);
+  return n;
+}
+
+void layout_dump_images(LayoutNode *root) {
+  int total = 0, with_src = 0, with_pic = 0;
+  if (root) dump_images_rec(root, &total, &with_src, &with_pic, 0);
+  Serial.printf("[Imgs] <img> nodes=%d, 有绝对地址=%d, 有字节=%d\n", total,
+                with_src, with_pic);
+}
+
 /* 申领一块瓦片：返回"是否真的建控件"。
    干跑时永远不建；分段时只建落在窗口里的；MAX_WIDGETS 是绝对安全闸。
    ⚠️ **同一个节点只占一块**：下面的分支是 if / else-if 链，胶囊分支判定为
@@ -1010,7 +1105,34 @@ static void layout_render_node(LayoutNode *node, RenderContext *render_ctx,
         <textarea id="sb_form_q" type="search" rows="1">，当年为了省 DRAM
         把 textarea 整个跳过，结果必应里**根本看不见搜索框**。
         现在 LVGL 池已在 PSRAM、DRAM 有 250KB，这个限制不成立。 */
-  if ((node->type == ELEMENT_INPUT_TEXT || node->type == ELEMENT_TEXTAREA) &&
+  if (node->type == ELEMENT_IMAGE && node->img_thumb && seg_take_tile(node) &&
+      iface->create_image) {
+    /* 缩略图瓦片。判定条件是 img_thumb（渲染用的小图）不是 img_dsc（原始字节）：
+       没做出缩略图的图片节点**一块瓦片都不占**，干跑和实跑看到的状态一致，
+       所以"图下不下来"既不会把版面撑变形，也不会吃掉 MAX_WIDGETS 配额。
+       小图排进 row-wrap 行（跟胶囊同一套机制），一屏能并排好几个。 */
+    if (!s_rowContainer) {
+      void *saved = renderer->platform_data;
+      renderer->platform_data = parent;
+      s_rowContainer = iface->create_row_wrap(renderer, render_ctx->max_width);
+      renderer->platform_data = saved;
+      if (s_rowContainer) s_widgetCount++;
+    }
+    if (s_rowContainer) {
+      void *saved = renderer->platform_data;
+      renderer->platform_data = s_rowContainer;
+      node->widget = iface->create_image(renderer, node->img_thumb,
+                                         render_ctx->max_width);
+      renderer->platform_data = saved;
+      widget = node->widget;
+      if (widget) {
+        s_widgetCount++;
+        Serial.printf("[Img] tile #%d created\n", s_widgetCount - 1);
+        if (iface->register_image_handler)
+          iface->register_image_handler(renderer, widget, node);
+      }
+    }
+  } else if ((node->type == ELEMENT_INPUT_TEXT || node->type == ELEMENT_TEXTAREA) &&
       iface->create_text_input && seg_take_tile(node)) {
     /* textarea 的 form_value 是它的**整段 innerText**（可能几十 KB），
        原样塞给单行输入框会拖慢渲染，截到 256 B 足够看。 */

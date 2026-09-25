@@ -61,4 +61,10 @@ void listDir(const char* path, int depth);
 bool writeFile(const char* path, const String& data);
 bool readFile(const char* path, String& out);
 
+/* 二进制整文件写（图片另存用）。
+   ⚠️ 必须是独立的入口：writeFile 收 String，而 String 构造/拼接都按 NUL
+   结尾处理 —— JPEG/PNG 中间随便一个 0x00 就把后面全吃了（readFile 已经
+   栽过一次，见 docs/09 的 L4）。 */
+bool writeFileBin(const char* path, const uint8_t* data, size_t len);
+
 }  // namespace SDCard

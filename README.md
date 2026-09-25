@@ -99,13 +99,21 @@ python tools\verify_flow.py COM7 "https://m.baidu.com"
   - DIM 态上滑 ≥120px 解锁；OFF 态触摸回 DIM
 - **浏览器**（`src/app/browser_screen.cpp` + `src/browser_engine/`）：HTML → Lexbor 解析 → 平铺排版 → LVGL 渲染
   - 平铺排版（不建容器，避免 CSS 坐标压盖）、链接可点、搜索首页（**必应 / 360 两颗引擎独立一行** + 常用词胶囊）
-  - **分段渲染**（2026-09-25）：一次只铺 60 块瓦片，内容末尾给「上一段 / 第 x/y 段 / 下一段」。
+  - **分段渲染**（2026-09-25）：一次只铺 80 块瓦片，内容末尾给「上一段 / 第 x/y 段 / 下一段」。
     布局树渲染完**不释放**当本地缓存，翻段只是重铺同一棵树 —— 实测 19~73 ms，不联网、不重新解析。
     ⚠️ 在此之前 `MAX_WIDGETS=200` 是硬闸门，长页面（必应/360 中文搜索）后半截会被**直接丢弃**。
     诊断：串口 `seg` / `seg next` / `seg <n>`
   - 页面缓存**三级**：① PSRAM 2 槽（当前页 + 上一页，TTL 5 分钟）
     ② **SD 卡 `/gt/p<hash>.html`，TTL 30 分钟（跨重启）** ③ LittleFS 下载
     ⚠️ SD 只在已挂载时参与（串口 `sd` 挂载；挂载要占用与 LCD 共用的 SPI，绝不在浏览中偷偷 mount）
+  - **网页图片（缩略图 → 全屏 → 另存）**（2026-09-25）：
+    `<img>` 一律重采样成 **96px 小图**铺进页面（盒子滤波，糊但看得清），
+    点一下开**全屏大图**（小图最多放大到 2 倍），左下角可**另存**（SD 优先 / LittleFS 兜底）。
+    - ⚠️ 图片必须在**解析之前**抓完：解析会把内部 DRAM 吃到只剩几百字节，
+      之后 DNS 直接失败（`hostByName(): DNS Failed`），一张图都下不来。
+      所以流程是「下 HTML → 扫原始 HTML 抓图 → 解析 → 按 URL 认领回节点」。
+    - 每页最多 6 张、单张 ≤64KB、整个图片阶段 ≤20s（`IMG_MAX` / `IMG_TOTAL_MS`）。
+    - 串口：`img on|off`、`thumb <px>`、`imgscan`、`imgview <n>`、`imgdl <n>`
   - 下载当前页（底栏下载键）：**插了 SD 卡优先写卡**，否则退回 LittleFS
   - 内置 HTTP 服务（`serve`），PC 浏览器访问设备 IP 看原始 HTML
 - NTP 校时（`src/hal/ntp_time.cpp`，手写避开 `Time` 库）、背光 PWM（LEDC，PIN_BL=38）

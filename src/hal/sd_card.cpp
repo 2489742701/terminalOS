@@ -225,6 +225,24 @@ bool writeFile(const char* path, const String& data) {
   return w == data.length();
 }
 
+bool writeFileBin(const char* path, const uint8_t* data, size_t len) {
+  if (!g_mounted || !path || !data || len == 0) return false;
+  const char* slash = strrchr(path, '/');
+  if (slash && slash > path) {
+    char dir[64];
+    int n = (int)(slash - path);
+    if (n >= (int)sizeof(dir)) n = (int)sizeof(dir) - 1;
+    memcpy(dir, path, (size_t)n);
+    dir[n] = '\0';
+    if (!SD.exists(dir)) SD.mkdir(dir);
+  }
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return false;
+  size_t w = f.write(data, len);
+  f.close();
+  return w == len;
+}
+
 bool readFile(const char* path, String& out) {
   if (!g_mounted || !path) return false;
   File f = SD.open(path, FILE_READ);

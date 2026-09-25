@@ -787,6 +787,31 @@ static void executeLine(char* line) {
     /* SD 读写自检：写一段已知字节模式再读回比对。
        页面缓存读回来内容对不上时先跑它，分清是 SD 层还是 HTML 层。 */
     SDCard::selfTest((arg && *arg) ? (uint32_t)atoi(arg) : 128);
+  } else if (strcmp(cmd, "img") == 0) {
+    /* 缩略图开关：img / img on / img off。
+       图多的页面会把加载时间拉长（每张一次 TLS 握手），关掉可以救回来。 */
+    if (!arg || !*arg) {
+      Serial.printf("[Img] images %s\n",
+                    BrowserScreen_imagesEnabled() ? "ON" : "OFF");
+    } else {
+      BrowserScreen_setImages(!(strcmp(arg, "off") == 0 ||
+                                strcmp(arg, "0") == 0));
+    }
+  } else if (strcmp(cmd, "thumb") == 0) {
+    /* 缩略图长边上限：thumb 96 / thumb 160。只影响重采样，不影响下载。 */
+    BrowserScreen_setThumbPx((arg && *arg) ? atoi(arg) : 96);
+  } else if (strcmp(cmd, "imgscan") == 0) {
+    /* 本页有几个 <img>、几个取到了地址 —— 图片不显示时第一个该跑的命令 */
+    BrowserScreen_imgScan();
+  } else if (strcmp(cmd, "imgview") == 0) {
+    /* 不开屏也能验全屏看图：imgview 1 */
+    BrowserScreen_imgView((arg && *arg) ? atoi(arg) : 1);
+  } else if (strcmp(cmd, "imgdl") == 0) {
+    /* 验另存：imgdl 1 */
+    BrowserScreen_imgDownload((arg && *arg) ? atoi(arg) : 1);
+  } else if (strcmp(cmd, "imgtest") == 0) {
+    /* 单张图连通性+可解码性验证：imgtest https://.../a.jpg */
+    BrowserScreen_imgTest(arg);
   } else if (strcmp(cmd, "seg") == 0) {
     /* 分段渲染诊断：seg = 看状态；seg 2 = 跳到第 2 段；seg next / seg prev */
     if (!arg || !*arg) {

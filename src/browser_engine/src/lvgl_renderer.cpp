@@ -337,6 +337,466 @@ RenderResult arduino_download_html(const char *url, MemoryBuffer *buffer) {
   return RENDER_SUCCESS;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 图片（缩略图）2026-09-25
+ *
+ * 为什么要有字节/尺寸上限：LVGL 的 SJPG 解码器（lv_sjpg.c，底层是 tjpgd）在
+ * decoder_open 里**一次性**分配 w*h*3 的 RGB888 中间缓冲，再按行转成 RGB565。
+ * 也就是说一张 1920x1080 的 JPEG 会直接吃掉 6MB —— 不设闸，PSRAM 瞬间见底。
+ * 所以：下载有字节上限，下载完先用 tb_image_peek_size 看宽高，超预算直接丢，
+ * 通过的才包成 lv_img_dsc_t 交给渲染层。
+ *
+ * ⚠️ 这些函数跑在后台 fetch 任务（Core 0）里，**一律不许碰 LVGL**。
+ *    只有 tb_image_dsc_free 例外（它要失效图片缓存），必须在 UI 线程调。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* 二进制下载（与 arduino_download_html 同构，但更短、有上限、带 Referer） */
+static int download_binary_inner(const char *url, uint8_t **out, size_t *outLen,
+                                 size_t maxBytes, const char *referer,
+                                 int depth) {
+  if (!url || !out || !outLen || maxBytes == 0) return -1;
+  if (depth > 3) return -1;
+
+  String urlStr(url);
+  bool isHttps = urlStr.startsWith("https://");
+  int protoEnd = urlStr.indexOf("://");
+  if (protoEnd < 0) return -1;
+  String rest = urlStr.substring(protoEnd + 3);
+  int slashPos = rest.indexOf('/');
+  String host = slashPos < 0 ? rest : rest.substring(0, slashPos);
+  String path = slashPos < 0 ? "/" : rest.substring(slashPos);
+  int port = isHttps ? 443 : 80;
+  int colonPos = host.indexOf(':');
+  if (colonPos >= 0) {
+    port = host.substring(colonPos + 1).toInt();
+    host = host.substring(0, colonPos);
+  }
+
+  WiFiClient *client = nullptr;
+  WiFiClient tcpClient;
+  WiFiClientSecure sslClient;
+  if (isHttps) {
+    init_tls_psram();
+    sslClient.setInsecure();
+    sslClient.setTimeout(8);
+    if (!sslClient.connect(host.c_str(), port)) return -1;
+    client = &sslClient;
+  } else {
+    tcpClient.setTimeout(8);
+    if (!tcpClient.connect(host.c_str(), port)) return -1;
+    client = &tcpClient;
+  }
+
+  String req = "GET " + path + " HTTP/1.1\r\n" +
+               "Host: " + host + "\r\n" +
+               "User-Agent: Mozilla/5.0 (Linux; Android 4.4.2; Nexus 5 "
+               "Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) "
+               "Chrome/30.0.0.0 Mobile Safari/537.36\r\n" +
+               "Accept: image/jpeg,image/png,image/*,*/*;q=0.8\r\n" +
+               "Accept-Language: zh-CN,zh;q=0.9\r\n" +
+               (referer && referer[0] ? (String("Referer: ") + referer + "\r\n")
+                                      : String("")) +
+               "Connection: close\r\n\r\n";
+  client->print(req);
+
+  String line;
+  int status = 0;
+  int contentLen = 0;
+  bool chunked = false;
+  String redirectTo = "";
+  uint32_t t0 = millis();
+  while (client->connected() || client->available()) {
+    if (millis() - t0 > 8000) { client->stop(); return -1; }
+    line = client->readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) break;
+    if (status == 0 && line.startsWith("HTTP/")) {
+      status = line.substring(9, 12).toInt();
+    } else if (line.startsWith("Content-Length:")) {
+      contentLen = line.substring(15).toInt();
+    } else if (line.equalsIgnoreCase("Transfer-Encoding: chunked")) {
+      chunked = true;
+    } else if (line.length() > 9 &&
+               strncasecmp(line.c_str(), "location:", 9) == 0) {
+      redirectTo = line.substring(9);
+      redirectTo.trim();
+    }
+  }
+
+  if (status >= 300 && status <= 399 && redirectTo.length() > 0) {
+    client->stop();
+    String nextUrl = resolve_redirect(urlStr, redirectTo);
+    if (nextUrl.length() == 0) return -1;
+    return download_binary_inner(nextUrl.c_str(), out, outLen, maxBytes,
+                                 referer, depth + 1);
+  }
+  if (status != 200) { client->stop(); return -3; }
+  if (contentLen > (int)maxBytes) { client->stop(); return -3; }
+  if (contentLen <= 0) contentLen = (int)maxBytes;
+
+  uint8_t *buf = (uint8_t *)heap_caps_malloc(contentLen + 8,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) { client->stop(); return -2; }
+  Serial.printf("[Img] dl host=%s len=%d chunked=%d\n", host.c_str(),
+                contentLen, (int)chunked);
+
+  int total = 0;
+  t0 = millis();
+  if (chunked) {
+    while (client->connected() || client->available()) {
+      if (millis() - t0 > 10000) break;
+      String sl = client->readStringUntil('\n');
+      sl.trim();
+      int cs = strtol(sl.c_str(), NULL, 16);
+      if (cs <= 0) break;
+      int room = contentLen - total;
+      if (room <= 0) break;
+      int want = cs > room ? room : cs;
+      int got = 0;
+      while (got < want && (client->connected() || client->available())) {
+        int r = client->read(buf + total, want - got);
+        if (r > 0) { got += r; total += r; }
+        else delay(1);
+      }
+      client->readStringUntil('\n');
+      if (got < cs) break;
+      vTaskDelay(1);
+    }
+  } else {
+    while (total < contentLen && (client->connected() || client->available())) {
+      if (millis() - t0 > 10000) break;
+      int r = client->read(buf + total, contentLen - total);
+      if (r > 0) { total += r; if (total % 4096 < 64) vTaskDelay(1); }
+      else delay(1);
+    }
+  }
+  client->stop();
+
+  if (total <= 0) { heap_caps_free(buf); return -1; }
+  *out = buf;
+  *outLen = (size_t)total;
+  return 0;
+}
+
+int arduino_download_binary(const char *url, uint8_t **out, size_t *outLen,
+                            size_t maxBytes, const char *referer) {
+  return download_binary_inner(url, out, outLen, maxBytes, referer, 0);
+}
+
+bool tb_image_peek_size(const uint8_t *data, size_t len, int *w, int *h) {
+  if (!data || !w || !h) return false;
+  *w = 0;
+  *h = 0;
+  /* JPEG：从 SOI 开始顺着段链找 SOFn（FFC0~FFCF，排除 DHT/C4、JPG/C8、DAC/CC） */
+  if (len > 24 && data[0] == 0xFF && data[1] == 0xD8) {
+    size_t i = 2;
+    while (i + 9 < len) {
+      if (data[i] != 0xFF) { i++; continue; }
+      uint8_t m = data[i + 1];
+      if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7) || m == 0xFF) {
+        i += 2;
+        continue;
+      }
+      if (m == 0xC0 || m == 0xC1 || m == 0xC2 || m == 0xC3 || m == 0xC5 ||
+          m == 0xC6 || m == 0xC7 || m == 0xC9 || m == 0xCA || m == 0xCB ||
+          m == 0xCD || m == 0xCE || m == 0xCF) {
+        *h = (data[i + 5] << 8) | data[i + 6];
+        *w = (data[i + 7] << 8) | data[i + 8];
+        return (*w > 0 && *h > 0);
+      }
+      size_t seg = ((size_t)data[i + 2] << 8) | data[i + 3];
+      if (seg < 2) return false;
+      i += 2 + seg;
+    }
+    return false;
+  }
+  /* PNG：IHDR 里第 16~23 字节是大端宽高 */
+  if (len > 24 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E &&
+      data[3] == 0x47) {
+    *w = (int)(((uint32_t)data[16] << 24) | ((uint32_t)data[17] << 16) |
+               ((uint32_t)data[18] << 8) | (uint32_t)data[19]);
+    *h = (int)(((uint32_t)data[20] << 24) | ((uint32_t)data[21] << 16) |
+               ((uint32_t)data[22] << 8) | (uint32_t)data[23]);
+    return (*w > 0 && *h > 0);
+  }
+  /* GIF：逻辑屏幕描述符，小端 */
+  if (len > 14 && data[0] == 0x47 && data[1] == 0x49 && data[2] == 0x46) {
+    *w = (int)(data[6] | (data[7] << 8));
+    *h = (int)(data[8] | (data[9] << 8));
+    return (*w > 0 && *h > 0);
+  }
+  return false;
+}
+
+void *tb_image_dsc_create(uint8_t *data, size_t len, int w, int h,
+                          int max_w, long max_px, int *scale_out) {
+  if (scale_out) *scale_out = 0;
+  if (!data || len < 16 || w <= 0 || h <= 0) return NULL;
+
+  bool is_png = (len > 24 && data[0] == 0x89 && data[1] == 0x50 &&
+                 data[2] == 0x4E && data[3] == 0x47);
+  bool is_jpg = (data[0] == 0xFF && data[1] == 0xD8);
+  if (!is_png && !is_jpg) return NULL;
+
+  /* JPEG 能在**解码阶段**降采样（tjpgd 的 1/2 / 1/4 / 1/8，档位走
+     lv_img_header_t.reserved，见 tools/patch_lvgl_jpeg_scale.py），
+     所以再大的图也能当缩略图显示；PNG 走 lodepng，只能原尺寸解，
+     超预算就放弃 —— 宁可不显示，也别把 PSRAM 吃穿。 */
+  int scale = 0;
+  if (is_jpg) {
+    for (scale = 0; scale <= 3; scale++) {
+      long sw = w >> scale;
+      long sh = h >> scale;
+      if (sw <= max_w && sw * sh <= max_px) break;
+    }
+    if (scale > 3) return NULL;   /* 1/8 都还塞不下 */
+  } else if (w > max_w || (long)w * (long)h > max_px) {
+    return NULL;
+  }
+
+  lv_img_dsc_t *d = (lv_img_dsc_t *)tb_alloc(sizeof(lv_img_dsc_t));
+  if (!d) return NULL;
+  memset(d, 0, sizeof(*d));
+  d->header.always_zero = 0;
+  d->header.w = w >> scale;
+  d->header.h = h >> scale;
+  /* ⚠️⚠️ 这里的 cf 是**给解码器看的输入**，不是"解码后的格式"，填错会出乱码：
+       · PNG 必须填 RAW_ALPHA。填 TRUE_COLOR_ALPHA(5) 会踩一个大坑 ——
+         内建解码器受理 4~11 这一段，PNG 解不出来时它会**接管**，而内建对
+         VARIABLE 源的做法是把 data（压缩的 PNG 原文）当像素交出来。
+         结果是：尺寸看着对、像素全是乱码，还不报错。
+         RAW_ALPHA(2) 落在内建受理范围外，只有 PNG 解码器能认领，
+         解不了就干净地失败。
+       · JPEG 填 RAW，交给 SJPG 逐行 read_line。 */
+  d->header.cf = is_png ? LV_IMG_CF_RAW_ALPHA : LV_IMG_CF_RAW;
+  d->header.reserved = (uint32_t)scale;   /* JPEG 降采样档位 */
+  d->data = data;
+  d->data_size = len;
+  if (scale_out) *scale_out = scale;
+  return d;
+}
+
+void tb_image_dsc_discard(void *dsc) {
+  if (!dsc) return;
+  lv_img_dsc_t *d = (lv_img_dsc_t *)dsc;
+  if (d->data) heap_caps_free((void *)d->data);
+  heap_caps_free(d);
+}
+
+void tb_image_dsc_free(void *dsc) {
+  if (!dsc) return;
+  lv_img_dsc_t *d = (lv_img_dsc_t *)dsc;
+  /* LVGL 的图片缓存按 src 指针索引。不让它失效的话，缓存里那条还指着我们
+     马上要 free 的 dsc —— 下次命中就是野指针，而且是延后很久才炸的那种。 */
+  lv_img_cache_invalidate_src(d);
+  if (d->data) heap_caps_free((void *)d->data);
+  heap_caps_free(d);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 缩略图 / 全屏大图：把原始 JPEG/PNG 字节重采样成指定尺寸的 RGB565 缓冲
+ *
+ * 为什么不用 lv_img_set_zoom（两条都踩过）：
+ *   1) JPEG 在 LVGL 里走的是 RAW + 逐行 read_line（decoder_open 故意把
+ *      img_data 留成 NULL）。LVGL 缩放时会拿**每一行**当整张图单独变换，
+ *      画出来是上下错位的；
+ *   2) zoom 本身是最近邻，缩到 1/5 就是马赛克 —— 而我们要的是"糊但看得清"。
+ * 所以这里自己把像素抠出来做**区域平均**（box filter）：每个目标像素取它覆盖
+ * 的那些源像素求平均，缩略图上还能认出这是什么。
+ *
+ * 取像素的两条路：
+ *   · JPEG（img_data 为空）→ lv_img_decoder_read_line 逐行取（已经是 RGB565）；
+ *   · PNG（解码器一次性给整块）→ 直接从 img_data 取（RGB565+alpha，3 字节/像素）。
+ *
+ * ⚠️ 只能在 UI 线程调（碰 LVGL 解码器）。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+#define TB_DECODE_PIXEL_CAP 400000   /* 解码中间缓冲的像素上限：w*h*3 ≤ 1.2MB */
+
+static void tb_unpack565(uint16_t c, int *r, int *g, int *b) {
+  *r = (c >> 11) & 0x1F;
+  *g = (c >> 5) & 0x3F;
+  *b = c & 0x1F;
+}
+
+void *tb_image_resample(void *src_dsc, int box_w, int box_h,
+                        int *out_w, int *out_h) {
+  if (out_w) *out_w = 0;
+  if (out_h) *out_h = 0;
+  if (!src_dsc || box_w <= 0 || box_h <= 0) return NULL;
+
+  lv_img_dsc_t *sd = (lv_img_dsc_t *)src_dsc;
+  if (!sd->data || sd->header.w <= 0 || sd->header.h <= 0) return NULL;
+
+  const uint8_t *raw = sd->data;
+  bool is_png = (sd->data_size > 8 && raw[0] == 0x89 && raw[1] == 0x50);
+
+  /* JPEG 挑降采样档位：最小的那一档，让解码出来的图既塞得进 box*2
+     （留点余量，区域平均才有东西可平均），又不超过解码预算。 */
+  int scale = is_png ? 0 : 3;
+  if (!is_png) {
+    int pw = sd->header.w, ph = sd->header.h;
+    for (int s = 0; s <= 3; s++) {
+      long dw = pw >> s, dh = ph >> s;
+      if (dw <= (long)box_w * 2 && dh <= (long)box_h * 2 &&
+          dw * dh <= TB_DECODE_PIXEL_CAP) {
+        scale = s;
+        break;
+      }
+    }
+  }
+
+  lv_img_dsc_t tmp;                 /* 一份副本：档位只影响这次的解码 */
+  lv_img_decoder_dsc_t dec;
+  uint8_t *dst = NULL;
+  int32_t *acc = NULL;
+  uint8_t *row = NULL;
+  int sw = 0, sh = 0, dw = 0, dh = 0, bpp = 2, has_alpha = 0;
+  int ret = 0;
+
+  tmp = *sd;
+  tmp.header.reserved = (uint32_t)scale;
+
+  if (lv_img_decoder_open(&dec, is_png ? (const void *)sd : (const void *)&tmp,
+                          lv_color_white(), 0) != LV_RES_OK) {
+    Serial.println("[Img] resample: decoder open failed");
+    return NULL;
+  }
+  sw = (int)dec.header.w;
+  sh = (int)dec.header.h;
+  if (sw <= 0 || sh <= 0) ret = 1;
+  has_alpha = lv_img_cf_has_alpha(dec.header.cf) ? 1 : 0;
+  bpp = has_alpha ? 3 : 2;
+
+  /* ⚠️ 兜底：img_data 如果就是 data 本身，说明根本没有解码器解它，
+     是内建解码器把**压缩原文**原样递回来了 —— 当像素读就是彩色乱码。 */
+  if (dec.img_data && (const uint8_t *)dec.img_data == sd->data) {
+    Serial.println("[Img] resample: built-in handed back raw bytes, refuse");
+    lv_img_decoder_close(&dec);
+    return NULL;
+  }
+  Serial.printf("[Img] resample in: cf=%u %dx%d img_data=%s src=%u B\n",
+                (unsigned)dec.header.cf, sw, sh,
+                dec.img_data ? "decoded" : "line-by-line",
+                (unsigned)sd->data_size);
+
+  /* 目标尺寸：等比缩到能塞进 box（只缩不放） */
+  if (!ret) {
+    dw = sw;
+    dh = sh;
+    if (dw > box_w) {
+      dh = (int)((long)dh * box_w / dw);
+      dw = box_w;
+    }
+    if (dh > box_h) {
+      dw = (int)((long)dw * box_h / dh);
+      dh = box_h;
+    }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+
+    dst = (uint8_t *)tb_alloc((size_t)dw * dh * bpp);
+    acc = (int32_t *)tb_alloc(sizeof(int32_t) * (size_t)dw * 4);
+    if (!dst || !acc) ret = 2;
+  }
+
+  const uint8_t *mem = (const uint8_t *)dec.img_data;
+  if (!ret && !mem) {
+    row = (uint8_t *)tb_alloc((size_t)sw * 2);
+    if (!row) ret = 3;
+  }
+
+  for (int dy = 0; !ret && dy < dh; dy++) {
+    int y0 = (int)((long)dy * sh / dh);
+    int y1 = (int)((long)(dy + 1) * sh / dh);
+    if (y1 <= y0) y1 = y0 + 1;
+    if (y1 > sh) y1 = sh;
+
+    memset(acc, 0, sizeof(int32_t) * (size_t)dw * 4);
+    for (int y = y0; y < y1; y++) {
+      if (!mem) {
+        /* JPEG 逐行取；read_line 已经是 RGB565，只认 y 递增，不能回头 */
+        if (lv_img_decoder_read_line(&dec, 0, y, sw, row) != LV_RES_OK) {
+          ret = 4;
+          break;
+        }
+      }
+      const uint8_t *srcp = mem ? (mem + (size_t)y * sw * bpp) : row;
+      for (int dx = 0; dx < dw; dx++) {
+        int x0 = (int)((long)dx * sw / dw);
+        int x1 = (int)((long)(dx + 1) * sw / dw);
+        if (x1 <= x0) x1 = x0 + 1;
+        if (x1 > sw) x1 = sw;
+        int r = 0, g = 0, b = 0, a = 0;
+        for (int x = x0; x < x1; x++) {
+          const uint8_t *q = srcp + (size_t)x * bpp;
+          int rr, gg, bb;
+          tb_unpack565((uint16_t)(q[0] | (q[1] << 8)), &rr, &gg, &bb);
+          r += rr;
+          g += gg;
+          b += bb;
+          if (has_alpha) a += q[2];
+        }
+        int32_t *o = acc + dx * 4;
+        int cnt = x1 - x0;
+        o[0] += r;
+        o[1] += g;
+        o[2] += b;
+        o[3] += has_alpha ? a : (cnt * 255);
+      }
+    }
+    if (ret) break;
+
+    int rows = y1 - y0;
+    uint8_t *dp = dst + (size_t)dy * dw * bpp;
+    for (int dx = 0; dx < dw; dx++) {
+      int x0 = (int)((long)dx * sw / dw);
+      int x1 = (int)((long)(dx + 1) * sw / dw);
+      if (x1 <= x0) x1 = x0 + 1;
+      if (x1 > sw) x1 = sw;
+      int cnt = rows * (x1 - x0);
+      const int32_t *o = acc + dx * 4;
+      int r = (int)(o[0] / cnt) & 0x1F;
+      int g = (int)(o[1] / cnt) & 0x3F;
+      int b = (int)(o[2] / cnt) & 0x1F;
+      uint16_t c = (uint16_t)((r << 11) | (g << 5) | b);
+      dp[0] = (uint8_t)(c & 0xFF);
+      dp[1] = (uint8_t)(c >> 8);
+      if (has_alpha) dp[2] = (uint8_t)(o[3] / cnt);
+      dp += bpp;
+    }
+  }
+
+  lv_img_decoder_close(&dec);
+  if (row) heap_caps_free(row);
+  if (acc) heap_caps_free(acc);
+
+  if (ret) {
+    if (dst) heap_caps_free(dst);
+    Serial.printf("[Img] resample failed: ret=%d %dx%d scale=%d\n", ret, sw, sh,
+                  scale);
+    return NULL;
+  }
+
+  lv_img_dsc_t *out = (lv_img_dsc_t *)tb_alloc(sizeof(lv_img_dsc_t));
+  if (!out) {
+    heap_caps_free(dst);
+    return NULL;
+  }
+  memset(out, 0, sizeof(*out));
+  out->header.always_zero = 0;
+  out->header.w = (uint32_t)dw;
+  out->header.h = (uint32_t)dh;
+  out->header.cf = has_alpha ? LV_IMG_CF_TRUE_COLOR_ALPHA : LV_IMG_CF_TRUE_COLOR;
+  out->data = dst;
+  out->data_size = (uint32_t)((size_t)dw * dh * bpp);
+  if (out_w) *out_w = dw;
+  if (out_h) *out_h = dh;
+  Serial.printf("[Img] resample %dx%d(scale %d) -> %dx%d %s\n", sw, sh, scale,
+                dw, dh, has_alpha ? "RGB565A" : "RGB565");
+  return out;
+}
+
 static bool lvgl_renderer_init(Renderer *renderer) {
   (void)renderer;
   return true;
@@ -344,6 +804,35 @@ static bool lvgl_renderer_init(Renderer *renderer) {
 
 static void lvgl_renderer_cleanup(Renderer *renderer) {
   (void)renderer;
+}
+
+static void *lvgl_renderer_create_image(Renderer *renderer, void *img_dsc,
+                                         int max_w) {
+  if (!renderer || !img_dsc) return NULL;
+  lv_obj_t *parent = (lv_obj_t *)renderer->platform_data;
+  if (!parent) return NULL;
+
+  /* 外面套一层带边框的容器再放图。
+     为什么不直接给 lv_img 加边框：lv_img 是拿**对象整体坐标**画图的
+     （不是内容区），边框会被图盖住 —— 等于白设。 */
+  lv_obj_t *box = lv_obj_create(parent);
+  lv_obj_remove_style_all(box);
+  lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_pad_all(box, 2, 0);
+  lv_obj_set_style_border_width(box, 1, 0);
+  lv_obj_set_style_border_color(box, lv_color_hex(0x888888), 0);
+  lv_obj_set_style_radius(box, 4, 0);
+
+  lv_obj_t *img = lv_img_create(box);
+  lv_img_set_src(img, (const lv_img_dsc_t *)img_dsc);
+  lv_obj_center(img);
+
+  /* 缩略图早就重采样到 <= THUMB 了，这里不需要再缩放。
+     ⚠️ 别想着用 lv_img_set_zoom 收尾：LVGL 对未解码完的图按行变换，
+     一 zoom 就错位（详见 tb_image_resample 上面的注释）。 */
+  (void)max_w;
+  return box;
 }
 
 static void *lvgl_renderer_create_label(Renderer *renderer, const char *text,
@@ -607,6 +1096,28 @@ static int s_linkCount = 0;
 
 void lvgl_renderer_set_link_callback(LvglLinkCallback cb) { s_linkCb = cb; }
 
+/* ── 缩略图点击 ──
+   user_data 直接存**布局节点指针**。为什么敢存：节点和 widget 同生共死
+   （换页时 freeLayoutTree + contentReset 一起做），而且这里只处理 CLICKED，
+   销毁阶段不会再派发给它。 */
+static LvglImageCallback s_imageCb = NULL;
+void lvgl_renderer_set_image_callback(LvglImageCallback cb) { s_imageCb = cb; }
+
+static void image_clicked_cb(lv_event_t *e) {
+  if (!s_imageCb) return;
+  void *node = lv_event_get_user_data(e);
+  if (node) s_imageCb(node);
+}
+
+static void lvgl_renderer_register_image_handler(Renderer *renderer,
+                                                 void *widget, void *node) {
+  (void)renderer;
+  if (!widget || !node) return;
+  lv_obj_add_flag((lv_obj_t *)widget, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb((lv_obj_t *)widget, image_clicked_cb, LV_EVENT_CLICKED,
+                      node);
+}
+
 void lvgl_renderer_reset_link_count(void) { s_linkCount = 0; }
 int lvgl_renderer_link_count(void) { return s_linkCount; }
 
@@ -683,6 +1194,8 @@ LvglRenderer *lvgl_renderer_create(void) {
   renderer->base.clear_container = lvgl_renderer_clear_container;
   renderer->base.create_row_wrap = lvgl_renderer_create_row_wrap;
   renderer->base.create_chip = lvgl_renderer_create_chip;
+  renderer->base.create_image = lvgl_renderer_create_image;
+  renderer->base.register_image_handler = lvgl_renderer_register_image_handler;
   renderer->base.style_result_item = lvgl_renderer_style_result_item;
   renderer->base.get_height = lvgl_renderer_get_height;
   renderer->base.platform_data = NULL;

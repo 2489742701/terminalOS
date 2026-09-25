@@ -47,3 +47,15 @@ void BrowserScreen_segGo(int start);
 void BrowserScreen_segDump();
 int  BrowserScreen_segStart();
 int  BrowserScreen_segSize();
+
+/* ── 缩略图（串口 `img on|off` / `imgtest <url>`）── */
+void BrowserScreen_setImages(bool on);
+bool BrowserScreen_imagesEnabled();
+void BrowserScreen_imgTest(const char* url);
+/* 缩略图长边上限（像素），串口 `thumb <px>`；重新加载页面后生效 */
+void BrowserScreen_setThumbPx(int px);
+/* 把本页第 idx 张图（1 起）开成全屏 / 另存 —— 不点屏也能验。串口 imgview / imgdl */
+void BrowserScreen_imgView(int idx);
+void BrowserScreen_imgDownload(int idx);
+/* 把本页布局树里的图片节点抖到串口（串口 imgscan） */
+void BrowserScreen_imgScan();

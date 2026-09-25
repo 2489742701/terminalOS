@@ -13,6 +13,7 @@
 #include "lvgl_renderer.h"
 #include "tactilebrowser_core.h"
 #include "layout_engine.h"
+#include "url_utils.h"   /* tactilebrowser_resolve_url：扫 HTML 时要把图片地址绝对化 */
 #include <FS.h>
 #include <LittleFS.h>
 #include "../hal/sd_card.h"
@@ -235,7 +236,11 @@ bool g_linkPendingSet = false;
  * 不重新联网、不重新解析（实测几十毫秒）。
  * ⛔ 翻段按钮在 g_content 里 → 绝不能在它自己的 CLICKED 回调里 contentReset()
  *    （会把正在派发事件的对象删掉）。回调只置 g_segPending，由 tick 真正执行。 */
-static const int PAGE_SEG_TILES = 60;   /* 一段铺多少块瓦片 */
+/* 一段铺多少块瓦片。
+   ⚠️ 2026-09-25 从 60 提到 80：163 首页的导航条摊平出 ~58 个胶囊，60 块的前
+   58 块全被吃光，图片节点排在 60 名开外 —— 第 1 段一块缩略图都铺不出来，
+   现象就是"页面上根本找不到图"。80 之后图片能被包进第 1 段。 */
+static const int PAGE_SEG_TILES = 80;
 static int g_segStart = 0;              /* 当前段的起始瓦片下标 */
 static int g_segTotal = 0;              /* 本页瓦片总数（引擎干跑得出，0=未知） */
 static int g_segPending = -1;           /* >=0 = 待执行的翻段目标 */
@@ -518,6 +523,179 @@ static void toastHide() {
   if (g_toast && lv_obj_is_valid(g_toast)) lv_obj_add_flag(g_toast, LV_OBJ_FLAG_HIDDEN);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 缩略图 / 全屏看图 / 另存（2026-09-25）
+ *
+ * 链路：<img> → 后台任务下载**原始字节**（img_dsc）→ 渲染前在 UI 线程重采样成
+ *       小图（img_thumb，默认最长边 96）→ 页面上一块小图 → 点开全屏大图 → 另存。
+ *
+ * 为什么不一上来就按屏幕大小解码：网页图片动辄 1000+ 像素宽，整屏铺一张、
+ * 版面全乱；而且 tjpgd 解一张 1920x1080 要 6MB 中间缓冲。
+ * 小图 + 点开大图才是 480x480 上唯一说得通的形态。
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+static void downloadImage(LayoutNode* node);   /* 前向：另存按钮要用 */
+
+/* 全屏看图挂在 lv_layer_top() 上（整个屏之上），所以不受 g_content 的
+   滚动/裁剪影响。生命周期严格跟着 g_viewNode 走 —— 退出浏览器、换页都必须拆。 */
+static lv_obj_t* g_viewRoot = nullptr;
+static void* g_viewDsc = nullptr;
+static LayoutNode* g_viewNode = nullptr;
+static LayoutNode* g_viewPending = nullptr;    /* 点击只记指针，tick 里再开 */
+static bool g_viewClosePending = false;
+
+static void closeImageViewer() {
+  if (g_viewRoot && lv_obj_is_valid(g_viewRoot)) lv_obj_del(g_viewRoot);
+  g_viewRoot = nullptr;
+  if (g_viewDsc) {
+    tb_image_dsc_free(g_viewDsc);
+    g_viewDsc = nullptr;
+  }
+  g_viewNode = nullptr;
+}
+
+/* ⚠️ 三个回调都**不直接动手**：关覆盖层 = 删掉正在派发事件的树，
+   开覆盖层 = 在自己的事件回调里往树上加节点。一律置标志，tick 里做。 */
+static void viewCloseCb(lv_event_t* e) { (void)e; g_viewClosePending = true; }
+static void viewSaveCb(lv_event_t* e) {
+  (void)e;
+  if (g_viewNode) downloadImage(g_viewNode);
+}
+
+static void openImageViewer(LayoutNode* node) {
+  if (!node || !node->img_dsc) return;
+  closeImageViewer();
+
+  /* 大图按屏幕再重采样一次：这时候才值得解到 448px，缩略图那点分辨率放大
+     只会更糊。box 留出上下按钮的位置。 */
+  int w = 0, h = 0;
+  void* dsc = tb_image_resample(node->img_dsc, 448, 384, &w, &h);
+  if (!dsc) {
+    toast("这张图解不出来");
+    return;
+  }
+  g_viewDsc = dsc;
+  g_viewNode = node;
+
+  lv_obj_t* root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(root);
+  lv_obj_set_size(root, 480, 480);
+  lv_obj_set_pos(root, 0, 0);
+  lv_obj_set_style_bg_color(root, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(root, LV_OBJ_FLAG_CLICKABLE);
+  /* 点空白处关闭（图片本身不可点，所以点图不会误关） */
+  lv_obj_add_event_cb(root, viewCloseCb, LV_EVENT_CLICKED, nullptr);
+  g_viewRoot = root;
+
+  lv_obj_t* img = lv_img_create(root);
+  lv_img_set_src(img, (const lv_img_dsc_t*)dsc);
+  lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+
+  /* 小图放大展示：480 屏上 300px 的图原样摆着还是小。上限 2 倍 ——
+     再往上就是最近邻糊成块，反而看不清。
+     大图不动：它已经是"能解到的最高分辨率"，再放只会更糊。 */
+  int zw = w, zh = h;
+  if (w < 420 && h < 340 && w > 0 && h > 0) {
+    int z = 448 * 256 / w;
+    int z2 = 384 * 256 / h;
+    if (z2 < z) z = z2;
+    if (z > 512) z = 512;
+    if (z > 256) {
+      /* pivot 必须挪到左上角：默认是中心，缩放会从中间往外撑，位置全歪 */
+      lv_img_set_pivot(img, 0, 0);
+      lv_img_set_zoom(img, (uint16_t)z);
+      zw = w * z / 256;
+      zh = h * z / 256;
+      lv_obj_set_size(img, zw, zh);
+    }
+  }
+  lv_obj_align(img, LV_ALIGN_CENTER, 0, -16);
+
+  lv_obj_t* close = lv_btn_create(root);
+  lv_obj_remove_style_all(close);
+  lv_obj_set_size(close, 52, 52);
+  lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -4, 4);
+  lv_obj_set_style_radius(close, 26, 0);
+  lv_obj_set_style_bg_color(close, lv_color_hex(0x222222), 0);
+  lv_obj_set_style_bg_opa(close, LV_OPA_80, 0);
+  lv_obj_add_event_cb(close, viewCloseCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* cl = lv_label_create(close);
+  lv_label_set_text(cl, LV_SYMBOL_CLOSE);
+  lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+  lv_obj_center(cl);
+
+  lv_obj_t* sv = lv_btn_create(root);
+  lv_obj_set_size(sv, 156, 44);
+  lv_obj_align(sv, LV_ALIGN_BOTTOM_MID, 0, -12);
+  lv_obj_set_style_bg_color(sv, lv_color_hex(0x1F6FEB), 0);
+  lv_obj_add_event_cb(sv, viewSaveCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_t* sl = lv_label_create(sv);
+  lv_label_set_text(sl, "保存图片");
+  lv_obj_set_style_text_font(sl, &font_zh_16, 0);
+  lv_obj_center(sl);
+
+  /* 左上角报尺寸：一眼看出"这张图小，放大也就这样" */
+  lv_obj_t* info = lv_label_create(root);
+  char buf[40];
+  snprintf(buf, sizeof(buf), "%dx%d", w, h);
+  lv_label_set_text(info, buf);
+  lv_obj_set_style_text_color(info, lv_color_hex(0x999999), 0);
+  lv_obj_align(info, LV_ALIGN_TOP_LEFT, 12, 16);
+
+  Serial.printf("[Img] viewer %dx%d -> %dx%d from %.56s\n", w, h, zw, zh,
+                node->img_src ? node->img_src : "?");
+}
+
+/* 缩略图点击 → 只记指针。在事件回调里直接开覆盖层 = 在自己的事件处理过程中
+   往对象树上加节点，跟链接点击踩的是同一个坑。 */
+static void image_click_cb(void* node) {
+  if (node) g_viewPending = (LayoutNode*)node;
+}
+
+/* 另存：SD 卡优先（容量大），没挂卡退回片内 LittleFS。
+   ⚠️ 写的是**原始字节**，不是重采样后的小图 —— 存下来要能拿去别处看。 */
+static void downloadImage(LayoutNode* node) {
+  if (!node || !node->img_dsc) { toast("没有图片数据"); return; }
+  lv_img_dsc_t* d = (lv_img_dsc_t*)node->img_dsc;
+  const uint8_t* data = (const uint8_t*)d->data;
+  size_t len = (size_t)d->data_size;
+  if (!data || len == 0) { toast("没有图片数据"); return; }
+
+  const char* ext =
+      (len > 8 && data[0] == 0x89 && data[1] == 'P') ? "png" : "jpg";
+  uint32_t hh = url_hash(String(node->img_src ? node->img_src : ""));
+  char name[64];
+  int written = 0;
+
+  if (SDCard::mounted()) {
+    snprintf(name, sizeof(name), "/gt/i%08lx.%s", (unsigned long)hh, ext);
+    if (SDCard::writeFileBin(name, data, len)) written = 1;
+  } else if (LittleFS.begin(false)) {
+    snprintf(name, sizeof(name), "/i%08lx.%s", (unsigned long)hh, ext);
+    File f = LittleFS.open(name, FILE_WRITE);
+    if (f) {
+      if (f.write(data, len) == len) written = 1;
+      f.close();
+    }
+  } else {
+    toast("存储不可用（插张卡吧）");
+    return;
+  }
+
+  char msg[96];
+  if (written)
+    snprintf(msg, sizeof(msg), "已存 %s (%uKB)", name, (unsigned)(len / 1024));
+  else
+    snprintf(msg, sizeof(msg), "保存失败：%s", name);
+  toast(msg);
+  Serial.printf("[Img] save %s -> %s (%u B)\n", written ? "OK" : "FAIL", name,
+                (unsigned)len);
+}
+
+
+
 static void downloadCurrentPage() {
   if (!g_currentUrl.length()) { toast("还没有页面"); return; }
   int ci = pageCacheFind(g_currentUrl);
@@ -694,6 +872,8 @@ void ensureEngineInit() {
   arduino_set_progress_callback(progressCb);
   /* 网页里链接/胶囊被点击 → link_click_cb（只存 URL，tick 里再真正导航） */
   lvgl_renderer_set_link_callback(link_click_cb);
+  /* 缩略图被点 → image_click_cb（只存节点指针，tick 里再开全屏） */
+  lvgl_renderer_set_image_callback(image_click_cb);
   /* 告诉引擎屏幕内容区有多宽：<meta viewport width=device-width> 要用它排版 */
   layout_set_screen_width(CONTENT_W);
   g_engineInited = true;
@@ -724,6 +904,241 @@ void ensureFetchTask() {
                   (unsigned)FETCH_STACK_BYTES,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
   }
+}
+
+/* ═══ 缩略图（2026-09-25）══════════════════════════════════════════════════
+ * <img> 以前只被映射成 ELEMENT_IMAGE，之后渲染阶段谁都不认识 ——
+ * 页面上一张图都看不见（这是待办清单里第 ④ 项一直没动的原因）。
+ *
+ * 现在的链路（⚠️ 顺序是踩出来的，别调）：
+ *   1) 后台任务下完 HTML、**还没解析**时，先在原始 HTML 里扫出 <img> 地址；
+ *   2) **趁 DRAM 还富余**把图抓下来（最多 IMG_MAX 张，单张有字节上限）；
+ *      —— 解析 + 建布局树会把内部 DRAM 吃到只剩几百字节，那时候 DNS 直接
+ *         失败（`hostByName(): DNS Failed`），图片一张都下不来；
+ *   3) 解析 + 建布局树（dom_renderer 只记 img_src，DOM 阶段绝不联网）；
+ *   4) 树建好后按 URL 把提前抓好的图认领回节点；
+ *   5) 渲染前在 UI 线程把原图重采样成小缩略图（img_thumb），点开再看大图。
+ *
+ * 门槛集中在下面几个宏。没有 img_thumb 的图片节点**一块瓦片都不占**，
+ * 所以"图下不下来"不会撑变形，也不会吃掉 MAX_WIDGETS 的配额。 */
+#define IMG_MAX         6         /* 一页最多几张图 */
+#define IMG_MAX_BYTES   65536     /* 单张下载字节上限 */
+/* 整个图片阶段的时间预算。几张图把页面加载拖成分钟级是不可接受的 ——
+   预算用完就放弃剩下的，页面该渲染渲染（顶多少几张缩略图）。 */
+#define IMG_TOTAL_MS    20000
+#define IMG_MAX_W       464       /* 解码后宽度上限（= 内容区宽，超了戳出右边） */
+#define IMG_MAX_PIXELS  110000    /* 解码后像素上限：w*h*3 ≈ 330KB 中间缓冲 */
+
+static bool g_imgEnabled = true;  /* 串口 `img on|off`；慢页面可以临时关掉 */
+static int  g_imgThumbPx = 96;    /* 缩略图长边上限（串口 `thumb <px>`） */
+
+/* ── 提前抓下来的图：URL → dsc。解析完后按 URL 认领回节点 ── */
+static String g_preUrl[IMG_MAX];
+static void* g_preDsc[IMG_MAX];
+static bool g_preUsed[IMG_MAX];
+static int g_preN = 0;
+
+static void clearPreload() {
+  for (int i = 0; i < IMG_MAX; i++) {
+    g_preUrl[i] = "";
+    g_preDsc[i] = nullptr;
+    g_preUsed[i] = false;
+  }
+  g_preN = 0;
+}
+
+/* 没人认领的图收尸（扫到的 URL 在布局树里可能压根没有对应节点）。 */
+static void freeUnusedPreload() {
+  int freed = 0;
+  for (int i = 0; i < IMG_MAX; i++) {
+    if (g_preDsc[i] && !g_preUsed[i]) {
+      tb_image_dsc_discard(g_preDsc[i]);
+      g_preDsc[i] = nullptr;
+      freed++;
+    }
+  }
+  if (freed) Serial.printf("[Img] discarded %d unmatched\n", freed);
+}
+
+static bool attrDelim(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '/' ||
+         c == '"' || c == '\'';
+}
+
+/* 读 p 处形如 attr = "值" 的值，写进 out/outLen。
+   ⚠️ 调用方必须保证 p 前面是分隔符，否则 `data-src` 里的 `src` 也会被当成 src。 */
+static bool attrValueAt(const char* p, size_t remain, const char* attr,
+                        const char** out, size_t* outLen) {
+  size_t alen = strlen(attr);
+  if (remain < alen + 3) return false;
+  if (memcmp(p, attr, alen) != 0) return false;
+  size_t i = alen;
+  while (i < remain && (p[i] == ' ' || p[i] == '\t')) i++;
+  if (i >= remain || p[i] != '=') return false;
+  i++;
+  while (i < remain && (p[i] == ' ' || p[i] == '\t')) i++;
+  if (i >= remain) return false;
+  char q = p[i];
+  if (q != '"' && q != '\'') return false;
+  i++;
+  size_t s = i;
+  while (i < remain && p[i] != q && (i - s) < 400) i++;
+  if (i >= remain || p[i] != q) return false;
+  *out = p + s;
+  *outLen = i - s;
+  return true;
+}
+
+/* 在原始 HTML 里扫 <img> 的地址（绝对化后存进 g_preUrl），返回个数。
+   属性优先级跟 dom_renderer 保持一致：src > data-src > data-original，
+   否则同一张图两边取到不同 URL，认领时对不上。 */
+static int scanImageUrls(const char* html, size_t len, const String& base) {
+  static const char* KEYS[3] = {"src", "data-src", "data-original"};
+  int n = 0;
+  for (size_t i = 0; i + 6 < len && n < IMG_MAX; i++) {
+    if (html[i] != '<') continue;
+    if (!(html[i + 1] == 'i' && html[i + 2] == 'm' && html[i + 3] == 'g'))
+      continue;
+    char c4 = html[i + 4];
+    if (!(c4 == ' ' || c4 == '\t' || c4 == '\n' || c4 == '\r' || c4 == '/' ||
+          c4 == '>'))
+      continue;
+
+    size_t j = i + 4;
+    size_t end = j;
+    while (end < len && html[end] != '>') end++;
+    if (end - j > 3000) {          /* 不像正常标签（半个 script 之类），跳过 */
+      i = end;
+      continue;
+    }
+
+    const char* v = nullptr;
+    size_t vlen = 0;
+    bool got = false;
+    for (int t = 0; t < 3 && !got; t++) {
+      for (size_t k = j; k < end && !got; k++) {
+        if (k > j && !attrDelim(html[k - 1])) continue;
+        got = attrValueAt(html + k, end - k, KEYS[t], &v, &vlen);
+      }
+    }
+    i = end;
+    if (!got || vlen < 12) continue;
+    if (vlen >= 5 && memcmp(v, "data:", 5) == 0) continue;
+
+    char* raw = (char*)malloc(vlen + 1);
+    if (!raw) continue;
+    memcpy(raw, v, vlen);
+    raw[vlen] = '\0';
+    char* abs = tactilebrowser_resolve_url(base.c_str(), raw);
+    free(raw);
+    if (!abs) continue;
+    bool dup = false;
+    for (int d = 0; d < n; d++) {
+      if (g_preUrl[d] == abs) { dup = true; break; }
+    }
+    if (!dup) {
+      g_preUrl[n] = abs;
+      n++;
+    }
+    free(abs);
+  }
+  return n;
+}
+
+/* 跑在后台 fetch 任务里（Core 0）：只下载、只填 g_pre*，**不碰 LVGL**。
+   ⚠️⚠️ 必须在解析之前调（见文件头注释）。 */
+static void fetchPageImages(const char* html, size_t htmlLen, const String& base) {
+  clearPreload();
+  if (!html || htmlLen < 64) return;
+
+  int n = scanImageUrls(html, htmlLen, base);
+  if (n <= 0) {
+    Serial.println("[Img] no <img> found in raw HTML");
+    return;
+  }
+  g_preN = n;
+  Serial.printf("[Img] %d candidate(s) from raw HTML, DRAM free=%u\n", n,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+  uint32_t tAll = millis();
+  int ok = 0;
+  for (int i = 0; i < n; i++) {
+    if (g_stopRequested) break;      /* 用户点了停止 → 立刻收手 */
+    uint32_t spent = millis() - tAll;
+    if (spent > IMG_TOTAL_MS) {
+      Serial.printf("[Img] budget out (%ums), %d left\n", (unsigned)spent,
+                    n - i);
+      break;
+    }
+    uint8_t* data = nullptr;
+    size_t len = 0;
+    uint32_t t0 = millis();
+    Serial.printf("[Img] get %d/%d %.72s\n", i + 1, n, g_preUrl[i].c_str());
+    int rc = arduino_download_binary(g_preUrl[i].c_str(), &data, &len,
+                                     IMG_MAX_BYTES, base.c_str());
+    Serial.printf("[Img] got rc=%d %u B %ums\n", rc, (unsigned)len,
+                  (unsigned)(millis() - t0));
+    if (rc != 0 || !data || len == 0) continue;
+
+    int w = 0, h = 0;
+    if (!tb_image_peek_size(data, len, &w, &h) || w < 16 || h < 16) {
+      Serial.printf("[Img] drop fmt/size %dx%d\n", w, h);
+      heap_caps_free(data);
+      continue;
+    }
+    int scale = 0;
+    void* dsc = tb_image_dsc_create(data, len, w, h, IMG_MAX_W,
+                                    IMG_MAX_PIXELS, &scale);
+    if (!dsc) {
+      Serial.printf("[Img] drop too big %dx%d (%u B)\n", w, h, (unsigned)len);
+      heap_caps_free(data);
+      continue;
+    }
+    g_preDsc[i] = dsc;
+    ok++;
+    Serial.printf("[Img] ok %dx%d -> %dx%d (1/%d) %u B\n", w, h, w >> scale,
+                  h >> scale, 1 << scale, (unsigned)len);
+  }
+  Serial.printf("[Img] preloaded %d/%d in %ums, DRAM free=%u\n", ok, n,
+                (unsigned)(millis() - tAll),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+/* 解析完之后，把提前抓好的图按 URL 认领回布局节点。 */
+static void* matchPreloaded(const char* src, void* ctx) {
+  (void)ctx;
+  if (!src) return nullptr;
+  for (int i = 0; i < g_preN; i++) {
+    if (!g_preDsc[i] || g_preUsed[i]) continue;
+    if (g_preUrl[i] == src) {
+      g_preUsed[i] = true;
+      return g_preDsc[i];
+    }
+  }
+  return nullptr;
+}
+
+/* 把已拿到字节的图**重采样成小缩略图**。
+   ⚠️ 必须在 UI 线程、且必须在 layout_render_tree 之前调完：
+   干跑数瓦片时看的就是 img_thumb，晚一步这批图就一条瓦片都不占。 */
+static int buildThumbnails() {
+  if (!g_layoutRoot) return 0;
+  LayoutNode* imgs[IMG_MAX];
+  int n = layout_collect_ready_images(g_layoutRoot, imgs, IMG_MAX);
+  if (n <= 0) return 0;
+  uint32_t t0 = millis();
+  int made = 0;
+  for (int i = 0; i < n; i++) {
+    int w = 0, h = 0;
+    void* th = tb_image_resample(imgs[i]->img_dsc, g_imgThumbPx, g_imgThumbPx,
+                                 &w, &h);
+    if (!th) continue;
+    imgs[i]->img_thumb = th;
+    made++;
+  }
+  Serial.printf("[Img] thumbs %d/%d in %u ms (box=%d)\n", made, n,
+                (unsigned)(millis() - t0), g_imgThumbPx);
+  return made;
 }
 
 /* ── 后台下载解析任务（Phase 1，不触碰 LVGL）──
@@ -757,6 +1172,12 @@ void fetch_task(void *param) {
     Serial.printf("[Browser] fetch_task start: %s\n", url.c_str());
 
     /* 用宽视口排版（max_height 在布局阶段未使用，传 0 即可） */
+    const char* htmlData = nullptr;
+    size_t htmlLen = 0;
+    MemoryBuffer fresh;
+    fresh.data = nullptr;
+    fresh.size = 0;
+
     int ci = pageCacheFind(url);
     if (ci < 0) {
       /* PSRAM 里没有 → 退到 SD 卡那份（跨会话/重启仍然有效）。
@@ -774,13 +1195,43 @@ void fetch_task(void *param) {
       Serial.printf("[Browser] cache hit: %s (%u B, age %us)\n",
                     url.c_str(), (unsigned)g_pageCache[ci].len,
                     (unsigned)((millis() - g_pageCache[ci].ts) / 1000));
-      g_taskResult = tactilebrowser_parse_html_buffer(
-          url.c_str(), (const char*)g_pageCache[ci].data, g_pageCache[ci].len,
-          g_browserViewportW, 0, &g_stopRequested, &g_layoutRoot);
+      htmlData = (const char*)g_pageCache[ci].data;
+      htmlLen = g_pageCache[ci].len;
     } else {
-      g_taskResult = tactilebrowser_download_and_parse(
-          url.c_str(), g_browserViewportW, 0, &g_stopRequested, &g_layoutRoot);
+      /* 自己下、自己解析（不再走 tactilebrowser_download_and_parse）——
+         为的就是拿到**原始 HTML**，好在解析之前先把图抓下来。 */
+      g_taskResult = cache_download_html(url.c_str(), &fresh);
+      Serial.printf("[Browser] download rc=%d size=%u DRAM free=%u\n",
+                    (int)g_taskResult, (unsigned)fresh.size,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+      if (g_taskResult == RENDER_SUCCESS && fresh.data) {
+        htmlData = fresh.data;
+        htmlLen = fresh.size;
+      }
     }
+
+    /* ⚠️⚠️ 顺序不能换：图片必须在**解析之前**抓完。
+       解析 + 建布局树会把内部 DRAM 吃到只剩几百字节，之后 DNS 一律失败
+       （实测 `hostByName(): DNS Failed`），每张图白等 7 秒、rc=-1。 */
+    if (htmlData && g_imgEnabled && !g_stopRequested) {
+      fetchPageImages(htmlData, htmlLen, url);
+    }
+
+    if (htmlData) {
+      g_taskResult = tactilebrowser_parse_html_buffer(
+          url.c_str(), htmlData, htmlLen, g_browserViewportW, 0,
+          &g_stopRequested, &g_layoutRoot);
+    }
+    if (fresh.data) {
+      free(fresh.data);
+      fresh.data = nullptr;
+    }
+
+    if (g_taskResult == RENDER_SUCCESS && g_layoutRoot) {
+      int got = layout_assign_images(g_layoutRoot, matchPreloaded, nullptr);
+      Serial.printf("[Img] attached %d/%d to layout\n", got, g_preN);
+    }
+    freeUnusedPreload();
 
     Serial.printf("[Browser] fetch_task done: result=%d layout=%p DRAM free=%u\n",
       (int)g_taskResult, g_layoutRoot,
@@ -850,6 +1301,8 @@ void startFetch(const String& url) {
   g_fetchUrl = url;
   g_stopRequested = false;
   g_taskDone = false;
+  /* 覆盖层里握着旧树的节点指针，必须**先**拆覆盖层再释放布局树 */
+  closeImageViewer();
   freeLayoutTree();          /* 上一次的布局树（分段缓存）到此为止 */
   g_state = BROWSER_LOADING;
 
@@ -2202,6 +2655,17 @@ void BrowserScreen_tick() {
   pageServerTick();   /* 存下来的页面要能被电脑访问 */
   /* 网页里的链接点击（上一 tick 记下的）—— 在这里才真正导航，
      避开"在自己的事件回调里删自己"的 LVGL 崩溃。 */
+  /* 看图覆盖层：开关都推迟到这里做，别在事件回调里动树 */
+  if (g_viewClosePending) {
+    g_viewClosePending = false;
+    closeImageViewer();
+  }
+  if (g_viewPending) {
+    LayoutNode* nd = g_viewPending;
+    g_viewPending = nullptr;
+    openImageViewer(nd);
+  }
+
   if (g_linkPendingSet) {
     String target = g_linkPending;
     g_linkPendingSet = false;
@@ -2299,6 +2763,8 @@ void BrowserScreen_tick() {
         /* 渲染时把整棵树从视口宽压缩到内容区宽 */
         uint32_t tRender = millis();
         g_segStart = 0;
+        /* 缩略图必须在渲染之前做完：干跑数瓦片时要看 img_thumb。 */
+        buildThumbnails();
         /* 只铺第一段：长页面不再因为撞到 widget 上限而被砍掉后半截。 */
         layout_set_segment(0, PAGE_SEG_TILES);
         RenderResult r = tactilebrowser_render_layout(g_layoutRoot, g_content, CONTENT_W, CONTENT_H);
@@ -2405,6 +2871,9 @@ void BrowserScreen_navigate(const char* url) {
  * 屏壳（顶栏/底栏等少量控件）保留，避免下次进入重建 + 悬空指针风险；
  * 大头是 lv_obj_clean 掉的数十个内容 widget 和 free 掉的布局树。 */
 void BrowserScreen_close() {
+  /* 看图覆盖层挂在 lv_layer_top() 上（不属于任何屏），退出时必须自己拆，
+     否则它会一直盖在桌面上，而且手里握着即将失效的节点指针。 */
+  closeImageViewer();
   /* toast 的消失定时器持有 g_toast 指针，屏要拆了必须先注销，
      否则 1.8s 后回调里 lv_obj_is_valid(悬空指针) —— 这类定时器泄漏在本项目
      已经崩过好几次（clock 屏那只 lv_timer）。 */
@@ -2507,6 +2976,108 @@ void BrowserScreen_ime(const char* py) {
 /* ── 分段渲染：串口诊断入口 ──
    翻段只能在 tick 里真正执行（清内容区会删掉正在派发事件的对象），
    这里只是记下目标。 */
+/* 串口 `imgtest <url>`：只下这一张，走完整的 下载 → 看头 → 交 LVGL 解码器认一遍
+   （不建任何控件），专门用来回答"这张图到底能不能解"。
+   ⚠️ 必须在 UI 线程调（里面碰 LVGL），串口控制台就是在 loopTask 里跑的。 */
+void BrowserScreen_imgTest(const char* url) {
+  if (!url || !*url) { Serial.println("[Img] usage: imgtest <url>"); return; }
+  uint8_t* data = nullptr;
+  size_t len = 0;
+  uint32_t t0 = millis();
+  int rc = arduino_download_binary(url, &data, &len, IMG_MAX_BYTES, nullptr);
+  Serial.printf("[Img] test rc=%d len=%u (%ums)\n", rc, (unsigned)len,
+                (unsigned)(millis() - t0));
+  if (rc != 0 || !data) { Serial.println("[Img] test: download failed"); return; }
+
+  int w = 0, h = 0;
+  bool known = tb_image_peek_size(data, len, &w, &h);
+  Serial.printf("[Img] test peek=%d %dx%d\n", (int)known, w, h);
+  if (known && (w > IMG_MAX_W || (long)w * (long)h > IMG_MAX_PIXELS)) {
+    Serial.printf("[Img] test: over budget (%dx%d vs %dx%ld)\n", w, h,
+                  IMG_MAX_W, (long)IMG_MAX_PIXELS);
+  }
+
+  int scale = 0;
+  void* dsc = tb_image_dsc_create(data, len, w, h, IMG_MAX_W, IMG_MAX_PIXELS,
+                                  &scale);
+  if (!dsc) {
+    heap_caps_free(data);
+    Serial.println("[Img] test: rejected (unknown fmt or over budget)");
+    return;
+  }
+  Serial.printf("[Img] test scale=1/%d -> %dx%d\n", 1 << scale, w >> scale,
+                h >> scale);
+  lv_img_header_t hdr;
+  memset(&hdr, 0, sizeof(hdr));
+  lv_res_t r = lv_img_decoder_get_info((const lv_img_dsc_t*)dsc, &hdr);
+  Serial.printf("[Img] test decoder: res=%d cf=%u %ux%u\n", (int)r,
+                (unsigned)hdr.cf, (unsigned)hdr.w, (unsigned)hdr.h);
+
+  /* 真正要用的是这一条：重采样成缩略图（再解到大图）。
+     串口看到 [Img] resample ... 才算这张图"能显示"。 */
+  int tw = 0, th2 = 0;
+  void* thumb = tb_image_resample(dsc, g_imgThumbPx, g_imgThumbPx, &tw, &th2);
+  Serial.printf("[Img] test thumb=%s %dx%d (box=%d)\n", thumb ? "OK" : "FAIL",
+                tw, th2, g_imgThumbPx);
+  if (thumb) tb_image_dsc_free(thumb);
+  int vw = 0, vh = 0;
+  void* big = tb_image_resample(dsc, 448, 384, &vw, &vh);
+  Serial.printf("[Img] test view=%s %dx%d\n", big ? "OK" : "FAIL", vw, vh);
+  if (big) tb_image_dsc_free(big);
+
+  Serial.printf("[Img] test PSRAM free=%u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  tb_image_dsc_free(dsc);
+}
+
+/* 串口：把本页第 idx 张（1 起）图开成全屏，不点屏也能验。
+   顺带把"这一页到底有几张图"报出来。 */
+static int pageImageList(LayoutNode** out, int max) {
+  if (!g_layoutRoot) return 0;
+  return layout_collect_ready_images(g_layoutRoot, out, max);
+}
+
+/* 串口 imgscan：本页布局树里有几个 ELEMENT_IMAGE、几个拿到了绝对地址。
+   图片不显示时先跑它 —— 分清是"DOM 阶段就没收进来"还是"下载/解码失败"。 */
+void BrowserScreen_imgScan() {
+  if (!g_layoutRoot) { Serial.println("[Imgs] 还没有页面"); return; }
+  layout_dump_images(g_layoutRoot);
+}
+
+void BrowserScreen_imgView(int idx) {
+  LayoutNode* imgs[IMG_MAX];
+  int n = pageImageList(imgs, IMG_MAX);
+  Serial.printf("[Img] page has %d image(s)\n", n);
+  if (idx < 1 || idx > n) {
+    Serial.printf("[Img] usage: imgview 1..%d\n", n);
+    return;
+  }
+  openImageViewer(imgs[idx - 1]);
+}
+
+void BrowserScreen_imgDownload(int idx) {
+  LayoutNode* imgs[IMG_MAX];
+  int n = pageImageList(imgs, IMG_MAX);
+  if (idx < 1 || idx > n) {
+    Serial.printf("[Img] usage: imgdl 1..%d (page has %d)\n", n, n);
+    return;
+  }
+  downloadImage(imgs[idx - 1]);
+}
+
+void BrowserScreen_setThumbPx(int px) {
+  if (px < 32) px = 32;
+  if (px > 240) px = 240;
+  g_imgThumbPx = px;
+  Serial.printf("[Img] thumb box = %d px（重新加载后生效）\n", g_imgThumbPx);
+}
+
+void BrowserScreen_setImages(bool on) {
+  g_imgEnabled = on;
+  Serial.printf("[Img] images %s (下次加载生效)\n", on ? "ON" : "OFF");
+}
+bool BrowserScreen_imagesEnabled() { return g_imgEnabled; }
+
 void BrowserScreen_segGo(int start) {
   if (start < 0) start = 0;
   if (g_segTotal > 0 && start >= g_segTotal)
