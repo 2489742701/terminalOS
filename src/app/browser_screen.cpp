@@ -562,14 +562,92 @@ static void viewSaveCb(lv_event_t* e) {
   if (g_viewNode) downloadImage(g_viewNode);
 }
 
+/* 对象存储（定义在下面的"本地对象存储"段）：这几个在 loadFullImage /
+   downloadImage 里就要用，而它们的位置比定义处靠前 —— 先声明一下。 */
+/* 图片门槛（原本在"缩略图"那一节，因为 openImageViewer 更早要用，提到这里）：
+     IMG_MAX         一页最多几张图
+     IMG_MAX_BYTES   单张下载字节上限
+     IMG_TOTAL_MS    整个图片阶段的时间预算：几张图把页面加载拖成分钟级不可接受，
+                     预算用完就放弃剩下的，页面该渲染渲染（顶多少几张缩略图）
+     IMG_MAX_W       解码后宽度上限（= 内容区宽，超了戳出右边）
+     IMG_MAX_PIXELS  解码后像素上限：w*h*3 ≈ 330KB 中间缓冲 */
+#define IMG_MAX         6
+#define IMG_MAX_BYTES   65536
+#define IMG_TOTAL_MS    20000
+#define IMG_MAX_W       464
+#define IMG_MAX_PIXELS  110000
+
+#define BLOB_HDR 12
+static uint8_t* blobPack(const char* magic, int w, int h,
+                         const uint8_t* payload, size_t len, size_t* outLen);
+static bool blobUnpack(const uint8_t* b, size_t n, const char* magic,
+                       int* w, int* h, const uint8_t** payload, size_t* plen);
+static bool storeSave(const char* name, const uint8_t* data, size_t len);
+static bool storeLoad(const char* name, uint8_t** out, size_t* outLen);
+static void imgBlobName(char* out, size_t cap, const char* url, bool thumb);
+
+/* 按需加载原图：优先从本地读，盘上没有才联网。
+   返回的是"拿原图字节包好的 dsc"，用完调用方必须 tb_image_dsc_free。
+   ⚠️ 内存里平时**没有**原图（见 buildThumbnails）—— 这就是"点开才加载"。 */
+static void* loadFullImage(LayoutNode* node) {
+  if (!node || !node->img_src) return nullptr;
+  char nm[32];
+  imgBlobName(nm, sizeof(nm), node->img_src, false);
+
+  uint8_t* blob = nullptr;
+  size_t blen = 0;
+  const uint8_t* payload = nullptr;
+  size_t len = 0;
+  int w = 0, h = 0;
+  uint8_t* data = nullptr;
+
+  if (storeLoad(nm, &blob, &blen) &&
+      blobUnpack(blob, blen, "GTI1", &w, &h, &payload, &len)) {
+    data = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (data) memcpy(data, payload, len);
+    heap_caps_free(blob);
+    if (data)
+      Serial.printf("[Img] viewer: from disk %s %dx%d\n", nm, w, h);
+  } else {
+    if (blob) heap_caps_free(blob);
+    Serial.printf("[Img] viewer: not cached, refetch %.72s\n", node->img_src);
+    int rc = arduino_download_binary(node->img_src, &data, &len,
+                                     IMG_MAX_BYTES, nullptr);
+    if (rc != 0 || !data || len == 0) {
+      if (data) heap_caps_free(data);
+      return nullptr;
+    }
+    if (!tb_image_peek_size(data, len, &w, &h) || w < 16 || h < 16) {
+      heap_caps_free(data);
+      return nullptr;
+    }
+    size_t bl2 = 0;
+    uint8_t* b2 = blobPack("GTI1", w, h, data, len, &bl2);
+    if (b2) { storeSave(nm, b2, bl2); heap_caps_free(b2); }
+  }
+  if (!data) return nullptr;
+
+  void* d = tb_image_dsc_create(data, len, w, h, IMG_MAX_W, IMG_MAX_PIXELS,
+                                nullptr);
+  if (!d) heap_caps_free(data);
+  return d;
+}
+
 static void openImageViewer(LayoutNode* node) {
-  if (!node || !node->img_dsc) return;
+  if (!node || !node->img_src) return;
   closeImageViewer();
 
+  /* 原图平时不在内存里 —— 点开才从磁盘读回来解码。 */
+  void* full = loadFullImage(node);
+  if (!full) {
+    toast("这张图加载不出来");
+    return;
+  }
   /* 大图按屏幕再重采样一次：这时候才值得解到 448px，缩略图那点分辨率放大
      只会更糊。box 留出上下按钮的位置。 */
   int w = 0, h = 0;
-  void* dsc = tb_image_resample(node->img_dsc, 448, 384, &w, &h);
+  void* dsc = tb_image_resample(full, 448, 384, &w, &h);
+  tb_image_dsc_free(full);   /* 像素已经在 dsc 里，原图字节可以还回去了 */
   if (!dsc) {
     toast("这张图解不出来");
     return;
@@ -657,11 +735,22 @@ static void image_click_cb(void* node) {
 /* 另存：SD 卡优先（容量大），没挂卡退回片内 LittleFS。
    ⚠️ 写的是**原始字节**，不是重采样后的小图 —— 存下来要能拿去别处看。 */
 static void downloadImage(LayoutNode* node) {
-  if (!node || !node->img_dsc) { toast("没有图片数据"); return; }
-  lv_img_dsc_t* d = (lv_img_dsc_t*)node->img_dsc;
-  const uint8_t* data = (const uint8_t*)d->data;
-  size_t len = (size_t)d->data_size;
-  if (!data || len == 0) { toast("没有图片数据"); return; }
+  if (!node || !node->img_src) { toast("没有图片数据"); return; }
+
+  /* 原图已经在本地（抓取时就落盘了）—— 另存只是把它导出成能看的名字。 */
+  char nm[32];
+  imgBlobName(nm, sizeof(nm), node->img_src, false);
+  uint8_t* blob = nullptr;
+  size_t blen = 0;
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  int iw = 0, ih = 0;
+  if (!storeLoad(nm, &blob, &blen) ||
+      !blobUnpack(blob, blen, "GTI1", &iw, &ih, &data, &len)) {
+    if (blob) heap_caps_free(blob);
+    toast("本地没有这张图");
+    return;
+  }
 
   const char* ext =
       (len > 8 && data[0] == 0x89 && data[1] == 'P') ? "png" : "jpg";
@@ -670,19 +759,21 @@ static void downloadImage(LayoutNode* node) {
   int written = 0;
 
   if (SDCard::mounted()) {
-    snprintf(name, sizeof(name), "/gt/i%08lx.%s", (unsigned long)hh, ext);
+    snprintf(name, sizeof(name), "/gt/pic%08lx.%s", (unsigned long)hh, ext);
     if (SDCard::writeFileBin(name, data, len)) written = 1;
   } else if (LittleFS.begin(false)) {
-    snprintf(name, sizeof(name), "/i%08lx.%s", (unsigned long)hh, ext);
+    snprintf(name, sizeof(name), "/pic%08lx.%s", (unsigned long)hh, ext);
     File f = LittleFS.open(name, FILE_WRITE);
     if (f) {
       if (f.write(data, len) == len) written = 1;
       f.close();
     }
   } else {
+    heap_caps_free(blob);
     toast("存储不可用（插张卡吧）");
     return;
   }
+  heap_caps_free(blob);
 
   char msg[96];
   if (written)
@@ -921,16 +1012,117 @@ void ensureFetchTask() {
  *
  * 门槛集中在下面几个宏。没有 img_thumb 的图片节点**一块瓦片都不占**，
  * 所以"图下不下来"不会撑变形，也不会吃掉 MAX_WIDGETS 的配额。 */
-#define IMG_MAX         6         /* 一页最多几张图 */
-#define IMG_MAX_BYTES   65536     /* 单张下载字节上限 */
-/* 整个图片阶段的时间预算。几张图把页面加载拖成分钟级是不可接受的 ——
-   预算用完就放弃剩下的，页面该渲染渲染（顶多少几张缩略图）。 */
-#define IMG_TOTAL_MS    20000
-#define IMG_MAX_W       464       /* 解码后宽度上限（= 内容区宽，超了戳出右边） */
-#define IMG_MAX_PIXELS  110000    /* 解码后像素上限：w*h*3 ≈ 330KB 中间缓冲 */
+/* 上面那几个宏（IMG_MAX / IMG_MAX_BYTES / IMG_TOTAL_MS / IMG_MAX_W /
+   IMG_MAX_PIXELS）已经提到文件前半段去了 —— openImageViewer 要用它们，
+   而它比这一节靠前得多。门槛的取舍说明见下面"缩略图"注释块。 */
 
 static bool g_imgEnabled = true;  /* 串口 `img on|off`；慢页面可以临时关掉 */
 static int  g_imgThumbPx = 96;    /* 缩略图长边上限（串口 `thumb <px>`） */
+
+/* ═══ 本地对象存储（2026-09-25）════════════════════════════════════════════
+ * master 定的方向：**下载到本地为准**，内存只是"正在显示"的工作区。
+ *   · SD 卡优先（容量大）；没插卡退回片内 LittleFS。
+ *   · ⛔ SD 未挂载时绝不能碰 SD 接口 —— 会去动与 LCD 共用的那条 SPI 总线。
+ *
+ * 两种 blob 都带 12 字节头 magic(4) + w(2) + h(2) + len(4) + payload：
+ *   i<hash>.bin  GTI1  原图压缩字节（jpeg/png 原文）
+ *   t<hash>.thm  GTT1  缩略图 RGB565(或 RGB565A) 像素
+ * 带头的意义：回读时不用再 peek 尺寸，也不怕哪天格式判断改了。
+ */
+static uint8_t* blobPack(const char* magic, int w, int h,
+                         const uint8_t* payload, size_t len, size_t* outLen) {
+  if (!payload || len == 0 || !outLen) return nullptr;
+  uint8_t* b = (uint8_t*)heap_caps_malloc(BLOB_HDR + len,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!b) return nullptr;
+  memcpy(b, magic, 4);
+  b[4] = (uint8_t)(w & 0xFF);       b[5] = (uint8_t)((w >> 8) & 0xFF);
+  b[6] = (uint8_t)(h & 0xFF);       b[7] = (uint8_t)((h >> 8) & 0xFF);
+  b[8] = (uint8_t)(len & 0xFF);
+  b[9] = (uint8_t)((len >> 8) & 0xFF);
+  b[10] = (uint8_t)((len >> 16) & 0xFF);
+  b[11] = (uint8_t)((len >> 24) & 0xFF);
+  memcpy(b + BLOB_HDR, payload, len);
+  *outLen = BLOB_HDR + len;
+  return b;
+}
+
+static bool blobUnpack(const uint8_t* b, size_t n, const char* magic,
+                       int* w, int* h, const uint8_t** payload, size_t* plen) {
+  if (!b || n < BLOB_HDR + 1 || memcmp(b, magic, 4) != 0) return false;
+  int iw = b[4] | (b[5] << 8);
+  int ih = b[6] | (b[7] << 8);
+  uint32_t l = (uint32_t)b[8] | ((uint32_t)b[9] << 8) |
+               ((uint32_t)b[10] << 16) | ((uint32_t)b[11] << 24);
+  if (iw <= 0 || ih <= 0 || l == 0 || (size_t)l != n - BLOB_HDR) return false;
+  if (w) *w = iw;
+  if (h) *h = ih;
+  if (payload) *payload = b + BLOB_HDR;
+  if (plen) *plen = (size_t)l;
+  return true;
+}
+
+/* 路径：SD 上统一放 /gt/ 下（SD.mkdir 不递归，只能平铺）。 */
+static void storePath(char* out, size_t cap, const char* name, bool sd) {
+  if (sd) snprintf(out, cap, "/gt/%s", name);
+  else    snprintf(out, cap, "/%s", name);
+}
+
+static bool storeSave(const char* name, const uint8_t* data, size_t len) {
+  if (!name || !data || !len) return false;
+  char p[64];
+  if (SDCard::mounted()) {
+    storePath(p, sizeof(p), name, true);
+    return SDCard::writeFileBin(p, data, len);
+  }
+  if (!LittleFS.begin(false)) return false;
+  /* ⛔ 片内 Flash 只有几百 KB，"每页都落盘"几页就写满 —— 写满不是存不下，
+     是整个分区废掉。留 4KB 余量，不够就不缓存（代价只是多等一次网络）。
+     SD 卡路径不需要这道闸：GB 级容量，塞不满。 */
+  size_t avail = LittleFS.totalBytes() - LittleFS.usedBytes();
+  if (avail < len + 4096) { LittleFS.end(); return false; }
+  storePath(p, sizeof(p), name, false);
+  File f = LittleFS.open(p, FILE_WRITE);
+  if (!f) { LittleFS.end(); return false; }
+  size_t got = f.write(data, len);
+  f.close();
+  LittleFS.end();
+  return got == len;
+}
+
+/* 回读。*out 从 PSRAM 分配，调用方 heap_caps_free。 */
+static bool storeLoad(const char* name, uint8_t** out, size_t* outLen) {
+  if (out) *out = nullptr;
+  if (outLen) *outLen = 0;
+  if (!name || !out || !outLen) return false;
+  char p[64];
+
+  if (SDCard::mounted()) {
+    storePath(p, sizeof(p), name, true);
+    return SDCard::readFileBin(p, out, outLen);
+  }
+  if (!LittleFS.begin(false)) return false;
+  storePath(p, sizeof(p), name, false);
+  File f = LittleFS.open(p, FILE_READ);
+  if (!f) { LittleFS.end(); return false; }
+  size_t n = (size_t)f.size();
+  if (n == 0) { f.close(); LittleFS.end(); return false; }
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) { f.close(); LittleFS.end(); return false; }
+  size_t got = f.read(buf, n);
+  f.close();
+  LittleFS.end();
+  if (got != n) { heap_caps_free(buf); return false; }
+  *out = buf;
+  *outLen = n;
+  return true;
+}
+
+/* 原图 / 缩略图的本地文件名（hash 来自绝对 URL）。 */
+static void imgBlobName(char* out, size_t cap, const char* url, bool thumb) {
+  uint32_t hh = url_hash(String(url ? url : ""));
+  snprintf(out, cap, thumb ? "t%08lx.thm" : "i%08lx.bin", (unsigned long)hh);
+}
 
 /* ── 提前抓下来的图：URL → dsc。解析完后按 URL 认领回节点 ── */
 static String g_preUrl[IMG_MAX];
@@ -1072,20 +1264,47 @@ static void fetchPageImages(const char* html, size_t htmlLen, const String& base
     }
     uint8_t* data = nullptr;
     size_t len = 0;
-    uint32_t t0 = millis();
-    Serial.printf("[Img] get %d/%d %.72s\n", i + 1, n, g_preUrl[i].c_str());
-    int rc = arduino_download_binary(g_preUrl[i].c_str(), &data, &len,
-                                     IMG_MAX_BYTES, base.c_str());
-    Serial.printf("[Img] got rc=%d %u B %ums\n", rc, (unsigned)len,
-                  (unsigned)(millis() - t0));
-    if (rc != 0 || !data || len == 0) continue;
-
     int w = 0, h = 0;
-    if (!tb_image_peek_size(data, len, &w, &h) || w < 16 || h < 16) {
-      Serial.printf("[Img] drop fmt/size %dx%d\n", w, h);
-      heap_caps_free(data);
-      continue;
+    uint32_t t0 = millis();
+    char nm[32];
+    imgBlobName(nm, sizeof(nm), g_preUrl[i].c_str(), false);
+
+    /* ① 本地已有 → 回读，不联网。这是"下载到本地"该有的样子：
+          第二次打开同一页不再产生流量，也不受网络抖动影响。 */
+    uint8_t* cblob = nullptr;
+    size_t cblen = 0;
+    const uint8_t* payload = nullptr;
+    if (storeLoad(nm, &cblob, &cblen) &&
+        blobUnpack(cblob, cblen, "GTI1", &w, &h, &payload, &len)) {
+      data = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!data) { heap_caps_free(cblob); continue; }
+      memcpy(data, payload, len);
+      heap_caps_free(cblob);
+      Serial.printf("[Img] cache hit %s %dx%d %u B\n", nm, w, h, (unsigned)len);
+    } else {
+      if (cblob) heap_caps_free(cblob);
+      Serial.printf("[Img] get %d/%d %.72s\n", i + 1, n, g_preUrl[i].c_str());
+      int rc = arduino_download_binary(g_preUrl[i].c_str(), &data, &len,
+                                       IMG_MAX_BYTES, base.c_str());
+      Serial.printf("[Img] got rc=%d %u B %ums\n", rc, (unsigned)len,
+                    (unsigned)(millis() - t0));
+      if (rc != 0 || !data || len == 0) continue;
+
+      if (!tb_image_peek_size(data, len, &w, &h) || w < 16 || h < 16) {
+        Serial.printf("[Img] drop fmt/size %dx%d\n", w, h);
+        heap_caps_free(data);
+        continue;
+      }
+      /* ② 落盘：原图的家是磁盘，内存那份只是过客（缩略图做好就还回去）。 */
+      size_t blen = 0;
+      uint8_t* blob = blobPack("GTI1", w, h, data, len, &blen);
+      if (blob) {
+        if (storeSave(nm, blob, blen))
+          Serial.printf("[Img] saved %s (%u B)\n", nm, (unsigned)blen);
+        heap_caps_free(blob);
+      }
     }
+
     int scale = 0;
     void* dsc = tb_image_dsc_create(data, len, w, h, IMG_MAX_W,
                                     IMG_MAX_PIXELS, &scale);
@@ -1135,6 +1354,29 @@ static int buildThumbnails() {
     if (!th) continue;
     imgs[i]->img_thumb = th;
     made++;
+
+    /* 缩略图也落盘：将来再打开这一页可以直接读回像素，连解码都省了。 */
+    if (imgs[i]->img_src) {
+      char tnm[32];
+      imgBlobName(tnm, sizeof(tnm), imgs[i]->img_src, true);
+      lv_img_dsc_t* td = (lv_img_dsc_t*)th;
+      size_t blen = 0;
+      uint8_t* blob = blobPack("GTT1", w, h, (const uint8_t*)td->data,
+                               (size_t)td->data_size, &blen);
+      if (blob) {
+        storeSave(tnm, blob, blen);
+        heap_caps_free(blob);
+      }
+    }
+
+    /* ⛔ 原图的"家"是磁盘：缩略图一做好就把 PSRAM 里的原始字节还回去。
+       内存里只剩缩略图（96×96×2 ≈ 18KB），原图一张最多 64KB —— 六张就是
+       384KB，那是过去 DRAM 被吃穿的主要来源。
+       点开大图 / 另存时再从盘里读回来（loadFullImage）。 */
+    if (imgs[i]->img_dsc) {
+      tb_image_dsc_free(imgs[i]->img_dsc);
+      imgs[i]->img_dsc = nullptr;
+    }
   }
   Serial.printf("[Img] thumbs %d/%d in %u ms (box=%d)\n", made, n,
                 (unsigned)(millis() - t0), g_imgThumbPx);
@@ -3034,11 +3276,38 @@ void BrowserScreen_imgTest(const char* url) {
    顺带把"这一页到底有几张图"报出来。 */
 static int pageImageList(LayoutNode** out, int max) {
   if (!g_layoutRoot) return 0;
-  return layout_collect_ready_images(g_layoutRoot, out, max);
+  /* ⚠️ 必须是 shown 不是 ready：原图落盘后 img_dsc 就空了（内存只留缩略图），
+     用 ready 会得到"这一页 0 张图"，imgview / imgdl 全部失效。 */
+  return layout_collect_shown_images(g_layoutRoot, out, max);
 }
 
 /* 串口 imgscan：本页布局树里有几个 ELEMENT_IMAGE、几个拿到了绝对地址。
    图片不显示时先跑它 —— 分清是"DOM 阶段就没收进来"还是"下载/解码失败"。 */
+/* 串口 `dram`：把内存账摊开看。
+   ⚠️ 运行时**不调** heap_caps_get_largest_free_block —— 它要遍历整个堆，
+   实测会和 WiFi 抢时间片触发 wdt。free / minimum_free 已经够定位了。 */
+void BrowserScreen_memInfo() {
+  Serial.printf("[Mem] DRAM  free=%u  min_free=%u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+  Serial.printf("[Mem] PSRAM free=%u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  Serial.printf("[Mem] LVGL pool %u/%u B used=%u%% frag=%u%% peak=%u\n",
+                (unsigned)(m.total_size - m.free_size), (unsigned)m.total_size,
+                (unsigned)m.used_pct, (unsigned)m.frag_pct,
+                (unsigned)m.max_used);
+
+  size_t cacheBytes = 0;
+  for (int i = 0; i < PAGE_CACHE_SLOTS; i++)
+    if (g_pageCache[i].len) cacheBytes += g_pageCache[i].len;
+  Serial.printf("[Mem] layout=%s  pageCache=%u B (2 slots)  sd=%s\n",
+                g_layoutRoot ? "held(in PSRAM)" : "none",
+                (unsigned)cacheBytes, SDCard::mounted() ? "mounted" : "no");
+}
+
 void BrowserScreen_imgScan() {
   if (!g_layoutRoot) { Serial.println("[Imgs] 还没有页面"); return; }
   layout_dump_images(g_layoutRoot);

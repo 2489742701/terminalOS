@@ -243,6 +243,37 @@ bool writeFileBin(const char* path, const uint8_t* data, size_t len) {
   return w == len;
 }
 
+bool readFileBin(const char* path, uint8_t** out, size_t* outLen) {
+  if (out) *out = nullptr;
+  if (outLen) *outLen = 0;
+  if (!g_mounted || !path || !out || !outLen) return false;
+
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  size_t n = (size_t)f.size();
+  if (n == 0) { f.close(); return false; }
+
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) { f.close(); return false; }
+  size_t got = f.read(buf, n);
+  f.close();
+  if (got != n) { heap_caps_free(buf); return false; }
+
+  *out = buf;
+  *outLen = n;
+  return true;
+}
+
+bool statFile(const char* path, size_t* size) {
+  if (!g_mounted || !path) return false;
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  size_t n = (size_t)f.size();
+  f.close();
+  if (size) *size = n;
+  return true;
+}
+
 bool readFile(const char* path, String& out) {
   if (!g_mounted || !path) return false;
   File f = SD.open(path, FILE_READ);

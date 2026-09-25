@@ -59,3 +59,5 @@ void BrowserScreen_imgView(int idx);
 void BrowserScreen_imgDownload(int idx);
 /* 把本页布局树里的图片节点抖到串口（串口 imgscan） */
 void BrowserScreen_imgScan();
+/* 串口 `dram`：DRAM / PSRAM / LVGL 池 / 页面缓存的占用账 */
+void BrowserScreen_memInfo();

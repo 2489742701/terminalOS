@@ -153,6 +153,12 @@ int layout_collect_images(LayoutNode *root, LayoutNode **out, int max);
    渲染前用它批量做缩略图 —— 重采样要碰 LVGL 解码器，只能在 UI 线程做。 */
 int layout_collect_ready_images(LayoutNode *root, LayoutNode **out, int max);
 
+/* 页面上"实际显示得出来"的图片：img_thumb 或 img_dsc 任一非空。
+   ⚠️ 和上面那个不是一回事：collect_ready 只收还拿着原始字节的（做缩略图的输入）。
+   原图落盘后内存那份会被释放（img_dsc = NULL），但缩略图还在 —— 看图 / 另存 /
+   imgscan 要的是这一个。只认 img_dsc 会得出"这一页 0 张图"。 */
+int layout_collect_shown_images(LayoutNode *root, LayoutNode **out, int max);
+
 /* 把树里所有 ELEMENT_IMAGE 节点打到串口（串口 `imgscan`）。诊断用。 */
 void layout_dump_images(LayoutNode *root);
 

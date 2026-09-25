@@ -931,7 +931,10 @@ static void collect_images_rec(LayoutNode *node, LayoutNode **out, int max,
                                int *n, int depth) {
   if (!node || depth > MAX_LAYOUT_DEPTH) return;
   for (LayoutNode *c = node; c && *n < max; c = c->next_sibling) {
-    if (c->type == ELEMENT_IMAGE && c->img_src && !c->img_dsc) {
+    /* ⚠️ img_dsc 为空**不等于**没下载过：原图落盘后内存那份会被释放
+       （见 browser_screen.cpp 的 buildThumbnails），此时 img_thumb 还在。
+       只看 img_dsc 会把这批节点重新判成"待下载"，翻段时又去抓一遍。 */
+    if (c->type == ELEMENT_IMAGE && c->img_src && !c->img_dsc && !c->img_thumb) {
       bool tracking_pixel = (c->img_w > 0 && c->img_w <= 4 &&
                              c->img_h > 0 && c->img_h <= 4);
       if (!tracking_pixel) out[(*n)++] = c;
@@ -966,6 +969,26 @@ int layout_collect_ready_images(LayoutNode *root, LayoutNode **out, int max) {
   return n;
 }
 
+/* 见 layout_engine.h：判定是"缩略图或原始字节任一还在"。
+   兄弟用迭代、父子才递归 —— 铁律照旧。 */
+static void collect_shown_rec(LayoutNode *node, LayoutNode **out, int max,
+                              int *n, int depth) {
+  if (!node || depth > MAX_LAYOUT_DEPTH) return;
+  for (LayoutNode *c = node; c && *n < max; c = c->next_sibling) {
+    if (c->type == ELEMENT_IMAGE && (c->img_thumb || c->img_dsc))
+      out[(*n)++] = c;
+    if (c->first_child)
+      collect_shown_rec(c->first_child, out, max, n, depth + 1);
+  }
+}
+
+int layout_collect_shown_images(LayoutNode *root, LayoutNode **out, int max) {
+  int n = 0;
+  if (!root || !out || max <= 0) return 0;
+  collect_shown_rec(root, out, max, &n, 0);
+  return n;
+}
+
 static void dump_images_rec(LayoutNode *node, int *total, int *with_src,
                             int *with_pic, int depth) {
   if (!node || depth > MAX_LAYOUT_DEPTH) return;
@@ -973,11 +996,12 @@ static void dump_images_rec(LayoutNode *node, int *total, int *with_src,
     if (c->type == ELEMENT_IMAGE) {
       (*total)++;
       if (c->img_src) (*with_src)++;
-      if (c->img_dsc) (*with_pic)++;
+      if (c->img_dsc || c->img_thumb) (*with_pic)++;
       if (*total <= 15) {
         Serial.printf("[Imgs] #%d src=%s attr=%dx%d bytes=%s\n", *total,
                       c->img_src ? c->img_src : "(没取到)",
-                      c->img_w, c->img_h, c->img_dsc ? "Y" : "N");
+                      c->img_w, c->img_h,
+                      (c->img_thumb ? "thumb" : (c->img_dsc ? "raw" : "N")));
       }
     }
     if (c->first_child)
@@ -989,7 +1013,7 @@ static void assign_images_rec(LayoutNode *node, LayoutImageMatcher m, void *ctx,
                               int *n, int depth) {
   if (!node || depth > MAX_LAYOUT_DEPTH) return;
   for (LayoutNode *c = node; c; c = c->next_sibling) {
-    if (c->type == ELEMENT_IMAGE && c->img_src && !c->img_dsc) {
+    if (c->type == ELEMENT_IMAGE && c->img_src && !c->img_dsc && !c->img_thumb) {
       void *d = m(c->img_src, ctx);
       if (d) {
         c->img_dsc = d;

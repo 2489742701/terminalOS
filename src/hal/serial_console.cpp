@@ -803,6 +803,9 @@ static void executeLine(char* line) {
   } else if (strcmp(cmd, "imgscan") == 0) {
     /* 本页有几个 <img>、几个取到了地址 —— 图片不显示时第一个该跑的命令 */
     BrowserScreen_imgScan();
+  } else if (strcmp(cmd, "dram") == 0) {
+    /* 内存账：DRAM / PSRAM / LVGL 池 / 页面缓存各占多少 */
+    BrowserScreen_memInfo();
   } else if (strcmp(cmd, "imgview") == 0) {
     /* 不开屏也能验全屏看图：imgview 1 */
     BrowserScreen_imgView((arg && *arg) ? atoi(arg) : 1);

@@ -67,4 +67,14 @@ bool readFile(const char* path, String& out);
    栽过一次，见 docs/09 的 L4）。 */
 bool writeFileBin(const char* path, const uint8_t* data, size_t len);
 
+/* 二进制整文件读（图片缓存回读）。
+   *out 用 heap_caps_malloc(MALLOC_CAP_SPIRAM) 分配 —— 图片字节必须落 PSRAM，
+   内部 DRAM 只有几百 KB，一张 64KB 的图就能把它吃掉一大截。
+   调用方负责 heap_caps_free(*out)。未挂载 / 打不开 / 长度对不上一律 false。
+   ⚠️ 按**字节数**读并比对实际读到的长度，不依赖任何 NUL 结尾（见 readFile）。 */
+bool readFileBin(const char* path, uint8_t** out, size_t* outLen);
+
+/* 文件是否存在 + 大小。exists 只要"在不在"就传 NULL 给 size。 */
+bool statFile(const char* path, size_t* size);
+
 }  // namespace SDCard
