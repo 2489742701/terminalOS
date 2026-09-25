@@ -178,13 +178,21 @@ static void ime_hide();   /* 定义在下面，焦点/搜索回调里要先用�
 
 /* 清空内容区的唯一出口：网页 widget 和搜索首页 widget 都会失效，
    指针必须一起置空，否则下次 lv_obj_is_valid() 会踩到已释放内存。 */
+static void albumRelease();   /* 缓存相册的缩略图释放；定义在下方 */
+
 static void contentReset() {
   if (g_content && lv_obj_is_valid(g_content)) lv_obj_clean(g_content);
   g_searchTa = nullptr;
+  /* ⚠️ 顺序不能反：先把引用这些 dsc 的 lv_img 清掉，再释放像素。
+     反过来的话 LVGL 图片缓存里还留着指向已释放内存的条目，下次命中就炸。 */
+  albumRelease();
 }
 
 static void showSearchHome();   /* 定义在下方（导航回调里要用） */
 static void showDownloadsHome();  /* 下载列表（定义在下方） */
+static void showCacheAlbum();     /* 缓存相册（定义在下方） */
+static void albumRelease();       /* contentReset 里要调：换页就释放相册缩略图 */
+static void album_open_list_cb(lv_event_t* e);   /* 搜索首页 -> 缓存相册 */
 static void dl_open_list_cb(lv_event_t* e);   /* 搜索首页 -> 下载列表 */
 
 /* 排版视口宽度：网页按这个宽度排版，渲染时再等比压缩到屏幕宽度。
@@ -540,7 +548,8 @@ static void downloadImage(LayoutNode* node);   /* 前向：另存按钮要用 */
    滚动/裁剪影响。生命周期严格跟着 g_viewNode 走 —— 退出浏览器、换页都必须拆。 */
 static lv_obj_t* g_viewRoot = nullptr;
 static void* g_viewDsc = nullptr;
-static LayoutNode* g_viewNode = nullptr;
+static LayoutNode* g_viewNode = nullptr;   /* 网页里的图：非 NULL */
+static char g_viewHash[12] = {0};          /* 相册里的图：node 为 NULL 时用它 */
 static LayoutNode* g_viewPending = nullptr;    /* 点击只记指针，tick 里再开 */
 static bool g_viewClosePending = false;
 
@@ -554,12 +563,55 @@ static void closeImageViewer() {
   g_viewNode = nullptr;
 }
 
+/* 真正动手关：延迟一拍（一次性 lv_timer）。
+   ⛔ 为什么不再"置标志等 BrowserScreen_tick"：
+      tick 只在"浏览器主页是当前 Activity"时才被 App::loop 调用
+      （app.cpp: `if (act == nav_browser) BrowserScreen_tick()`）。
+      覆盖层一旦在别的时机被打开，标志就永远没人处理 —— 表现就是
+      「点右上角叉叉没反应，卡死在覆盖层里」。
+      lv_timer 走 LVGL 自己的调度，跟当前是哪个页面无关。 */
+static void viewCloseTimerCb(lv_timer_t* t) {
+  lv_timer_del(t);
+  closeImageViewer();
+}
+
+static void viewRequestClose(const char* why) {
+  Serial.printf("[Img] viewer close: %s\n", why);
+  lv_timer_t* t = lv_timer_create(viewCloseTimerCb, 1, nullptr);
+  if (t) lv_timer_set_repeat_count(t, 1);
+}
+
 /* ⚠️ 三个回调都**不直接动手**：关覆盖层 = 删掉正在派发事件的树，
-   开覆盖层 = 在自己的事件回调里往树上加节点。一律置标志，tick 里做。 */
-static void viewCloseCb(lv_event_t* e) { (void)e; g_viewClosePending = true; }
+   开覆盖层 = 在自己的事件回调里往树上加节点。一律延迟一拍。 */
+static void viewCloseCb(lv_event_t* e) {
+  (void)e;
+  viewRequestClose("button/blank");
+}
+
+/* URL → 8 位十六进制 hash（blob 文件名的唯一来源，两边必须一致）。 */
+static void imgHashOf(char* out, size_t cap, const char* url) {
+  uint32_t hh = url_hash(String(url ? url : ""));
+  snprintf(out, cap, "%08lx", (unsigned long)hh);
+}
+
+/* 把本地原图导出成"能看的名字"（pic<hash>.png/jpg）。
+   网页图片（downloadImage）和缓存相册共用这一条 —— 定义在下面，但
+   viewSaveCb / downloadImage 在它前面就要用，所以先声明。 */
+static void saveImageByHash(const char* hash);
+/* 从本地缩略图 blob 直接构造可显示的 dsc（RGB565 像素，不用解码）。 */
+static void* thumbFromBlob(const uint8_t* b, size_t n);
+
+/* 覆盖层全屏盖在 lv_layer_top() 上 —— 底下 screen 的统一返回手势**收不到
+   事件**（LVGL 事件默认不冒泡，而且 layer_top 在上层），所以左右滑返回在
+   这里是失效的。覆盖层只能自己接一份手势，否则用户滑不动也退不出去。 */
+static SwipeState g_viewSwipe;
+static void viewSwipeCb(lv_event_t* e) {
+  if (swipe_back_any(e, g_viewSwipe, true)) viewRequestClose("swipe");
+}
 static void viewSaveCb(lv_event_t* e) {
   (void)e;
   if (g_viewNode) downloadImage(g_viewNode);
+  else if (g_viewHash[0]) saveImageByHash(g_viewHash);   /* 缓存相册进来的 */
 }
 
 /* 对象存储（定义在下面的"本地对象存储"段）：这几个在 loadFullImage /
@@ -585,6 +637,55 @@ static bool blobUnpack(const uint8_t* b, size_t n, const char* magic,
 static bool storeSave(const char* name, const uint8_t* data, size_t len);
 static bool storeLoad(const char* name, uint8_t** out, size_t* outLen);
 static void imgBlobName(char* out, size_t cap, const char* url, bool thumb);
+
+/* 按 hash 导出一张原图到"能看的名字"。原图平时就在本地（抓取时落的盘），
+   所以这里只是读出来另写一个名字，不再联网。
+   ⚠️ 走 blob 而不是 node->img_dsc：内存里那份早就还回去了。 */
+static void saveImageByHash(const char* hash) {
+  char nm[24];
+  snprintf(nm, sizeof(nm), "i%s.bin", hash);
+  uint8_t* blob = nullptr;
+  size_t blen = 0;
+  const uint8_t* data = nullptr;
+  size_t len = 0;
+  int iw = 0, ih = 0;
+  if (!storeLoad(nm, &blob, &blen) ||
+      !blobUnpack(blob, blen, "GTI1", &iw, &ih, &data, &len)) {
+    if (blob) heap_caps_free(blob);
+    toast("本地没有这张图");
+    return;
+  }
+
+  const char* ext =
+      (len > 8 && data[0] == 0x89 && data[1] == 'P') ? "png" : "jpg";
+  char name[64];
+  int written = 0;
+  if (SDCard::mounted()) {
+    snprintf(name, sizeof(name), "/gt/pic%s.%s", hash, ext);
+    if (SDCard::writeFileBin(name, data, len)) written = 1;
+  } else if (LittleFS.begin(false)) {
+    snprintf(name, sizeof(name), "/pic%s.%s", hash, ext);
+    File f = LittleFS.open(name, FILE_WRITE);
+    if (f) {
+      if (f.write(data, len) == len) written = 1;
+      f.close();
+    }
+  } else {
+    heap_caps_free(blob);
+    toast("存储不可用（插张卡吧）");
+    return;
+  }
+  heap_caps_free(blob);
+
+  char msg[96];
+  if (written)
+    snprintf(msg, sizeof(msg), "已存 %s (%uKB)", name, (unsigned)(len / 1024));
+  else
+    snprintf(msg, sizeof(msg), "保存失败：%s", name);
+  toast(msg);
+  Serial.printf("[Img] save %s -> %s (%u B)\n", written ? "OK" : "FAIL", name,
+                (unsigned)len);
+}
 
 /* 按需加载原图：优先从本地读，盘上没有才联网。
    返回的是"拿原图字节包好的 dsc"，用完调用方必须 tb_image_dsc_free。
@@ -633,10 +734,10 @@ static void* loadFullImage(LayoutNode* node) {
   return d;
 }
 
+static void openImageViewWithDsc(void* dsc, int w, int h);   /* 定义在下面 */
+
 static void openImageViewer(LayoutNode* node) {
   if (!node || !node->img_src) return;
-  closeImageViewer();
-
   /* 原图平时不在内存里 —— 点开才从磁盘读回来解码。 */
   void* full = loadFullImage(node);
   if (!full) {
@@ -652,8 +753,47 @@ static void openImageViewer(LayoutNode* node) {
     toast("这张图解不出来");
     return;
   }
-  g_viewDsc = dsc;
+  imgHashOf(g_viewHash, sizeof(g_viewHash), node->img_src);
   g_viewNode = node;
+  openImageViewWithDsc(dsc, w, h);
+}
+
+/* 缓存相册：没有 LayoutNode，只有本地 hash（t<hash>.thm / i<hash>.bin）。 */
+static void openImageViewerHash(const char* hash) {
+  char nm[24];
+  snprintf(nm, sizeof(nm), "i%s.bin", hash);
+  uint8_t* blob = nullptr;
+  size_t blen = 0;
+  const uint8_t* payload = nullptr;
+  size_t len = 0;
+  int iw = 0, ih = 0;
+  if (!storeLoad(nm, &blob, &blen) ||
+      !blobUnpack(blob, blen, "GTI1", &iw, &ih, &payload, &len)) {
+    if (blob) heap_caps_free(blob);
+    toast("本地没有这张图");
+    return;
+  }
+  uint8_t* data = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!data) { heap_caps_free(blob); toast("内存不足"); return; }
+  memcpy(data, payload, len);
+  heap_caps_free(blob);
+
+  void* full = tb_image_dsc_create(data, len, iw, ih, IMG_MAX_W, IMG_MAX_PIXELS,
+                                   nullptr);
+  if (!full) { toast("这张图解不出来"); return; }
+  int w = 0, h = 0;
+  void* dsc = tb_image_resample(full, 448, 384, &w, &h);
+  tb_image_dsc_free(full);
+  if (!dsc) { toast("这张图解不出来"); return; }
+  snprintf(g_viewHash, sizeof(g_viewHash), "%s", hash);
+  g_viewNode = nullptr;
+  openImageViewWithDsc(dsc, w, h);
+}
+
+/* 建覆盖层 UI。dsc 已经是"解到 448x384 后"的像素，w/h 是它的实际尺寸。 */
+static void openImageViewWithDsc(void* dsc, int w, int h) {
+  closeImageViewer();
+  g_viewDsc = dsc;
 
   lv_obj_t* root = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(root);
@@ -665,6 +805,10 @@ static void openImageViewer(LayoutNode* node) {
   lv_obj_add_flag(root, LV_OBJ_FLAG_CLICKABLE);
   /* 点空白处关闭（图片本身不可点，所以点图不会误关） */
   lv_obj_add_event_cb(root, viewCloseCb, LV_EVENT_CLICKED, nullptr);
+  /* 滑动退出：layer_top 挡住了底下 screen 的手势，这里必须自己接一份 */
+  lv_obj_add_event_cb(root, viewSwipeCb, LV_EVENT_PRESSED, nullptr);
+  lv_obj_add_event_cb(root, viewSwipeCb, LV_EVENT_PRESSING, nullptr);
+  lv_obj_add_event_cb(root, viewSwipeCb, LV_EVENT_RELEASED, nullptr);
   g_viewRoot = root;
 
   lv_obj_t* img = lv_img_create(root);
@@ -723,7 +867,7 @@ static void openImageViewer(LayoutNode* node) {
   lv_obj_align(info, LV_ALIGN_TOP_LEFT, 12, 16);
 
   Serial.printf("[Img] viewer %dx%d -> %dx%d from %.56s\n", w, h, zw, zh,
-                node->img_src ? node->img_src : "?");
+                (g_viewNode && g_viewNode->img_src) ? g_viewNode->img_src : g_viewHash);
 }
 
 /* 缩略图点击 → 只记指针。在事件回调里直接开覆盖层 = 在自己的事件处理过程中
@@ -736,53 +880,10 @@ static void image_click_cb(void* node) {
    ⚠️ 写的是**原始字节**，不是重采样后的小图 —— 存下来要能拿去别处看。 */
 static void downloadImage(LayoutNode* node) {
   if (!node || !node->img_src) { toast("没有图片数据"); return; }
-
   /* 原图已经在本地（抓取时就落盘了）—— 另存只是把它导出成能看的名字。 */
-  char nm[32];
-  imgBlobName(nm, sizeof(nm), node->img_src, false);
-  uint8_t* blob = nullptr;
-  size_t blen = 0;
-  const uint8_t* data = nullptr;
-  size_t len = 0;
-  int iw = 0, ih = 0;
-  if (!storeLoad(nm, &blob, &blen) ||
-      !blobUnpack(blob, blen, "GTI1", &iw, &ih, &data, &len)) {
-    if (blob) heap_caps_free(blob);
-    toast("本地没有这张图");
-    return;
-  }
-
-  const char* ext =
-      (len > 8 && data[0] == 0x89 && data[1] == 'P') ? "png" : "jpg";
-  uint32_t hh = url_hash(String(node->img_src ? node->img_src : ""));
-  char name[64];
-  int written = 0;
-
-  if (SDCard::mounted()) {
-    snprintf(name, sizeof(name), "/gt/pic%08lx.%s", (unsigned long)hh, ext);
-    if (SDCard::writeFileBin(name, data, len)) written = 1;
-  } else if (LittleFS.begin(false)) {
-    snprintf(name, sizeof(name), "/pic%08lx.%s", (unsigned long)hh, ext);
-    File f = LittleFS.open(name, FILE_WRITE);
-    if (f) {
-      if (f.write(data, len) == len) written = 1;
-      f.close();
-    }
-  } else {
-    heap_caps_free(blob);
-    toast("存储不可用（插张卡吧）");
-    return;
-  }
-  heap_caps_free(blob);
-
-  char msg[96];
-  if (written)
-    snprintf(msg, sizeof(msg), "已存 %s (%uKB)", name, (unsigned)(len / 1024));
-  else
-    snprintf(msg, sizeof(msg), "保存失败：%s", name);
-  toast(msg);
-  Serial.printf("[Img] save %s -> %s (%u B)\n", written ? "OK" : "FAIL", name,
-                (unsigned)len);
+  char h[12];
+  imgHashOf(h, sizeof(h), node->img_src);
+  saveImageByHash(h);
 }
 
 
@@ -1120,8 +1221,37 @@ static bool storeLoad(const char* name, uint8_t** out, size_t* outLen) {
 
 /* 原图 / 缩略图的本地文件名（hash 来自绝对 URL）。 */
 static void imgBlobName(char* out, size_t cap, const char* url, bool thumb) {
-  uint32_t hh = url_hash(String(url ? url : ""));
-  snprintf(out, cap, thumb ? "t%08lx.thm" : "i%08lx.bin", (unsigned long)hh);
+  char h[12];
+  imgHashOf(h, sizeof(h), url);
+  snprintf(out, cap, thumb ? "t%s.thm" : "i%s.bin", h);
+}
+
+/* 从 GTT1 blob 直接构造一个**可以拿去显示**的 dsc —— 缩略图存的就是 RGB565
+   像素，读回来不用解码，这就是"二次打开更快"的本钱。
+   bpp 由 len/(w*h) 反推：2 = RGB565，3 = RGB565A。 */
+static void* thumbFromBlob(const uint8_t* b, size_t n) {
+  int w = 0, h = 0;
+  const uint8_t* px = nullptr;
+  size_t plen = 0;
+  if (!blobUnpack(b, n, "GTT1", &w, &h, &px, &plen)) return nullptr;
+  if (w <= 0 || h <= 0 || plen == 0) return nullptr;
+  size_t bpp = plen / ((size_t)w * (size_t)h);
+  if (bpp != 2 && bpp != 3) return nullptr;
+
+  uint8_t* dst = (uint8_t*)heap_caps_malloc(plen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!dst) return nullptr;
+  memcpy(dst, px, plen);
+  lv_img_dsc_t* d = (lv_img_dsc_t*)heap_caps_malloc(sizeof(lv_img_dsc_t),
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!d) { heap_caps_free(dst); return nullptr; }
+  memset(d, 0, sizeof(*d));
+  d->header.always_zero = 0;
+  d->header.w = (uint32_t)w;
+  d->header.h = (uint32_t)h;
+  d->header.cf = (bpp == 3) ? LV_IMG_CF_TRUE_COLOR_ALPHA : LV_IMG_CF_TRUE_COLOR;
+  d->data = dst;
+  d->data_size = (uint32_t)plen;
+  return d;
 }
 
 /* ── 提前抓下来的图：URL → dsc。解析完后按 URL 认领回节点 ── */
@@ -1629,7 +1759,8 @@ static String urlEncode(const String& s) {
 
 /* ⚠️ 这两个**必须定义在 startNews 之前**：缓存命中分支也要走 UI_PEND 通道
    重建首页。原来定义在文件后面（下载管理那节），startNews 看不见。 */
-enum PendingUiKind { UI_PEND_NONE = 0, UI_PEND_SEARCH, UI_PEND_DOWNLOADS };
+enum PendingUiKind { UI_PEND_NONE = 0, UI_PEND_SEARCH, UI_PEND_DOWNLOADS,
+                     UI_PEND_ALBUM };
 static volatile int g_uiPendingKind = UI_PEND_NONE;
 
 /* 搜索引擎（master 2026-09-25：必应 + 360，两个都摆出来直接点选）
@@ -2162,6 +2293,7 @@ static void showSearchHome() {
      回调里只置一个"待办"，真正的重建在下一 tick（见 g_uiPendingKind 的说明）。 */
   lv_obj_t* dlRow = makeRow(g_content, false);
   makeChipBtn(dlRow, "下载的网站", dl_open_list_cb, NULL);
+  makeChipBtn(dlRow, "缓存相册", album_open_list_cb, NULL);
 
   Serial.println("[Browser] search home shown");
 }
@@ -2194,6 +2326,11 @@ static void dl_goto(int kind) {
 static void dl_open_list_cb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   dl_goto(UI_PEND_DOWNLOADS);
+}
+
+static void album_open_list_cb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  dl_goto(UI_PEND_ALBUM);
 }
 
 static void dl_back_cb(lv_event_t* e) {
@@ -2382,6 +2519,168 @@ static void showDownloadsHome() {
   Serial.printf("[Browser] downloads list: %d rows\n", n);
 }
 
+
+/* ═══ 缓存相册（2026-09-25，master 要的）══════════════════════════════════
+ * 把缓存下来的网页图片当相册翻。
+ *   数据 = storeSave 已经落盘的 t<hash>.thm（缩略图）+ i<hash>.bin（原图）
+ *   全程不联网 —— 断网、离线也能看，这正是"下载到本地"的意义。
+ *
+ * ⚠️ 缩略图 dsc 的生命周期绑在**页面**上：contentReset() 会调 albumRelease()。
+ *    别在别处单独释放，也别在 UI 还引用它们的时候释放。
+ */
+#define ALBUM_MAX 36
+
+static void* g_albumDsc[ALBUM_MAX];
+static char  g_albumHash[ALBUM_MAX][12];
+static int   g_albumN = 0;
+static int   g_albumPending = -1;
+
+static void albumRelease() {
+  for (int i = 0; i < ALBUM_MAX; i++) {
+    if (g_albumDsc[i]) {
+      /* tb_image_dsc_free 会 invalidate LVGL 图片缓存，所以 UI 先清掉就安全 */
+      tb_image_dsc_free(g_albumDsc[i]);
+      g_albumDsc[i] = nullptr;
+    }
+    g_albumHash[i][0] = '\0';
+  }
+  g_albumN = 0;
+  g_albumPending = -1;
+}
+
+/* 收一张：base 形如 "t1234abcd.thm"。返回 true = 收下了（或已经有了）。 */
+static bool albumAdd(const char* base) {
+  if (g_albumN >= ALBUM_MAX) return false;
+  const char* dot = strchr(base, '.');
+  if (!dot) return false;
+  size_t hl = (size_t)(dot - base - 1);      /* 去掉开头的 t 和 ".thm" */
+  if (hl < 1 || hl > 8) return false;
+  char h[12];
+  memcpy(h, base + 1, hl);
+  h[hl] = '\0';
+
+  for (int i = 0; i < g_albumN; i++)
+    if (strcmp(g_albumHash[i], h) == 0) return true;   /* 去重 */
+
+  char nm[24];
+  snprintf(nm, sizeof(nm), "t%s.thm", h);
+  uint8_t* blob = nullptr;
+  size_t blen = 0;
+  if (!storeLoad(nm, &blob, &blen)) return false;
+  void* d = thumbFromBlob(blob, blen);
+  heap_caps_free(blob);
+  if (!d) return false;
+
+  snprintf(g_albumHash[g_albumN], sizeof(g_albumHash[0]), "%s", h);
+  g_albumDsc[g_albumN] = d;
+  g_albumN++;
+  return true;
+}
+
+static int albumScan() {
+  albumRelease();
+  if (SDCard::mounted()) {
+    String names[64];
+    int cnt = SDCard::listDirNames("/gt", names, 64);
+    for (int i = 0; i < cnt; i++) {
+      const char* nm = names[i].c_str();
+      if (nm[0] == 't' && strstr(nm, ".thm")) albumAdd(nm);
+    }
+  } else if (LittleFS.begin(false)) {
+    File root = LittleFS.open("/");
+    File f = root.openNextFile();
+    while (f) {
+      String nm = String(f.name());
+      f = root.openNextFile();              /* 先推进再处理 */
+      const char* slash = strrchr(nm.c_str(), '/');
+      const char* base = slash ? slash + 1 : nm.c_str();
+      if (base[0] == 't' && strstr(base, ".thm")) albumAdd(base);
+    }
+    /* 挂载后不 end()：会把正在跑的页面服务器弄成 404 */
+  }
+  Serial.printf("[Album] scanned %d thumb(s)\n", g_albumN);
+  return g_albumN;
+}
+
+/* 点缩略图 → 开全屏。开覆盖层同样是"在自己的回调里加节点"，延迟一拍。 */
+static void albumOpenTimerCb(lv_timer_t* t) {
+  lv_timer_del(t);
+  int i = g_albumPending;
+  g_albumPending = -1;
+  if (i >= 0 && i < g_albumN) openImageViewerHash(g_albumHash[i]);
+}
+
+static void albumOpenCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  g_albumPending = (int)(intptr_t)lv_event_get_user_data(e);
+  lv_timer_t* t = lv_timer_create(albumOpenTimerCb, 1, nullptr);
+  if (t) lv_timer_set_repeat_count(t, 1);
+}
+
+static void albumBackCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  dl_goto(UI_PEND_SEARCH);
+}
+
+static void showCacheAlbum() {
+  if (!g_content || !lv_obj_is_valid(g_content)) return;
+  hideLoadingOverlay();
+  contentReset();     /* ⚠️ 内部会 albumRelease —— 先清 UI 再释放 dsc */
+  g_state = BROWSER_LOADED;
+  g_currentUrl = "";
+  if (g_urlArea && lv_obj_is_valid(g_urlArea))
+    lv_label_set_text(g_urlArea, "缓存相册");
+  updateNavButtons();
+
+  lv_obj_t* title = lv_label_create(g_content);
+  lv_label_set_text(title, "缓存相册");
+  lv_obj_set_style_text_color(title, lv_color_white(), 0);
+  lv_obj_set_style_text_font(title, &font_zh_16, 0);
+
+  int n = albumScan();
+
+  lv_obj_t* row = makeRow(g_content, false);
+  makeChipBtn(row, "返回", albumBackCb, NULL);
+  char cnt[24];
+  snprintf(cnt, sizeof(cnt), "%d 张", n);
+  lv_obj_t* cl = lv_label_create(row);
+  lv_label_set_text(cl, cnt);
+  lv_obj_set_style_text_color(cl, lv_color_hex(0x999999), 0);
+  lv_obj_set_style_text_font(cl, &font_zh_16, 0);
+
+  if (n <= 0) {
+    lv_obj_t* m = lv_label_create(g_content);
+    lv_label_set_text(m, "还没有缓存的图片（先逛个网页）");
+    lv_obj_set_style_text_color(m, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_font(m, &font_zh_16, 0);
+    return;
+  }
+
+  lv_obj_t* grid = lv_obj_create(g_content);
+  lv_obj_set_size(grid, CONTENT_W, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+  lv_obj_set_style_pad_all(grid, 4, 0);
+  lv_obj_set_style_pad_gap(grid, 6, 0);
+  lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(grid, 0, 0);
+  lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+
+  for (int i = 0; i < n; i++) {
+    lv_obj_t* cell = lv_btn_create(grid);
+    lv_obj_set_size(cell, 140, 140);
+    lv_obj_set_style_bg_color(cell, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_bg_color(cell, lv_color_hex(0x333333), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(cell, 6, 0);
+    lv_obj_set_style_border_width(cell, 1, 0);
+    lv_obj_set_style_border_color(cell, lv_color_hex(0x333333), 0);
+    lv_obj_add_event_cb(cell, albumOpenCb, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)i);
+    lv_obj_t* im = lv_img_create(cell);
+    lv_img_set_src(im, (const lv_img_dsc_t*)g_albumDsc[i]);
+    lv_obj_center(im);
+  }
+}
+
 }  // namespace
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2514,6 +2813,11 @@ lv_obj_t* BrowserScreen_create() {
 
   /* ── 内容区 (40-410) ── */
   g_content = lv_obj_create(scr);
+  /* ⚠️ LVGL 事件默认**不冒泡**：统一返回手势挂在 scr 上，而 g_content 盖住了
+     大半个屏幕 —— 手指落在内容区时 scr 根本收不到 PRESSED，于是网页里、
+     "下载的网站"列表里左右滑都退不出去。让它冒泡，手势就能穿过内容区。
+     ⛔ 只影响 PRESSED/PRESSING/RELEASED，按钮的 CLICKED 不会被误触发。 */
+  lv_obj_add_flag(g_content, LV_OBJ_FLAG_EVENT_BUBBLE);
   lv_obj_set_size(g_content, 476, CONTENT_H);
   lv_obj_align(g_content, LV_ALIGN_TOP_LEFT, 2, 28);
   lv_obj_set_style_bg_color(g_content, lv_color_hex(0x0a0a0a), 0);
@@ -2924,6 +3228,7 @@ void BrowserScreen_tick() {
     int kind = g_uiPendingKind;
     g_uiPendingKind = UI_PEND_NONE;
     if (kind == UI_PEND_DOWNLOADS) showDownloadsHome();
+    else if (kind == UI_PEND_ALBUM) showCacheAlbum();
     else showSearchHome();
     return;
   }
@@ -3306,6 +3611,28 @@ void BrowserScreen_memInfo() {
   Serial.printf("[Mem] layout=%s  pageCache=%u B (2 slots)  sd=%s\n",
                 g_layoutRoot ? "held(in PSRAM)" : "none",
                 (unsigned)cacheBytes, SDCard::mounted() ? "mounted" : "no");
+}
+
+/* 串口 `imgclose`：关掉看图覆盖层。
+   专治"点叉叉退不出去"—— 不用点屏也能验那条关闭链路通不通。 */
+void BrowserScreen_imgClose() {
+  if (!g_viewRoot) { Serial.println("[Img] viewer not open"); return; }
+  viewRequestClose("serial");
+}
+
+/* 串口 `album`：直接跳到缓存相册（不点屏也能验）。 */
+void BrowserScreen_album() {
+  g_uiPendingKind = UI_PEND_ALBUM;   /* 下一 tick 重画，别在串口里直接动树 */
+}
+
+/* 串口 `albumview <n>`：不点屏也能验"相册里的图能不能打开大图"。 */
+void BrowserScreen_albumView(int idx) {
+  if (g_albumN <= 0) { Serial.println("[Album] 相册是空的（先进一次 album）"); return; }
+  if (idx < 1 || idx > g_albumN) {
+    Serial.printf("[Album] usage: albumview 1..%d\n", g_albumN);
+    return;
+  }
+  openImageViewerHash(g_albumHash[idx - 1]);
 }
 
 void BrowserScreen_imgScan() {

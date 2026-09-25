@@ -806,6 +806,15 @@ static void executeLine(char* line) {
   } else if (strcmp(cmd, "dram") == 0) {
     /* 内存账：DRAM / PSRAM / LVGL 池 / 页面缓存各占多少 */
     BrowserScreen_memInfo();
+  } else if (strcmp(cmd, "albumview") == 0) {
+    /* 相册第 n 张的大图：albumview 1 */
+    BrowserScreen_albumView((arg && *arg) ? atoi(arg) : 1);
+  } else if (strcmp(cmd, "album") == 0) {
+    /* 缓存相册：不点屏也能进 */
+    BrowserScreen_album();
+  } else if (strcmp(cmd, "imgclose") == 0) {
+    /* 关掉看图覆盖层（验"点叉叉退不出去"那条链路） */
+    BrowserScreen_imgClose();
   } else if (strcmp(cmd, "imgview") == 0) {
     /* 不开屏也能验全屏看图：imgview 1 */
     BrowserScreen_imgView((arg && *arg) ? atoi(arg) : 1);

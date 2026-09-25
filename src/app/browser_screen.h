@@ -59,5 +59,11 @@ void BrowserScreen_imgView(int idx);
 void BrowserScreen_imgDownload(int idx);
 /* 把本页布局树里的图片节点抖到串口（串口 imgscan） */
 void BrowserScreen_imgScan();
+/* 串口 `imgclose`：关掉看图覆盖层 */
+void BrowserScreen_imgClose();
+/* 串口 `album`：直接跳到缓存相册 */
+void BrowserScreen_album();
+/* 串口 `albumview <n>`：打开相册第 n 张的大图 */
+void BrowserScreen_albumView(int idx);
 /* 串口 `dram`：DRAM / PSRAM / LVGL 池 / 页面缓存的占用账 */
 void BrowserScreen_memInfo();

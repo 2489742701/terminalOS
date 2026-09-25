@@ -274,6 +274,25 @@ bool statFile(const char* path, size_t* size) {
   return true;
 }
 
+int listDirNames(const char* dir, String* out, int max) {
+  if (!g_mounted || !dir || !out || max <= 0) return 0;
+  File root = SD.open(dir);
+  if (!root) return 0;
+  int n = 0;
+  while (n < max) {
+    File f = root.openNextFile();
+    if (!f) break;
+    String nm = String(f.name());
+    f.close();
+    /* SD 的 name() 给的是带目录的完整路径（"/gt/t1234abcd.thm"），
+       这里统一剥成纯文件名，调用方才好按前缀/后缀过滤。 */
+    const char* slash = strrchr(nm.c_str(), '/');
+    out[n++] = slash ? String(slash + 1) : nm;
+  }
+  root.close();
+  return n;
+}
+
 bool readFile(const char* path, String& out) {
   if (!g_mounted || !path) return false;
   File f = SD.open(path, FILE_READ);

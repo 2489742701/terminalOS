@@ -77,4 +77,9 @@ bool readFileBin(const char* path, uint8_t** out, size_t* outLen);
 /* 文件是否存在 + 大小。exists 只要"在不在"就传 NULL 给 size。 */
 bool statFile(const char* path, size_t* size);
 
+/* 列目录下的**文件名**（不含目录前缀），最多 max 个，返回实际个数。
+   子目录和隐藏文件都会列出来，匹配前缀/后缀由调用方自己过滤。
+   ⛔ 未挂载返回 0（绝不碰 SPI）。 */
+int listDirNames(const char* dir, String* out, int max);
+
 }  // namespace SDCard
